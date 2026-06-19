@@ -1,0 +1,81 @@
+{
+    "version": 3,
+    "configurePresets": [
+        {
+            "name": "windows-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "toolset": {
+                "value": "host=x64",
+                "strategy": "external"
+            },
+            "cacheVariables": { "CMAKE_COMPILE_WARNING_AS_ERROR": "ON" }
+        },
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_COMPILE_WARNING_AS_ERROR": "ON"
+            }
+        },
+        {
+            "name": "windows-debug",
+            "displayName": "Windows x64 Debug",
+            "description": "Target Windows with MSVC (Debug)",
+            "inherits": "windows-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "windows-release",
+            "displayName": "Windows x64 Release",
+            "description": "Target Windows with MSVC (Release)",
+            "inherits": "windows-base",
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        },
+        {
+            "name": "linux-debug",
+            "displayName": "Linux Debug",
+            "description": "Target Linux with GCC/Clang (Debug)",
+            "inherits": "linux-base",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            },
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+        },
+        {
+            "name": "linux-release",
+            "displayName": "Linux Release",
+            "description": "Target Linux with GCC/Clang (Release)",
+            "inherits": "linux-base",
+            "condition": {
+                "type": "equals",
+                "lhs": "${hostSystemName}",
+                "rhs": "Linux"
+            },
+            "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "windows-debug",
+            "configurePreset": "windows-debug"
+        },
+        {
+            "name": "windows-release",
+            "configurePreset": "windows-release"
+        },
+        {
+            "name": "linux-debug",
+            "configurePreset": "linux-debug"
+        },
+        {
+            "name": "linux-release",
+            "configurePreset": "linux-release"
+        }
+    ]
+}
