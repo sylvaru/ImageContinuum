@@ -12,9 +12,16 @@ target_include_directories(ImageContinuumTests
         include
 )
 
+# Setup PCH
+target_precompile_headers(ImageContinuumTests
+    PRIVATE  
+         "include/common/tests_pch.h"
+)
+    
 # Link the tests against the Engine target, warnings, and any testing frameworks
 target_link_libraries(ImageContinuumTests
     PRIVATE 
         ImageContinuumEngine
         ic_compiler_warnings
+        spdlog
 )

@@ -1,3 +1,4 @@
+// engine/image_continuum/core/event_queue.h
 #pragma once
 #include <cstdint>
 

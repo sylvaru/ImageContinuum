@@ -122,16 +122,15 @@ namespace ic {
             m_nodes.emplace_back(std::move(layer));
         }
 
-        // Combine updates and renders into a single contiguous iteration pass
-        // to maximize CPU cache line residency
-        void updateAndRenderAll(float dt, float alpha) {
-            // Iterating once over the array means the CPU pulls the data into L1/L2 cache once, 
-            // rather than iterating twice over disjoint vectors.
-            for (auto& node : m_nodes) {
-                assert(node.update_fn && node.render_fn);
+      
+        void updateAll(float dt) {
+            for (auto& node : m_nodes)
                 node.update_fn(node.storage, dt);
+        }
+
+        void renderAll(float alpha) {
+            for (auto& node : m_nodes)
                 node.render_fn(node.storage, alpha);
-            }
         }
 
     private:

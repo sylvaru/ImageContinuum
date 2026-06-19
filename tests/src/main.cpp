@@ -1,8 +1,6 @@
-
+// test/src/main.cpp
+#include "common/tests_pch.h"
 #include "image_continuum/core/app_base.h"
-
-#include <chrono>
-#include <iostream>
 
 struct TestLayer 
 {
@@ -33,14 +31,16 @@ int main() {
 	// Warmup phase 
 	// let CPU boost up clock speeds and ensure branch predictors settle
 	for (int i = 0; i < WARMUP_ITERATIONS; ++i) {
-		stack.updateAndRenderAll(0.016f, 1.0f);
+		stack.updateAll(0.016f);
+		stack.renderAll(1.0f);
 	}
 
 	// Timed phase
 	auto start_time = std::chrono::high_resolution_clock::now();
 
 	for (int i = 0; i < TIMED_ITERATIONS; ++i) {
-		stack.updateAndRenderAll(0.016f, 1.0f);
+		stack.updateAll(0.016f);
+		stack.renderAll(1.0f);
 	}
 
 	auto end_time = std::chrono::high_resolution_clock::now();
@@ -50,9 +50,14 @@ int main() {
 	double avg_ns_per_frame = static_cast<double>(elapsed_ns) / TIMED_ITERATIONS;
 	double avg_ms_per_frame = avg_ns_per_frame / 1e6;
 
-	std::cout << "Executed " << TIMED_ITERATIONS << " frames over "
-		<< NUM_LAYERS << " contiguous layers per frame." << std::endl;
-	std::cout << "Total time: " << (elapsed_ns / 1e9) << " seconds." << std::endl;
-	std::cout << "Average time per updateAndRenderAll call: " << avg_ns_per_frame << " ns (" << avg_ms_per_frame << " ms)" << std::endl;
+	spdlog::info("Executed {} frames over {} contiguous layers per frame.",
+		TIMED_ITERATIONS,
+		NUM_LAYERS);
 
+	spdlog::info("Total time: {} seconds.",
+		elapsed_ns / 1e9);
+
+	spdlog::info("Average time per updateAll + renderAll calls: {} ns ({} ms)",
+		avg_ns_per_frame,
+		avg_ms_per_frame);
 }

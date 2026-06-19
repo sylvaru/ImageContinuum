@@ -24,6 +24,9 @@ namespace ic
     template <typename Derived>
     class AppBase 
     {
+    protected:
+        Derived& self() noexcept;
+
     public:
         AppBase() = default;
         ~AppBase() = default;
@@ -36,17 +39,23 @@ namespace ic
             (void)argc;
             (void)argv;
 
-            Derived::onInit(*this);
+            auto& app = self();
 
             bool isRunning = true;
             while (isRunning) 
             {
-                m_stack.updateAndRenderAll(0.016f, 1.0f);
+                app.onInit(*this);
+
+                m_stack.updateAll(0.016f);
+
+                app.onUpdate(*this);
+
+                m_stack.renderAll(1.0f);
 
                 isRunning = false;
             }
 
-            Derived::onShutdown();
+            app.onShutdown(*this);
             return 0;
         }
 
@@ -60,4 +69,10 @@ namespace ic
     private:
         LayerStack m_stack;
     };
+
+    template <typename Derived>
+    inline Derived& AppBase<Derived>::self() noexcept
+    {
+        return reinterpret_cast<Derived&>(*this);
+    }
 }

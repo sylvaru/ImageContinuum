@@ -19,7 +19,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/image_continuum/interface/layer.h" 
     "include/image_continuum/interface/events.h"
     
-)
+ "include/image_continuum/interface/window.h")
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine
@@ -39,5 +39,19 @@ target_precompile_headers(ImageContinuumEngine
 )
     
 
-# Link the strict compiler warnings interface
-target_link_libraries(ImageContinuumEngine PRIVATE ic_compiler_warnings)
+# Link against things
+target_link_libraries(ImageContinuumEngine 
+    PRIVATE 
+        ic_compiler_warnings
+        vulkan-headers
+        tomlplusplus::tomlplusplus
+        glfw
+        spdlog
+        miniaudio
+        entt
+        glm
+        concurrentqueue
+        fastgltf::fastgltf
+        stb
+        imgui
+)
