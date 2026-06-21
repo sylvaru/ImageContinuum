@@ -1,28 +1,30 @@
 // demo/src/demo_app.cpp
 #include "common/demo_pch.h"
 #include "demo_app.h"
+#include <spdlog/spdlog.h>
 
-void DemoApp::onInit(ic::AppBase<DemoApp>& appInstance)
+void DemoApp::onInit()
 {
 	spdlog::info("[ Demo App ] onInit..");
-	GameLayer layer;
-	appInstance.pushLayerToStack(layer);
+	pushLayer<GameLayer>();
 }
 
-void DemoApp::onRender(ic::AppBase<DemoApp>& appInstance)
+void DemoApp::onUpdate(float dt)
 {
-	(void)appInstance;
-	spdlog::info("[ Demo App ] onRender..");
+    (void)dt;
 }
 
-void DemoApp::onUpdate(ic::AppBase<DemoApp>& appInstance)
+void DemoApp::onShutdown()
 {
-	(void)appInstance;
-	spdlog::info("[ Demo App ] onUpdate..");
-}
-
-void DemoApp::onShutdown(ic::AppBase<DemoApp>& appInstance)
-{
-	(void)appInstance;
 	spdlog::info("[ Demo App ] onShutdown..");
+}
+
+ic::AppSpecification DemoApp::createSpecification()
+{
+    ic::AppSpecification spec;
+
+    spec.appName = "Demo App";
+    spec.window.width = 1920;
+    spec.window.height = 1080;
+    return spec;
 }

@@ -4,7 +4,7 @@ add_executable(ImageContinuumDemo
     "src/main.cpp"
     "include/game_layer.h"
     "include/demo_app.h" 
-    "src/demo_app.cpp")
+    "src/demo_app.cpp" "src/game_layer.cpp")
 
 # Set C++ standard to C++20 required
 set_property(TARGET ImageContinuumDemo PROPERTY CXX_STANDARD 20)

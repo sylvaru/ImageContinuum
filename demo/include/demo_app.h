@@ -3,16 +3,21 @@
 #include "game_layer.h"
 
 
-class DemoApp : public ic::AppBase<DemoApp>
+class DemoApp : public ic::AppBase
 {
 public:
-	void onInit(ic::AppBase<DemoApp>& appInstance);
-	void onRender(ic::AppBase<DemoApp>& appInstance);
-	void onUpdate(ic::AppBase<DemoApp>& appInstance);
-	void onShutdown(ic::AppBase<DemoApp>& appInstance);
+    DemoApp()
+        : AppBase(createSpecification())
+    {
+    }
+    void onInit() override;
+    void onUpdate(float dt) override;
+    void onShutdown() override;
 
 	GameLayer& getGameLayer() { return m_gameLayer; }
 
 private:
+    static ic::AppSpecification createSpecification();
+
 	GameLayer m_gameLayer;
 };

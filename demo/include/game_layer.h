@@ -2,9 +2,12 @@
 #pragma once
 #include "image_continuum/interface/layer.h"
 
+struct ic::Event;
 
-class GameLayer : public ic::Layer<GameLayer> {
+class GameLayer : public ic::Layer 
+{
 public:
-    void onUpdate(float dt) { (void)dt;/* Perform math here */ }
-    void onRender(float alpha) { (void)alpha;/* Submit flat data buffers */ }
+    void onUpdate(float dt);
+    void onRender(float alpha);
+    void onEvent(ic::Event& e);
 };

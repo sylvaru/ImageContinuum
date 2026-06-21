@@ -35,5 +35,3 @@
 #include <atomic>
 #include <chrono>
 
-// External
-#include <spdlog/spdlog.h>

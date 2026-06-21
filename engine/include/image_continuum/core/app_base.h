@@ -1,78 +1,80 @@
-// engine/include/image_continuum/core/app_base.h
+// image_continuum/core/app_base.h
 #pragma once
 #include "layer_stack.h"
-
-#include <cstdint>
-#include <utility>
+#include "image_continuum/interface/renderer_backend.h"
+#include "image_continuum/interface/window.h"
+#include "event_queue.h"
 
 namespace ic 
 {
+    struct Input;
+    struct Event;
 
     struct AppServices
     {
-        //Renderer* renderer
+        //Renderer* renderer;
         //AssetManager* assetManager;
         //SceneManager* sceneManager;
+        Input* input;
+        Window* window;
     };
+
 
     struct AppSpecification
     {
-        uint32_t maxScratchMemory;
-        bool enableImGui;
+        std::string appName = "Demo";
+
+        WindowSpecification window;
+
+        RendererSpecification renderer;
     };
 
-    template <typename Derived>
-    class AppBase 
+    class AppBase
     {
-    protected:
-        Derived& self() noexcept;
-
     public:
-        AppBase() = default;
-        ~AppBase() = default;
+        AppBase(AppSpecification apec);
 
-        AppBase(const AppBase&) = delete;
-        AppBase& operator=(const AppBase&) = delete;
+        int run(int argc, char** argv);
 
-        int run(int argc, char** argv) 
+    protected:
+
+        virtual ~AppBase();
+        virtual void onInit() {}
+        virtual void onUpdate(float dt) { (void)dt; }
+        virtual void onShutdown() {}
+
+        void onEvent(Event& e)
         {
-            (void)argc;
-            (void)argv;
-
-            auto& app = self();
-
-            bool isRunning = true;
-            while (isRunning) 
-            {
-                app.onInit(*this);
-
-                m_stack.updateAll(0.016f);
-
-                app.onUpdate(*this);
-
-                m_stack.renderAll(1.0f);
-
-                isRunning = false;
-            }
-
-            app.onShutdown(*this);
-            return 0;
+            m_layerStack.dispatchEvent(e);
         }
 
-
-        template <typename T>
-        void pushLayerToStack(T layer) {
-            m_stack.pushLayer(std::move(layer));
+        template<typename T, typename... Args>
+        T& pushLayer(Args&&... args)
+        {
+            return m_layerStack.emplaceLayer<T>(
+                std::forward<Args>(args)...);
         }
 
-        LayerStack& getStack() { return m_stack; }
+        AppServices& services()
+        {
+            return m_services;
+        }
+
     private:
-        LayerStack m_stack;
-    };
+        void routeEvent(Event& e);
+        void handleSystemEvents(const Event& e);
 
-    template <typename Derived>
-    inline Derived& AppBase<Derived>::self() noexcept
-    {
-        return reinterpret_cast<Derived&>(*this);
-    }
+        AppSpecification m_spec{};
+        struct PlatformState;
+        std::unique_ptr<PlatformState> m_platform;
+
+        std::unique_ptr<Window> m_window;
+        std::unique_ptr<Input> m_input;
+        
+        //std::unique_ptr<RenderBackend> m_renderer;
+
+        LayerStack m_layerStack{};
+        AppServices m_services{};
+        EventQueue m_eventQueue{};
+    };
 }
