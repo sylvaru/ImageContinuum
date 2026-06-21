@@ -4,9 +4,10 @@
 
 namespace ic
 {
-    enum class EventType : uint8_t
+    enum class EventType : uint16_t
     {
         None = 0,
+
         KeyPressed,
         KeyReleased,
 
@@ -16,7 +17,24 @@ namespace ic
         MouseScrolled,
 
         WindowResize,
-        WindowClose
+        WindowClose,
+
+        ShaderReloaded,
+        SwapchainRecreated,
+
+        AssetLoaded,
+        AssetUnloaded,
+
+        PhysicsBodyCreated,
+        PhysicsBodyDestroyed
+    };
+
+    enum class EventChannel
+    {
+        Input,
+        Window,
+        System,
+        Render
     };
 
     struct Event
@@ -56,7 +74,48 @@ namespace ic
 
     };
 
-    constexpr Event makeKeyPressed(IcKey key)
+
+    constexpr EventChannel
+        channelForEvent(const EventType t)
+    {
+        switch (t)
+        {
+        case EventType::KeyPressed:
+        case EventType::KeyReleased:
+        case EventType::MouseMoved:
+        case EventType::MouseButtonPressed:
+        case EventType::MouseButtonReleased:
+        case EventType::MouseScrolled:
+            return EventChannel::Input;
+
+        case EventType::WindowResize:
+        case EventType::WindowClose:
+            return EventChannel::Window;
+
+        default:
+            return EventChannel::System;
+        }
+    }
+
+    constexpr bool isInputEvent(EventType t)
+    {
+        return channelForEvent(t) == EventChannel::Input;
+    }
+
+    constexpr bool isWindowEvent(EventType type)
+    {
+        switch (type)
+        {
+        case EventType::WindowResize:
+        case EventType::WindowClose:
+            return true;
+
+        default:
+            return false;
+        }
+    }
+
+    [[nodiscard]] constexpr Event makeKeyPressed(IcKey key)
     {
         Event e{};
         e.type = EventType::KeyPressed;
@@ -64,7 +123,7 @@ namespace ic
         return e;
     }
 
-    constexpr Event makeKeyReleased(IcKey key)
+    [[nodiscard]] constexpr Event makeKeyReleased(IcKey key)
     {
         Event e{};
         e.type = EventType::KeyReleased;
@@ -72,7 +131,7 @@ namespace ic
         return e;
     }
 
-    constexpr Event makeMouseMoved(
+    [[nodiscard]] constexpr Event makeMouseMoved(
         double x,
         double y)
     {
@@ -83,7 +142,7 @@ namespace ic
         return e;
     }
 
-    constexpr Event makeMouseScrolled(
+    [[nodiscard]] constexpr Event makeMouseScrolled(
         double dx,
         double dy)
     {
@@ -94,7 +153,7 @@ namespace ic
         return e;
     }
 
-    constexpr Event makeMouseButtonPressed(
+    [[nodiscard]] constexpr Event makeMouseButtonPressed(
         MouseButton button)
     {
         Event e{};
@@ -103,7 +162,7 @@ namespace ic
         return e;
     }
 
-    constexpr Event makeMouseButtonReleased(
+    [[nodiscard]] constexpr Event makeMouseButtonReleased(
         MouseButton button)
     {
         Event e{};
@@ -112,14 +171,14 @@ namespace ic
         return e;
     }
 
-    constexpr Event makeWindowClose()
+    [[nodiscard]] constexpr Event makeWindowClose()
     {
         Event e{};
         e.type = EventType::WindowClose;
         return e;
     }
 
-    constexpr Event makeWindowResize(
+    [[nodiscard]] constexpr Event makeWindowResize(
         uint32_t width,
         uint32_t height)
     {

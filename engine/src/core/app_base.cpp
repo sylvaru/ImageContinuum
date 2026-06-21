@@ -35,9 +35,12 @@ namespace ic
         // create input bound to window
         m_input = std::make_unique<GLFWInput>(*m_window);
 
-        m_window->bindEventSink([this](Event e)
+        m_window->bindEventSink(
+            [this](const Event& e)
             {
-                m_eventQueue.push(e);
+                m_eventBus.push(
+                    channelForEvent(e.type),
+                    e);
             });
 
         // create renderer after window exists
@@ -62,9 +65,7 @@ namespace ic
 
             m_window->pollEvents();
 
-            m_eventQueue.drain([&](Event& e) {
-                routeEvent(e);
-                });
+            drainEvents();
             
             onUpdate(1.0f / 60.0f);
 
@@ -76,16 +77,35 @@ namespace ic
         return 0;
     }
 
-    void AppBase::routeEvent(Event& e)
-    {
-        m_input->onEvent(e);
-        m_layerStack.dispatchEvent(e);
 
-        handleSystemEvents(e);
+    void AppBase::drainEvents()
+    {
+        m_eventBus.drain(
+            EventChannel::Input,
+            [this](Event& e)
+            {
+                routeInputEvent(e);
+            });
+
+        m_eventBus.drain(
+            EventChannel::Window,
+            [this](Event& e)
+            {
+                routeWindowEvent(e);
+            });
+
+        m_eventBus.drain(
+            EventChannel::Render,
+            [this](Event& e)
+            {
+                routeRenderEvent(e);
+            });
     }
 
-    void AppBase::handleSystemEvents(const Event& e)
+    void AppBase::routeInputEvent(Event& e)
     {
+        m_input->onEvent(e);
+
         switch (e.type)
         {
         case EventType::KeyPressed:
@@ -99,12 +119,38 @@ namespace ic
 
         case EventType::MouseButtonPressed:
         {
-            spdlog::info("Mouse button: {}", (int)e.mouseButton.button);
+            spdlog::info(
+                "Mouse button: {}",
+                (int)e.mouseButton.button);
             break;
         }
 
         default:
             break;
         }
+
+        m_layerStack.dispatchEvent(e);
+    }
+
+    void AppBase::routeWindowEvent(Event& e)
+    {
+        switch (e.type)
+        {
+        case EventType::WindowResize:
+            // renderer resize later
+            break;
+
+        case EventType::WindowClose:
+            m_window->requestClose();
+            break;
+
+        default:
+            break;
+        }
+        m_layerStack.dispatchEvent(e);
+    }
+
+    void AppBase::routeRenderEvent(Event&)
+    {
     }
 }

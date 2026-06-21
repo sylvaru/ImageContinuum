@@ -1,9 +1,5 @@
 // image_continuum/core/event_queue.h
 #pragma once
-#include <cstdint>
-#include <vector>
-#include <functional>
-#include <memory>
 #include <concurrentqueue.h>
 #include "image_continuum/interface/events.h"
 

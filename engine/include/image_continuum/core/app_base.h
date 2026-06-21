@@ -3,7 +3,7 @@
 #include "layer_stack.h"
 #include "image_continuum/interface/renderer_backend.h"
 #include "image_continuum/interface/window.h"
-#include "event_queue.h"
+#include "event_bus.h"
 
 namespace ic 
 {
@@ -61,8 +61,10 @@ namespace ic
         }
 
     private:
-        void routeEvent(Event& e);
-        void handleSystemEvents(const Event& e);
+        void routeInputEvent(Event& e);
+        void routeWindowEvent(Event& e);
+        void routeRenderEvent(Event& e);
+        void drainEvents();
 
         AppSpecification m_spec{};
         struct PlatformState;
@@ -75,6 +77,6 @@ namespace ic
 
         LayerStack m_layerStack{};
         AppServices m_services{};
-        EventQueue m_eventQueue{};
+        EventBus m_eventBus{};
     };
 }

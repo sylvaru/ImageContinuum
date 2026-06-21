@@ -33,7 +33,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/platform/glfw_input.cpp" 
     "src/platform/glfw_window.cpp" 
     "src/platform/glfw_window.cpp" 
-)
+ "include/image_continuum/core/event_bus.h" "src/core/event_bus.cpp")
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine
