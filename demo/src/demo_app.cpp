@@ -9,9 +9,9 @@ void DemoApp::onInit()
 	pushLayer<GameLayer>();
 }
 
-void DemoApp::onUpdate(float dt)
+void DemoApp::onUpdate([[maybe_unused]] float dt)
 {
-    (void)dt;
+
 }
 
 void DemoApp::onShutdown()

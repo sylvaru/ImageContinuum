@@ -9,7 +9,7 @@
 #include "image_continuum/interface/input.h"
 
 #include <spdlog/spdlog.h>
-
+#include "image_continuum/util/profiler.h"
 namespace ic
 {
     struct AppBase::PlatformState
@@ -24,7 +24,7 @@ namespace ic
 	}
     AppBase::~AppBase() = default;
 
-    void AppBase::initializeAppBase()
+    void AppBase::initAppBase()
     {
         createPlatform();
         createWindow();
@@ -34,17 +34,19 @@ namespace ic
 
         buildServices();
 
-        onInit();
+        onInit(); // client (DemoApp)
     }
 
     int AppBase::run([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
     {
         
-        initializeAppBase();
+        initAppBase();
 
         // main loop
         while (!m_window->shouldClose())
         {
+            ZoneScopedN("Frame");
+            
             m_input->beginFrame();
 
             m_window->pollEvents();
@@ -52,6 +54,8 @@ namespace ic
             m_eventFrameBuffer.beginFrame(m_frame);
 
             m_executor.execute(m_frame);
+
+            FrameMark;
         }
 
         shutdown();

@@ -1,5 +1,6 @@
 #include "image_continuum/core/frame_executor.h"
 #include "image_continuum/core/app_base.h"
+#include "image_continuum/util/profiler.h"
 
 namespace ic
 {
@@ -18,6 +19,8 @@ namespace ic
 
     void FrameExecutor::runInput(FrameContext& frame)
     {
+        ZoneScopedN("runInput");
+
         auto& f = *frame.eventFrame;
 
         for (size_t i = 0; i < kEventChannelCount; ++i)
@@ -34,17 +37,20 @@ namespace ic
 
     void FrameExecutor::runSimulation(FrameContext& frame)
     {
+        ZoneScopedN("runSimulation");
         m_app.onUpdate(frame.deltaTime);
         m_app.layerStack().updateAll(frame.deltaTime);
     }
 
     void FrameExecutor::runRenderPrep([[maybe_unused]] FrameContext& frame)
     {
+        ZoneScopedN("runRenderPrep");
         // build render graph, cull, prepare GPU data
     }
 
     void FrameExecutor::runRenderSubmit(FrameContext& frame)
     {
+        ZoneScopedN("runRenderSubmit");
         m_app.layerStack().renderAll(frame.interpolationAlpha);
     }
 }

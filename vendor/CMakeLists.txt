@@ -81,6 +81,13 @@ target_include_directories(stb INTERFACE
 )
 
 # -------------------------
+# Tracy
+# -------------------------
+set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
+set(TRACY_ON_DEMAND OFF CACHE BOOL "" FORCE)
+add_subdirectory(tracy)
+
+# -------------------------
 # ImGui
 # -------------------------
 set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/imgui")
@@ -120,4 +127,5 @@ target_link_libraries(ic_thirdparty INTERFACE
     fastgltf::fastgltf
     stb
     imgui
+    Tracy::TracyClient
 )

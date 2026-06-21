@@ -70,8 +70,7 @@ namespace ic
         void dispatchEvent(EventChannel channel, Event& e);
 
     private:
-    private:
-        void initializeAppBase();
+        void initAppBase();
         void shutdown();
 
         void createPlatform();

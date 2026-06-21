@@ -37,7 +37,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/platform/glfw_input.cpp" 
     "src/platform/glfw_window.cpp" 
     "src/platform/glfw_window.cpp" 
-   )
+    "include/image_continuum/util/profiler.h")
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine
