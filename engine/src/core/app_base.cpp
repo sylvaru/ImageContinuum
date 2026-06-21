@@ -19,44 +19,28 @@ namespace ic
 
 	AppBase::AppBase(AppSpecification spec)
 		: m_spec(std::move(spec))
+        , m_executor(*this)
 	{
 	}
     AppBase::~AppBase() = default;
 
-    int AppBase::run(int argc, char** argv)
+    void AppBase::initializeAppBase()
     {
-        (void)argc, argv;
-        // create and initialize glfw platform context
-        m_platform = std::make_unique<PlatformState>();
+        createPlatform();
+        createWindow();
+        createInput();
 
-        // create window using spec
-        m_window = std::make_unique<GLFWWindow>(m_spec.window);
+        bindEvents();
 
-        // create input bound to window
-        m_input = std::make_unique<GLFWInput>(*m_window);
+        buildServices();
 
-        m_window->bindEventSink(
-            [this](const Event& e)
-            {
-                m_eventBus.push(
-                    channelForEvent(e.type),
-                    e);
-            });
-
-        // create renderer after window exists
-        //m_renderer = createRenderer(
-        //    *m_window,
-        //    m_spec.renderer
-        //);
-
-        // build services view
-        m_services = AppServices{
-            m_input.get(),
-            m_window.get()
-        };
-
-        // user init
         onInit();
+    }
+
+    int AppBase::run([[maybe_unused]] int argc, [[maybe_unused]] char** argv)
+    {
+        
+        initializeAppBase();
 
         // main loop
         while (!m_window->shouldClose())
@@ -65,74 +49,58 @@ namespace ic
 
             m_window->pollEvents();
 
-            drainEvents();
-            
-            onUpdate(1.0f / 60.0f);
+            m_eventFrameBuffer.beginFrame(m_frame);
 
-            m_layerStack.updateAll(1.0f / 60.0f);
-            m_layerStack.renderAll(1.0f);
+            m_executor.execute(m_frame);
         }
 
-        onShutdown();
+        shutdown();
         return 0;
     }
 
-
-    void AppBase::drainEvents()
+    void AppBase::dispatchEvent(EventChannel channel, Event& e)
     {
-        m_eventBus.drain(
-            EventChannel::Input,
-            [this](Event& e)
-            {
-                routeInputEvent(e);
-            });
-
-        m_eventBus.drain(
-            EventChannel::Window,
-            [this](Event& e)
-            {
-                routeWindowEvent(e);
-            });
-
-        m_eventBus.drain(
-            EventChannel::Render,
-            [this](Event& e)
-            {
-                routeRenderEvent(e);
-            });
-    }
-
-    void AppBase::routeInputEvent(Event& e)
-    {
+        // global systems first
         m_input->onEvent(e);
 
-        switch (e.type)
+        // channel based routing
+        switch (channel)
         {
-        case EventType::KeyPressed:
-        {
-            if (e.key.key == IcKey::ESCAPE)
-            {
-                m_window->requestClose();
-            }
+        case EventChannel::Input:
+            handleInputEvent(e);
+            break;
+
+        case EventChannel::Window:
+            handleWindowEvent(e);
+            break;
+
+        case EventChannel::Render:
+            handleRenderEvent(e);
             break;
         }
 
-        case EventType::MouseButtonPressed:
+        // always reach layers
+        m_layerStack.dispatchEvent(e);
+    }
+
+    void AppBase::handleInputEvent(Event& e)
+    {
+        m_input->onEvent(e);
+
+        if (e.type == EventType::KeyPressed &&
+            e.key.key == IcKey::ESCAPE)
+        {
+            m_window->requestClose();
+        }
+
+        if (e.type == EventType::MouseButtonPressed)
         {
             spdlog::info(
                 "Mouse button: {}",
                 (int)e.mouseButton.button);
-            break;
         }
-
-        default:
-            break;
-        }
-
-        m_layerStack.dispatchEvent(e);
     }
-
-    void AppBase::routeWindowEvent(Event& e)
+    void AppBase::handleWindowEvent(Event& e)
     {
         switch (e.type)
         {
@@ -147,10 +115,55 @@ namespace ic
         default:
             break;
         }
-        m_layerStack.dispatchEvent(e);
     }
 
-    void AppBase::routeRenderEvent(Event&)
+    void AppBase::handleRenderEvent(Event&)
     {
+        // reserved for render driven events later
+    }
+
+    void AppBase::createPlatform()
+    {
+        m_platform =
+            std::make_unique<PlatformState>();
+    }
+
+    void AppBase::createWindow()
+    {
+        m_window =
+            std::make_unique<GLFWWindow>(
+                m_spec.window);
+    }
+
+    void AppBase::createInput()
+    {
+        m_input =
+            std::make_unique<GLFWInput>(
+                *m_window);
+    }
+
+    void AppBase::bindEvents()
+    {
+        m_window->bindEventSink(
+            [this](const Event& e)
+            {
+                m_eventFrameBuffer.push(
+                    channelForEvent(e.type),
+                    e);
+            });
+    }
+
+    void AppBase::buildServices()
+    {
+        m_services =
+        {
+            m_input.get(),
+            m_window.get()
+        };
+    }
+
+    void AppBase::shutdown()
+    {
+        onShutdown();
     }
 }

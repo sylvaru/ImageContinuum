@@ -9,9 +9,15 @@ namespace ic
     {
     public:
 
-		void push(const Event& e);
+		void push(const Event& e)
+		{
+			m_queue.enqueue(e);
+		}
 
-		bool tryPop(Event& out);
+		bool tryPop(Event& out)
+		{
+			return m_queue.try_dequeue(out);
+		}
 
 		template<typename Fn>
 		void drain(Fn&& fn)

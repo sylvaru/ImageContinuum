@@ -4,12 +4,11 @@
 #include "image_continuum/interface/events.h"
 
 
-void GameLayer::onUpdate(float dt) { 
-	(void)dt;/* Perform math here */ 
+void GameLayer::onUpdate([[maybe_unused]] float dt) {
+	/* Perform math here */ 
 }
-void GameLayer::onRender(float alpha) { 
-	(void)alpha;/* Submit flat data buffers */ 
+void GameLayer::onRender([[maybe_unused]] float alpha) {
+	/* Submit flat data buffers */ 
 }
-void GameLayer::onEvent(ic::Event& e) {
-	(void)e;/* */
+void GameLayer::onEvent([[maybe_unused]] ic::Event& e) {
 }

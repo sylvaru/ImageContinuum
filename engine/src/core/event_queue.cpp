@@ -5,13 +5,5 @@
 
 namespace ic
 {
-	void EventQueue::push(const Event& e)
-	{
-		m_queue.enqueue(e);
-	}
 
-	bool EventQueue::tryPop(Event& out)
-	{
-		return m_queue.try_dequeue(out);
-	}
 }

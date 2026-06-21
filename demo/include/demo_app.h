@@ -17,7 +17,15 @@ public:
 	GameLayer& getGameLayer() { return m_gameLayer; }
 
 private:
-    static ic::AppSpecification createSpecification();
+    static ic::AppSpecification createSpecification()
+    {
+        ic::AppSpecification spec;
+
+        spec.appName = "Demo App";
+        spec.window.width = 1920;
+        spec.window.height = 1080;
+        return spec;
+    }
 
 	GameLayer m_gameLayer;
 };

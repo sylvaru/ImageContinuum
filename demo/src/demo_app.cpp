@@ -18,13 +18,3 @@ void DemoApp::onShutdown()
 {
 	spdlog::info("[ Demo App ] onShutdown..");
 }
-
-ic::AppSpecification DemoApp::createSpecification()
-{
-    ic::AppSpecification spec;
-
-    spec.appName = "Demo App";
-    spec.window.width = 1920;
-    spec.window.height = 1080;
-    return spec;
-}

@@ -14,26 +14,30 @@ add_library(ImageContinuumEngine ${LIB_TYPE})
 target_sources(ImageContinuumEngine PRIVATE
     "include/image_continuum/core/app_base.h" 
     "include/image_continuum/core/event_queue.h" 
-    "include/image_continuum/interface/layer.h" 
-    "include/image_continuum/interface/events.h"
-    "include/image_continuum/interface/window.h" 
-    "include/image_continuum/interface/renderer_backend.h" 
-    "include/image_continuum/interface/input.h" 
+    "include/image_continuum/core/event_frame_buffer.h" 
+    "include/image_continuum/core/frame.h"
+    "include/image_continuum/core/frame_executor.h"
     "include/image_continuum/common/ic_common.h" 
     "include/image_continuum/common/ic_key_codes.h"  
     "include/image_continuum/platform/glfw_input.h" 
     "include/image_continuum/platform/glfw_context.h" 
     "include/image_continuum/platform/rendering/graphics_api.h" 
-    
+    "include/image_continuum/interface/layer.h" 
+    "include/image_continuum/interface/events.h"
+    "include/image_continuum/interface/window.h" 
+    "include/image_continuum/interface/renderer_backend.h" 
+    "include/image_continuum/interface/input.h" 
 
     "src/core/app_base.cpp" 
     "src/core/layer_stack.cpp" 
     "src/core/event_queue.cpp"
+    "src/core/event_frame_buffer.cpp" 
+    "src/core/frame_executor.cpp"
     "src/platform/rendering/graphics_api.cpp"
     "src/platform/glfw_input.cpp" 
     "src/platform/glfw_window.cpp" 
     "src/platform/glfw_window.cpp" 
- "include/image_continuum/core/event_bus.h" "src/core/event_bus.cpp")
+   )
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine

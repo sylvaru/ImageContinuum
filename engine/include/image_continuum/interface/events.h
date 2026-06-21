@@ -34,8 +34,13 @@ namespace ic
         Input,
         Window,
         System,
-        Render
+        Render,
+
+        Count
     };
+
+    constexpr size_t kEventChannelCount =
+        static_cast<size_t>(EventChannel::Count);
 
     struct Event
     {

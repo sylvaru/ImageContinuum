@@ -3,7 +3,8 @@
 #include "layer_stack.h"
 #include "image_continuum/interface/renderer_backend.h"
 #include "image_continuum/interface/window.h"
-#include "event_bus.h"
+#include "event_frame_buffer.h"
+#include "frame_executor.h"
 
 namespace ic 
 {
@@ -40,7 +41,6 @@ namespace ic
 
         virtual ~AppBase();
         virtual void onInit() {}
-        virtual void onUpdate(float dt) { (void)dt; }
         virtual void onShutdown() {}
 
         void onEvent(Event& e)
@@ -55,16 +55,34 @@ namespace ic
                 std::forward<Args>(args)...);
         }
 
+    public:
         AppServices& services()
         {
             return m_services;
         }
 
+        LayerStack& layerStack()
+        {
+            return m_layerStack;
+        }
+        virtual void onUpdate(float dt) { (void)dt; }
+
+        void dispatchEvent(EventChannel channel, Event& e);
+
     private:
-        void routeInputEvent(Event& e);
-        void routeWindowEvent(Event& e);
-        void routeRenderEvent(Event& e);
-        void drainEvents();
+    private:
+        void initializeAppBase();
+        void shutdown();
+
+        void createPlatform();
+        void createWindow();
+        void createInput();
+        void bindEvents();
+        void buildServices();
+
+        void handleInputEvent(Event& e);
+        void handleWindowEvent(Event& e);
+        void handleRenderEvent(Event&);
 
         AppSpecification m_spec{};
         struct PlatformState;
@@ -77,6 +95,8 @@ namespace ic
 
         LayerStack m_layerStack{};
         AppServices m_services{};
-        EventBus m_eventBus{};
+        EventFrameBuffer m_eventFrameBuffer{};
+        FrameContext m_frame{};
+        FrameExecutor m_executor{ *this };
     };
 }
