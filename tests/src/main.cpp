@@ -1,6 +1,6 @@
 // test/src/main.cpp
 #include "common/tests_pch.h"
-#include "image_continuum/interface/events.h"
+#include "ic/core/events.h"
 
 struct TestLayer 
 {

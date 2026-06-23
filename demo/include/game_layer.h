@@ -1,13 +1,14 @@
 // game_layer.h
 #pragma once
-#include "image_continuum/interface/layer.h"
+#include "ic/interface/layer.h"
 
 struct ic::Event;
+struct ic::FrameContext;
 
 class GameLayer : public ic::Layer 
 {
 public:
-    void onUpdate(float dt);
-    void onRender(float alpha);
-    void onEvent(ic::Event& e);
+    void onUpdate(ic::FrameContext& ctx) override;
+    void onRender(float alpha) override;
+    //void onEvent(ic::Event& e);
 };

@@ -12,32 +12,52 @@ add_library(ImageContinuumEngine ${LIB_TYPE})
 
 # Add source files
 target_sources(ImageContinuumEngine PRIVATE
-    "include/image_continuum/core/app_base.h" 
-    "include/image_continuum/core/event_queue.h" 
-    "include/image_continuum/core/event_frame_buffer.h" 
-    "include/image_continuum/core/frame.h"
-    "include/image_continuum/core/frame_executor.h"
-    "include/image_continuum/common/ic_common.h" 
-    "include/image_continuum/common/ic_key_codes.h"  
-    "include/image_continuum/platform/glfw_input.h" 
-    "include/image_continuum/platform/glfw_context.h" 
-    "include/image_continuum/platform/rendering/graphics_api.h" 
-    "include/image_continuum/interface/layer.h" 
-    "include/image_continuum/interface/events.h"
-    "include/image_continuum/interface/window.h" 
-    "include/image_continuum/interface/renderer_backend.h" 
-    "include/image_continuum/interface/input.h" 
+    "include/ic/core/app_base.h" 
+    "include/ic/core/event_queue.h" 
+    "include/ic/core/event_frame_buffer.h" 
+    "include/ic/core/frame.h"
+    "include/ic/core/frame_executor.h"
 
-    "src/core/app_base.cpp" 
-    "src/core/layer_stack.cpp" 
-    "src/core/event_queue.cpp"
-    "src/core/event_frame_buffer.cpp" 
-    "src/core/frame_executor.cpp"
-    "src/platform/rendering/graphics_api.cpp"
-    "src/platform/glfw_input.cpp" 
-    "src/platform/glfw_window.cpp" 
-    "src/platform/glfw_window.cpp" 
-    "include/image_continuum/util/profiler.h")
+    "include/ic/common/ic_common.h" 
+    "include/ic/common/ic_key_codes.h"  
+
+    "include/ic/util/profiler.h"
+
+    "include/ic/platform/glfw_input.h" 
+    "include/ic/platform/glfw_context.h" 
+
+    "include/ic/interface/layer.h" 
+    "include/ic/core/events.h"
+    "include/ic/interface/window.h" 
+    "include/ic/interface/input.h" 
+
+    "include/ic/renderer/renderer_specification.h" 
+    "include/ic/renderer/graphics_api.h" 
+    "include/ic/renderer/render_types.h"
+    "include/ic/renderer/render_world.h"
+    "include/ic/renderer/frame_graph/frame_graph.h" 
+    "include/ic/renderer/vulkan_backend/vulkan_backend.h" 
+    "include/ic/renderer/frame_graph/frame_graph_node.h"
+    "include/ic/renderer/renderer_backend.h"
+    "include/ic/renderer/render_handles.h" 
+    "include/ic/renderer/renderer_path/renderer_path.h" 
+    "include/ic/renderer/renderer_path/deferred_path.h"
+    "include/ic/core/job_system.h" 
+
+    "src/ic/core/app_base.cpp" 
+    "src/ic/core/layer_stack.cpp" 
+    "src/ic/core/event_queue.cpp"
+    "src/ic/core/event_frame_buffer.cpp" 
+    "src/ic/core/frame_executor.cpp"
+
+    "src/ic/renderer/graphics_api.cpp"
+    "src/ic/platform/glfw_input.cpp" 
+    "src/ic/platform/glfw_window.cpp" 
+    "src/ic/renderer/vulkan_backend/vulkan_backend.cpp" 
+    "src/ic/renderer/frame_graph/frame_graph.cpp"
+    "src/ic/renderer/renderer_backend.cpp"
+    
+    "src/ic/core/job_system.cpp" "include/ic/core/clock.h" "include/ic/common/ic_fwd.h" "include/ic/renderer/frame_graph/frame_graph_compiler.h" "src/ic/renderer/frame_graph/frame_graph_compiler.cpp" "include/ic/core/frame_arena.h" "include/ic/core/thread_arena.h")
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine
@@ -53,7 +73,7 @@ target_include_directories(ImageContinuumEngine
 # Setup PCH
 target_precompile_headers(ImageContinuumEngine
     PRIVATE 
-        "include/image_continuum/common/ic_pch.h"
+        "include/ic/common/ic_pch.h"
 )
 
 target_compile_options(ImageContinuumEngine PRIVATE

@@ -1,5 +1,5 @@
 // demo/include/sandbox_app.h
-#include "image_continuum/core/app_base.h"
+#include "ic/core/app_base.h"
 #include "game_layer.h"
 
 
