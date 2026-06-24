@@ -84,7 +84,7 @@ target_include_directories(stb INTERFACE
 # =========================================================
 # Tracy
 # =========================================================
-set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
+set(TRACY_ENABLE OFF CACHE BOOL "" FORCE)
 set(TRACY_ON_DEMAND OFF CACHE BOOL "" FORCE)
 set(TRACY_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(TRACY_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
@@ -126,15 +126,15 @@ add_dependencies(ic_thirdparty concurrentqueue)
 
 target_link_libraries(ic_thirdparty INTERFACE
     vulkan-headers
-    tomlplusplus::tomlplusplus
     glfw
     spdlog
     miniaudio
-    EnTT::EnTT
     glm
     concurrentqueue
-    fastgltf::fastgltf
     stb
     imgui
+    tomlplusplus::tomlplusplus
+    fastgltf::fastgltf
+    EnTT::EnTT
     Tracy::TracyClient
 )

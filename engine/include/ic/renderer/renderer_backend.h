@@ -5,6 +5,8 @@
 
 namespace ic 
 {
+    struct CompiledFramePlan;
+    struct FrameContext;
 
     class RendererBackend
     {
@@ -18,8 +20,9 @@ namespace ic
         virtual void immediate_create_bffer(
             BufferHandle handle, uint64_t size) = 0;
 
-        virtual void submit_frame_commands(
-            const class CompiledFramePlan& plan) = 0;
+        virtual void execute(
+            const CompiledFramePlan& plan,
+            const FrameContext& frame) = 0;
 
     };
 

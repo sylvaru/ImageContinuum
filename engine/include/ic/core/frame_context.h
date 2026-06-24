@@ -5,8 +5,10 @@
 namespace ic
 {
     struct EventFrame;
-    class JobSystem;
     struct Input;
+    class FrameArena;
+    class JobSystem;
+    
 
     struct FrameContext
     {
@@ -20,9 +22,10 @@ namespace ic
         
         EventFrame* eventFrame;
         Input* input;
-        //FrameArena* arena;
         JobSystem* jobs;
         //RendererBackend* renderer;
+
+        FrameArena* arena;
     };
 
 

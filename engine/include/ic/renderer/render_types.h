@@ -19,4 +19,6 @@ namespace ic
         uint32_t materialIndex; // Index into a global SSBO (Bindless)
         uint32_t meshIndex;     // Index into global vertex/index buffer (BDA)
     };
+
+    // GPU Ring buffer
 }

@@ -1,4 +1,4 @@
-// ic/rendering/render_node.h
+// ic/rendering/render_world.h
 #pragma once
 
 namespace ic

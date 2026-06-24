@@ -4,6 +4,11 @@
 #include "ic/core/app_base.h"
 #include "ic/util/profiler.h"
 #include "ic/core/event_frame_buffer.h"
+#include "ic/core/memory/frame_arena.h"
+#include "ic/core/frame_context.h"
+
+
+#include <spdlog/spdlog.h>
 
 namespace ic
 {
@@ -22,7 +27,7 @@ namespace ic
 
     void FrameExecutor::runInput(FrameContext& frame)
     {
-        //ZoneScopedN("runInput");
+        ZoneScopedN("runInput");
 
         auto& f = *frame.eventFrame;
 
@@ -41,20 +46,30 @@ namespace ic
 
     void FrameExecutor::runSimulation(FrameContext& frame)
     {
-        //ZoneScopedN("runSimulation");
+        ZoneScopedN("runSimulation");
         m_app.onUpdate(frame.deltaTime);
         m_app.layerStack().updateAll(frame);
     }
 
     void FrameExecutor::runRenderPrep([[maybe_unused]] FrameContext& frame)
     {
-        //ZoneScopedN("runRenderPrep");
+        ZoneScopedN("runRenderPrep");
         // build render graph, cull, prepare GPU data
+        struct TestStruct
+        {
+            int x{};
+            float y{};
+        };
+        auto* data = frame.arena->alloc<TestStruct>(FrameRegion::RenderPrep);
+        data->x = 12;
+        data->y = 3.24f;
+
+        //spdlog::info("{} {}", data->x, data->y);
     }
 
     void FrameExecutor::runRenderSubmit([[maybe_unused]] FrameContext& frame)
     {
-        //ZoneScopedN("runRenderSubmit");
+        ZoneScopedN("runRenderSubmit");
         m_app.layerStack().renderAll(frame.interpolationAlpha);
     }
 }

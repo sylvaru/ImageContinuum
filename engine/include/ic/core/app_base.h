@@ -7,7 +7,7 @@
 
 #include "layer_stack.h"
 #include "clock.h"
-#include "frame.h"
+#include "frame_context.h"
 
 
 namespace ic 
@@ -29,6 +29,8 @@ namespace ic
         WindowSpecification window;
 
         RendererSpecification renderer;
+
+        static constexpr size_t kMaxFramesInFlight = 2;
     };
 
     class AppBase
@@ -81,8 +83,11 @@ namespace ic
         void createPlatform();
         void createWindow();
         void createInput();
-        void bindEvents();
+        void createFrameArenas();
+
         void buildServices();
+        void bindEventSink();
+        void sleep(const auto& frameStart);
 
         void handleInputEvent(Event& e);
         void handleWindowEvent(Event& e);

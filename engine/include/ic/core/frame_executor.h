@@ -1,9 +1,10 @@
 #pragma once
-#include "frame.h"
+
 
 namespace ic
 {
     class AppBase;
+    struct FrameContext;
 
     enum class FramePhase
     {

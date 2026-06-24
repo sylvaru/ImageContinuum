@@ -8,5 +8,5 @@ namespace ic
 		uint8_t* begin;
 		uint8_t* current;
 		uint8_t* end;
-	}
+	};
 }

@@ -16,10 +16,10 @@ namespace ic
 		PathTraced
 	};
 
-	class IRenderPath
+	class RendererPath
 	{
 	public:
-		virtual ~IRenderPath() = default;
+		virtual ~RendererPath() = default;
 
 		virtual void setupGraph(
 			FrameGraphBuilder& builder,

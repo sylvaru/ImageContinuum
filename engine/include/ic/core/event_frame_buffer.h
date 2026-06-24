@@ -20,21 +20,37 @@ namespace ic
     };
 
     // Frame local event storage
+
+    template<size_t FrameCount>
     class EventFrameBuffer
     {
     public:
-        static constexpr size_t kFrameCount = 2;
 
         EventFrameBuffer() = default;
 
-        void ingest(EventQueue& globalQueue);
+        void ingest(EventQueue& globalQueue)
+        {
+            Event e;
+            while (globalQueue.tryPop(e))
+            {
+                auto ch = channelForEvent(e.type);
+                m_frames[m_write].get(ch).push(e);
+            }
+        }
 
         // Called at frame start (game thread)
-        void beginFrame(FrameContext& ctx);
+        void beginFrame(FrameContext& ctx)
+        {
+            // Ring buffer indexing replacing the XOR (m_write ^= 1) bit hack
+            // This safely scales to 1, 2, or N frames in flight seamlessly
+            const size_t read = m_write;
+            m_write = (ctx.frameIndex + 1) % FrameCount;
+            ctx.eventFrame = &m_frames[read];
+        }
 
     private:
 
-        std::array<EventFrame, kFrameCount> m_frames;
+        std::array<EventFrame, FrameCount> m_frames;
 
         int m_write = 0;
     };

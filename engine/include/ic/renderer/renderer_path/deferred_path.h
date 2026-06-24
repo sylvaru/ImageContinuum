@@ -6,12 +6,11 @@ namespace ic
     // EXAMPLE PATH
     // 
     // 
-    //class DeferredPath : public IRenderPath
+    //class DeferredPath : public RenderPath
     //{
     //public:
     //    void setupGraph(FrameGraphBuilder& builder, const RenderScenePacket& packet) override
     //    {
-    //        // 1. COMPUTE PASS: GPU Culling
     //        builder.addNode("GPU_Culling", QueueType::Compute)
     //            .write(packet.hzbTexture) // Dependency tracking
     //            .execute([=](const RenderContext& ctx) {
@@ -20,7 +19,6 @@ namespace ic
     //            ctx.backend->dispatchCompute(packet.objectCount / 64, 1, 1);
     //                });
 
-    //        // 2. RASTER PASS: G-Buffer Generation
     //        builder.addNode("GBuffer_Pass", QueueType::Graphics)
     //            .read(packet.hzbTexture)
     //            .write(packet.gBufferAlbedo)
@@ -32,7 +30,6 @@ namespace ic
     //            ctx.backend->endRenderPass();
     //                });
 
-    //        // 3. COMPUTE PASS: Direct Lighting / Tiled Shading
     //        builder.addPass("Deferred_Lighting", QueueType::Compute)
     //            .read(packet.gBufferAlbedo)
     //            .write(packet.hdrColorTarget)

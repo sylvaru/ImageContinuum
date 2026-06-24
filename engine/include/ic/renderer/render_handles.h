@@ -4,30 +4,89 @@
 namespace ic 
 {
 
-    // 32 bit Generational Handles. 20 bits for indexing (1M distinct objects), 
-    // 12 bits for generational tracking to eliminate dangling handle bugs.
     struct TextureHandle
     {
-        uint32_t index : 20;
-        uint32_t generation : 12;
+        uint32_t value = Invalid;
 
-        inline bool isValid() const { return index != 0xFFFFF; }
+        static constexpr uint32_t Invalid = 0xFFFFFFFFu;
+
+        uint32_t index() const
+        {
+            return value & 0xFFFFFu;
+        }
+
+        uint32_t generation() const
+        {
+            return value >> 20;
+        }
     };
 
     struct BufferHandle
     {
-        uint32_t index : 20;
-        uint32_t generation : 12;
+        uint32_t value = Invalid;
 
-        inline bool isValid() const { return index != 0xFFFFF; }
+        static constexpr uint32_t Invalid = 0xFFFFFFFFu;
+
+        uint32_t index() const
+        {
+            return value & 0xFFFFFu;
+        }
+
+        uint32_t generation() const
+        {
+            return value >> 20;
+        }
     };
 
     struct PipelineHandle
     {
-        uint32_t index : 20;
-        uint32_t generation : 12;
+        uint32_t value = Invalid;
 
-        inline bool isValid() const { return index != 0xFFFFF; }
+        static constexpr uint32_t Invalid = 0xFFFFFFFFu;
+
+        uint32_t index() const
+        {
+            return value & 0xFFFFFu;
+        }
+
+        uint32_t generation() const
+        {
+            return value >> 20;
+        }
+    };
+
+    struct MaterialHandle
+    {
+        uint32_t value = Invalid;
+
+        static constexpr uint32_t Invalid = 0xFFFFFFFFu;
+
+        uint32_t index() const
+        {
+            return value & 0xFFFFFu;
+        }
+
+        uint32_t generation() const
+        {
+            return value >> 20;
+        }
+    };
+
+    struct MeshHandle
+    {
+        uint32_t value = Invalid;
+
+        static constexpr uint32_t Invalid = 0xFFFFFFFFu;
+
+        uint32_t index() const
+        {
+            return value & 0xFFFFFu;
+        }
+
+        uint32_t generation() const
+        {
+            return value >> 20;
+        }
     };
 
 }

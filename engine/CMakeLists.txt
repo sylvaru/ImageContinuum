@@ -15,7 +15,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/core/app_base.h" 
     "include/ic/core/event_queue.h" 
     "include/ic/core/event_frame_buffer.h" 
-    "include/ic/core/frame.h"
+    "include/ic/core/frame_context.h"
     "include/ic/core/frame_executor.h"
 
     "include/ic/common/ic_common.h" 
@@ -43,11 +43,24 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/renderer_path/renderer_path.h" 
     "include/ic/renderer/renderer_path/deferred_path.h"
     "include/ic/core/job_system.h" 
+    "include/ic/util/util.h"
+    "include/ic/core/memory/frame_arena_region.h"
+    "include/ic/core/memory/frame_memory_types.h"
+    "include/ic/renderer/frame_graph/frame_graph_edge.h"
+    "include/ic/renderer/frame_graph/frame_graph_types.h" 
+    "include/ic/renderer/frame_graph/frame_graph_pass.h"
+    "include/ic/core/clock.h" 
+    "include/ic/common/ic_fwd.h" 
+    "include/ic/core/memory/frame_arena.h" 
+    "include/ic/core/memory/thread_arena.h" 
+    "include/ic/core/memory/frame_arena_manager.h"
+    "include/ic/core/memory/frame_arena_storage.h"
+    "include/ic/renderer/frame_graph/frame_graph_compiler.h"
 
     "src/ic/core/app_base.cpp" 
     "src/ic/core/layer_stack.cpp" 
     "src/ic/core/event_queue.cpp"
-    "src/ic/core/event_frame_buffer.cpp" 
+     
     "src/ic/core/frame_executor.cpp"
 
     "src/ic/renderer/graphics_api.cpp"
@@ -57,7 +70,11 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/renderer/frame_graph/frame_graph.cpp"
     "src/ic/renderer/renderer_backend.cpp"
     
-    "src/ic/core/job_system.cpp" "include/ic/core/clock.h" "include/ic/common/ic_fwd.h" "include/ic/renderer/frame_graph/frame_graph_compiler.h" "src/ic/renderer/frame_graph/frame_graph_compiler.cpp" "include/ic/core/frame_arena.h" "include/ic/core/thread_arena.h")
+    "src/ic/core/job_system.cpp"
+    "src/ic/renderer/frame_graph/frame_graph_compiler.cpp"
+    "src/ic/core/memory/frame_arena.cpp" 
+
+    )
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine

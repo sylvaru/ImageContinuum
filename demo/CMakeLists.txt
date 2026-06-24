@@ -11,7 +11,8 @@ add_executable(ImageContinuumDemo
 set_property(TARGET ImageContinuumDemo PROPERTY CXX_STANDARD 20)
 set_property(TARGET ImageContinuumDemo PROPERTY CXX_STANDARD_REQUIRED ON)
 
-# Tell the demo executable where to find its own local include folder
+# Tell the demo executable where to find 
+# its own local include folder
 target_include_directories(ImageContinuumDemo 
     PRIVATE 
         include

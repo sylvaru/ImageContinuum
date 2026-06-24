@@ -11,6 +11,8 @@
 #include "ic/util/profiler.h"
 #include "ic/core/event_frame_buffer.h"
 #include "ic/core/frame_executor.h"
+#include "ic/core/memory/frame_arena.h"
+#include "ic/core/memory/frame_arena_manager.h"
 #include <spdlog/spdlog.h>
 
 
@@ -31,14 +33,18 @@ namespace ic
 
     struct AppBase::AppRuntime
     {
-        Scope<PlatformState> platform;
-        Scope<Window> window;
-        Scope<Input> input;
-        Scope<JobSystem> jobs;
-        Scope<EventQueue> eventQueue;
+        Scope<PlatformState>        platform;
+        Scope<Window>               window;
+        Scope<Input>                input;
+        Scope<JobSystem>            jobs;
+        Scope<EventQueue>           eventQueue;
+        Scope<FrameArenaManager<AppSpecification::kMaxFramesInFlight>> 
+                                    frameArenas;
+        
 
-        EventFrameBuffer eventBuffer;
-        FrameExecutor executor;
+        EventFrameBuffer<AppSpecification::kMaxFramesInFlight> 
+                                    eventBuffer;
+        FrameExecutor               executor;
 
         AppRuntime(AppBase& app)
             : executor(app)
@@ -58,8 +64,9 @@ namespace ic
         createWindow();
         createInput();
         createJobSystem();
+        createFrameArenas();
 
-        bindEvents();
+        bindEventSink();
         buildServices();
 
     }
@@ -79,37 +86,31 @@ namespace ic
         // Main Loop
         while (!m_runtime->window->shouldClose())
         {
-            //ZoneScopedN("Frame");
+            ZoneScopedN("Frame");
 
             auto frameStart = std::chrono::steady_clock::now();
 
-            m_runtime->window->pollEvents();
-            m_runtime->input->beginFrame();
-
+            ++m_frame.frameIndex;
             m_frame.deltaTime = m_clock.tick();
             m_frame.timeSinceStart = m_clock.getTimeSinceStart();
+            
+            auto& arena =
+                m_runtime->frameArenas->beginFrame(
+                    m_frame.frameIndex);
+            arena.reset();
+            m_frame.arena = &arena;
 
+            m_runtime->window->pollEvents();
             m_runtime->eventBuffer.ingest(*m_runtime->eventQueue);
+            m_runtime->input->beginFrame();
             m_runtime->eventBuffer.beginFrame(m_frame);
-
+           
             m_runtime->executor.execute(m_frame);
 
-            //FrameMark;
-
             // Frame pacing
-            auto frameEnd = std::chrono::steady_clock::now();
+            sleep(frameStart);
 
-            std::chrono::duration<float> frameTime = frameEnd - frameStart;
-
-            float sleepTime = kTargetFrameTime - frameTime.count();
-
-            if (sleepTime > 0.0f)
-            {
-                std::this_thread::sleep_for(
-                    std::chrono::duration<float>(sleepTime)
-                );
-            }
-
+            FrameMark;
         }
 
         shutdown();
@@ -158,7 +159,7 @@ namespace ic
         switch (e.type)
         {
         case EventType::WindowResize:
-            // renderer resize later
+            // window and renderer swapchain resize later
             break;
 
         case EventType::WindowClose:
@@ -173,6 +174,19 @@ namespace ic
     void AppBase::handleRenderEvent([[maybe_unused]] Event& e)
     {
         // reserved for render driven events later
+    }
+
+    void AppBase::sleep(const auto& frameStart)
+    {
+        auto frameEnd = std::chrono::steady_clock::now();
+        std::chrono::duration<float> frameTime = frameEnd - frameStart;
+        float sleepTime = kTargetFrameTime - frameTime.count();
+        if (sleepTime > 0.0f)
+        {
+            std::this_thread::sleep_for(
+                std::chrono::duration<float>(sleepTime)
+            );
+        }
     }
 
     void AppBase::createPlatform()
@@ -190,6 +204,12 @@ namespace ic
 
     }
 
+    void AppBase::createFrameArenas()
+    {
+        m_runtime->frameArenas =
+            std::make_unique<FrameArenaManager<AppSpecification::kMaxFramesInFlight>>(16 * 1024 * 1024);
+    }
+
     void AppBase::createWindow()
     {
         m_runtime->window =
@@ -204,7 +224,7 @@ namespace ic
                 *m_runtime->window);
     }
 
-    void AppBase::bindEvents()
+    void AppBase::bindEventSink()
     {
         m_runtime->window->bindEventSink(
             [this](const Event& e)
