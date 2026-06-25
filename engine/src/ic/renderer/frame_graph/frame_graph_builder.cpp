@@ -5,28 +5,6 @@
 
 namespace ic
 {
-	GraphNodeId
-		FrameGraphBuilder::addGraphNode(
-			GraphNodeType type,
-			QueueType queue)
-	{
-		GraphNodeId id =
-			static_cast<GraphNodeId>(
-				m_nodes.size());
-
-		m_nodes.push_back({
-			.id = id,
-			.queue = queue,
-			.type = type,
-			.firstRead = 0,
-			.readCount = 0,
-			.firstWrite = 0,
-			.writeCount = 0,
-			.payloadIndex = 0
-			});
-
-		return id;
-	}
 
 	GraphResourceId
 		FrameGraphBuilder::createTexture()
@@ -67,7 +45,7 @@ namespace ic
 			GraphResourceId resource,
 			ResourceUsage usage)
 	{
-		m_reads.push_back({
+		m_nodes[node].accesses.push_back({
 			.node = node,
 			.resource = resource,
 			.access = AccessType::Read,
@@ -80,7 +58,7 @@ namespace ic
 			GraphResourceId resource,
 			ResourceUsage usage)
 	{
-		m_writes.push_back({
+		m_nodes[node].accesses.push_back({
 			.node = node,
 			.resource = resource,
 			.access = AccessType::Write,
@@ -92,7 +70,6 @@ namespace ic
 	{
 		m_nodes.clear();
 		m_resources.clear();
-		m_reads.clear();
-		m_writes.clear();
+		m_payloads.clear();
 	}
 }

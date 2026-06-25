@@ -35,4 +35,9 @@ namespace ic
         //    const PipelineDesc&) = 0;
     };
 
+    // Backend should eventually know almost nothing about how dependencies were generated
+    //for (GraphNodeId nodeId : plan.executionOrder)
+    //{
+    //    executeNode(nodeId);
+    //}
 }

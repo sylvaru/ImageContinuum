@@ -21,21 +21,9 @@ namespace ic
         }
 
         void execute(
-            const CompiledGraphPlan& plan,
-            const FrameContext&) override
+            [[maybe_unused]] const CompiledGraphPlan& plan,
+            [[maybe_unused]] const FrameContext& ctx) override
         {
-            spdlog::info("--- Vulkan Backend Execution ---");
-
-            for (const auto& node : plan.nodes)
-            {
-                spdlog::info(
-                    "Node {} | Queue {} | Type {}",
-                    node.nodeId,
-                    static_cast<int>(node.queue),
-                    static_cast<int>(node.type));
-            }
-
-            spdlog::info("------");
         }
     };
 }

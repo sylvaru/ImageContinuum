@@ -3,6 +3,7 @@
 
 namespace ic
 {
+
     using GraphNodeId = uint32_t;
     using GraphResourceId = uint32_t;
 
@@ -54,17 +55,15 @@ namespace ic
         Present
     };
 
-    struct Barrier
+    struct ResourceBarrier
     {
         GraphResourceId resource;
 
-        ResourceUsage before;
+        GraphNodeId fromNode;
+        GraphNodeId toNode;
 
-        ResourceUsage after;
-
-        QueueType sourceQueue;
-
-        QueueType destinationQueue;
+        ResourceUsage oldUsage;
+        ResourceUsage newUsage;
     };
 
     struct Dependency
@@ -78,14 +77,7 @@ namespace ic
         GraphNodeId id;
 
         QueueType queue;
-
         GraphNodeType type;
-
-        uint32_t firstRead;
-        uint32_t readCount;
-
-        uint32_t firstWrite;
-        uint32_t writeCount;
 
         uint32_t payloadIndex;
     };
@@ -107,6 +99,20 @@ namespace ic
         uint32_t payloadIndex;
     };
 
+    struct ResourceAccess 
+    {
+        GraphNodeId node;
+        GraphResourceId resource;
+        AccessType access;
+        ResourceUsage usage;
+    };
+
+    struct NodeRecord
+    {
+        GraphNode graphNode;
+        std::pmr::vector<ResourceAccess> accesses;
+    };
+
     struct GraphResource
     {
         GraphResourceId id;
@@ -114,14 +120,6 @@ namespace ic
 
         uint32_t firstAccess;
         uint32_t accessCount;
-    };
-
-    struct ResourceAccess 
-    {
-        GraphNodeId node;
-        GraphResourceId resource;
-        AccessType access;
-        ResourceUsage usage;
     };
 
     struct ResourceLifetime

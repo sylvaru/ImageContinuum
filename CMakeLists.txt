@@ -15,7 +15,6 @@ option(IC_BUILD_SHARED "Build libraries as shared" OFF)
 # Setup the scalable compiler warnings module
 include(cmake/CompilerWarnings.cmake)
 
-
 # Add external dependencies first
 add_subdirectory(vendor)
 

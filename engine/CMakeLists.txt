@@ -74,7 +74,14 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/renderer/frame_graph/frame_graph_compiler.cpp"
     "src/ic/core/memory/frame_arena.cpp" 
 
-     "include/ic/renderer/frame_graph/frame_graph_builder.h" "src/ic/renderer/frame_graph/frame_graph_builder.cpp"   "include/ic/renderer/frame_graph/compiled_graph_plan.h"  "include/ic/renderer/frame_graph/frame_graph_cache.h" "include/ic/renderer/renderer.h" "src/ic/renderer/renderer.cpp" "include/ic/renderer/frame_graph/frame_graph_arena.h" "include/ic/renderer/renderer_types.h")
+    "include/ic/renderer/frame_graph/frame_graph_builder.h" 
+    "src/ic/renderer/frame_graph/frame_graph_builder.cpp"  
+    "include/ic/renderer/frame_graph/compiled_graph_plan.h" 
+    "include/ic/renderer/frame_graph/frame_graph_cache.h"
+    "include/ic/renderer/renderer.h"
+    "src/ic/renderer/renderer.cpp" 
+    "include/ic/renderer/frame_graph/frame_graph_arena.h"
+    "include/ic/renderer/renderer_types.h")
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine

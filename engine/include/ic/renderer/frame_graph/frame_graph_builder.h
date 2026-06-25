@@ -2,6 +2,7 @@
 #include <vector>
 #include <span>
 #include "frame_graph_types.h"
+#include "frame_graph_pass.h"
 
 
 namespace ic
@@ -12,19 +13,43 @@ namespace ic
 	{
 	public:
 		explicit FrameGraphBuilder(std::pmr::memory_resource* memory)
-			: m_nodes(memory)
+			: m_memory(memory)
+			, m_nodes(memory)
 			, m_resources(memory)
-			, m_reads(memory)
-			, m_writes(memory)
+			, m_payloads(memory)
 		{}
 
 		~FrameGraphBuilder() = default;
 
 		// Node creation
+		template<typename T>
 		GraphNodeId addGraphNode(
+			const T& payload,
 			GraphNodeType type,
-			QueueType queue = QueueType::Graphics);
+			QueueType queue)
+		{
+			const uint32_t payloadIndex =
+				static_cast<uint32_t>(
+					m_payloads.size());
 
+			m_payloads.emplace_back(payload);
+
+			GraphNodeId id =
+				static_cast<GraphNodeId>(
+					m_nodes.size());
+
+			m_nodes.push_back(NodeRecord{
+				.graphNode = {
+					.id = id,
+					.queue = queue,
+					.type = type,
+					.payloadIndex = payloadIndex
+				},
+				.accesses = {}
+				});
+
+			return id;
+		}
 
 		// Resource creation
 		GraphResourceId createTexture(); // TextureDesc desc
@@ -43,12 +68,21 @@ namespace ic
 
 		void clear();
 
-		[[nodiscard]]
-		std::span<const GraphNode>
-			nodes() const noexcept
+	private:
+
+		std::pmr::vector<GraphResource> m_resources;
+		std::pmr::vector<NodeRecord> m_nodes;
+		std::pmr::vector<PassPayload> m_payloads;
+
+		std::pmr::memory_resource* m_memory;
+	public:
+
+		std::pmr::memory_resource* 
+			get_allocator() const noexcept
 		{
-			return m_nodes;
+			return m_memory;
 		}
+
 
 		[[nodiscard]]
 		std::span<const GraphResource>
@@ -58,24 +92,18 @@ namespace ic
 		}
 
 		[[nodiscard]]
-		std::span<const ResourceAccess>
-			reads() const noexcept
+		std::span<const NodeRecord>
+			nodes() const noexcept
 		{
-			return m_reads;
+			return m_nodes;
 		}
+
 
 		[[nodiscard]]
-		std::span<const ResourceAccess>
-			writes() const noexcept
+		std::span<const PassPayload>
+			payloads() const noexcept
 		{
-			return m_writes;
+			return m_payloads;
 		}
-
-	private:
-
-		std::pmr::vector<GraphNode> m_nodes;
-		std::pmr::vector<GraphResource> m_resources;
-		std::pmr::vector<ResourceAccess> m_reads;
-		std::pmr::vector<ResourceAccess> m_writes;
 	};
 }

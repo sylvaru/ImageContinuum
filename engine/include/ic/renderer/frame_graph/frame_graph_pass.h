@@ -5,21 +5,32 @@ namespace ic
 {
     class FrameGraphBuilder;
 
+    struct GraphicsPassData {};
 
-    struct GraphicsPassData
+    struct ComputePassData {};
+
+    struct ClearPassData {};
+
+    struct GeometryPassData
     {
-        std::string_view name;
-
-        // Eventually:
-        //bool depthTest;
-        //bool depthWrite;
-        //PipelineHandle pipeline;
+        bool depthPrepass;
+        bool occlusionCulling;
     };
 
-    struct ComputePassData
-    {
-        std::string_view name;
-    };
+    struct LightingPassData {};
+    struct PresentPassData {};
+    struct ShadowPassData {};
+    struct PostProcessPassData {};
+
+    using PassPayload =
+        std::variant<
+        ClearPassData,
+        GeometryPassData,
+        LightingPassData,
+        ComputePassData,
+        PresentPassData,
+        ShadowPassData,
+        PostProcessPassData>;
 
     template<typename T>
     concept GraphPass = requires(
@@ -28,4 +39,12 @@ namespace ic
     {
         { pass.setup(builder) } -> std::same_as<void>;
     };
+
 }
+
+
+
+// Eventually PassData should have:
+//bool depthTest;
+//bool depthWrite;
+//PipelineHandle pipeline;
