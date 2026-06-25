@@ -16,7 +16,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/core/event_queue.h" 
     "include/ic/core/event_frame_buffer.h" 
     "include/ic/core/frame_context.h"
-    "include/ic/core/frame_executor.h"
+    "include/ic/core/frame_pipeline.h"
 
     "include/ic/common/ic_common.h" 
     "include/ic/common/ic_key_codes.h"  
@@ -32,21 +32,21 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/interface/input.h" 
 
     "include/ic/renderer/renderer_specification.h" 
-    "include/ic/renderer/graphics_api.h" 
+     
     "include/ic/renderer/render_types.h"
     "include/ic/renderer/render_world.h"
-    "include/ic/renderer/frame_graph/frame_graph.h" 
+     
     "include/ic/renderer/vulkan_backend/vulkan_backend.h" 
-    "include/ic/renderer/frame_graph/frame_graph_node.h"
+    
     "include/ic/renderer/renderer_backend.h"
     "include/ic/renderer/render_handles.h" 
     "include/ic/renderer/renderer_path/renderer_path.h" 
-    "include/ic/renderer/renderer_path/deferred_path.h"
+    "include/ic/renderer/renderer_path/forward_path.h"
     "include/ic/core/job_system.h" 
     "include/ic/util/util.h"
     "include/ic/core/memory/frame_arena_region.h"
     "include/ic/core/memory/frame_memory_types.h"
-    "include/ic/renderer/frame_graph/frame_graph_edge.h"
+    
     "include/ic/renderer/frame_graph/frame_graph_types.h" 
     "include/ic/renderer/frame_graph/frame_graph_pass.h"
     "include/ic/core/clock.h" 
@@ -61,20 +61,20 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/core/layer_stack.cpp" 
     "src/ic/core/event_queue.cpp"
      
-    "src/ic/core/frame_executor.cpp"
+    "src/ic/core/frame_pipeline.cpp"
 
-    "src/ic/renderer/graphics_api.cpp"
+    
     "src/ic/platform/glfw_input.cpp" 
     "src/ic/platform/glfw_window.cpp" 
     "src/ic/renderer/vulkan_backend/vulkan_backend.cpp" 
-    "src/ic/renderer/frame_graph/frame_graph.cpp"
+    
     "src/ic/renderer/renderer_backend.cpp"
     
     "src/ic/core/job_system.cpp"
     "src/ic/renderer/frame_graph/frame_graph_compiler.cpp"
     "src/ic/core/memory/frame_arena.cpp" 
 
-    )
+     "include/ic/renderer/frame_graph/frame_graph_builder.h" "src/ic/renderer/frame_graph/frame_graph_builder.cpp"   "include/ic/renderer/frame_graph/compiled_graph_plan.h"  "include/ic/renderer/frame_graph/frame_graph_cache.h" "include/ic/renderer/renderer.h" "src/ic/renderer/renderer.cpp" "include/ic/renderer/frame_graph/frame_graph_arena.h" "include/ic/renderer/renderer_types.h")
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine

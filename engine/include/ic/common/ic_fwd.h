@@ -7,6 +7,7 @@ namespace ic
     struct Event;
 
     class JobSystem;
+    class Renderer;
 
     enum class EventChannel;
 }

@@ -17,7 +17,7 @@ namespace ic
         Input* input;
         Window* window;
         JobSystem* jobSystem;
-        //Renderer* renderer;
+        Renderer* renderer;
         //AssetManager* assetManager;
         //SceneManager* sceneManager;
     };
@@ -28,7 +28,7 @@ namespace ic
 
         WindowSpecification window;
 
-        RendererSpecification renderer;
+        RendererSpecification rendererSpec;
 
         static constexpr size_t kMaxFramesInFlight = 2;
     };
@@ -84,6 +84,7 @@ namespace ic
         void createWindow();
         void createInput();
         void createFrameArenas();
+        void createRenderer();
 
         void buildServices();
         void bindEventSink();
@@ -93,9 +94,10 @@ namespace ic
         void handleWindowEvent(Event& e);
         void handleRenderEvent(Event& e);
 
+        Scope<AppRuntime> m_runtime;
         AppSpecification m_spec{};
         Clock m_clock;
-        Scope<AppRuntime> m_runtime;
+        
         LayerStack m_layerStack{};
         AppServices m_services{};
         FrameContext m_frame{};

@@ -1,9 +1,11 @@
 // demo/include/sandbox_app.h
 #include "ic/core/app_base.h"
 #include "game_layer.h"
+#include "ic/renderer/renderer_specification.h"
 
+using namespace ic;
 
-class DemoApp : public ic::AppBase
+class DemoApp : public AppBase
 {
 public:
     DemoApp()
@@ -17,11 +19,13 @@ public:
 	GameLayer& getGameLayer() { return m_gameLayer; }
 
 private:
-    static ic::AppSpecification createSpecification()
+    static AppSpecification createSpecification()
     {
-        ic::AppSpecification spec;
+        AppSpecification spec;
 
         spec.appName = "Demo App";
+        spec.rendererSpec.backendType = RendererBackendType::Vulkan;
+        spec.rendererSpec.pathType = RenderPathType::Forward;
         spec.window.width = 1920;
         spec.window.height = 1080;
         return spec;

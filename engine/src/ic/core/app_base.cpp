@@ -10,9 +10,11 @@
 #include "ic/core/job_system.h"
 #include "ic/util/profiler.h"
 #include "ic/core/event_frame_buffer.h"
-#include "ic/core/frame_executor.h"
+#include "ic/core/frame_pipeline.h"
 #include "ic/core/memory/frame_arena.h"
 #include "ic/core/memory/frame_arena_manager.h"
+#include "ic/renderer/renderer.h"
+
 #include <spdlog/spdlog.h>
 
 
@@ -23,14 +25,6 @@ namespace ic
         GLFWContext glfw;
     };
 
-    AppBase::AppBase(AppSpecification spec)
-        : m_spec(std::move(spec))
-        , m_runtime(std::make_unique<AppRuntime>(*this))
-	{
-	}
-    
-    AppBase::~AppBase() = default;
-
     struct AppBase::AppRuntime
     {
         Scope<PlatformState>        platform;
@@ -40,18 +34,26 @@ namespace ic
         Scope<EventQueue>           eventQueue;
         Scope<FrameArenaManager<AppSpecification::kMaxFramesInFlight>> 
                                     frameArenas;
+        Scope<Renderer>             renderer;
         
-
         EventFrameBuffer<AppSpecification::kMaxFramesInFlight> 
                                     eventBuffer;
-        FrameExecutor               executor;
+        FramePipeline               framePipeline;
 
         AppRuntime(AppBase& app)
-            : executor(app)
+            : framePipeline(app)
             , eventQueue(std::make_unique<EventQueue>())
         {
         }
     };
+
+    AppBase::AppBase(AppSpecification spec)
+        : m_spec(std::move(spec))
+        , m_runtime(std::make_unique<AppRuntime>(*this))
+    {
+    }
+
+    AppBase::~AppBase() = default;
 
     void AppBase::initAppBase(
         [[maybe_unused]] int argc,
@@ -65,10 +67,12 @@ namespace ic
         createInput();
         createJobSystem();
         createFrameArenas();
+        createRenderer();
 
         bindEventSink();
         buildServices();
 
+        m_runtime->renderer->init(m_spec.rendererSpec);
     }
 
     int AppBase::run(
@@ -82,6 +86,8 @@ namespace ic
         m_clock.reset();
         m_frame.jobs = m_runtime->jobs.get();
         m_frame.input = m_runtime->input.get();
+        
+        auto& runtime = *m_runtime;
 
         // Main Loop
         while (!m_runtime->window->shouldClose())
@@ -94,18 +100,17 @@ namespace ic
             m_frame.deltaTime = m_clock.tick();
             m_frame.timeSinceStart = m_clock.getTimeSinceStart();
             
-            auto& arena =
-                m_runtime->frameArenas->beginFrame(
-                    m_frame.frameIndex);
+            auto& arena = m_runtime->frameArenas->beginFrame(m_frame.frameIndex);
             arena.reset();
             m_frame.arena = &arena;
 
-            m_runtime->window->pollEvents();
-            m_runtime->eventBuffer.ingest(*m_runtime->eventQueue);
-            m_runtime->input->beginFrame();
-            m_runtime->eventBuffer.beginFrame(m_frame);
+            runtime.window->pollEvents();
+            runtime.eventBuffer.ingest(*m_runtime->eventQueue);
+            runtime.input->beginFrame();
+            runtime.eventBuffer.beginFrame(m_frame);
            
-            m_runtime->executor.execute(m_frame);
+            runtime.framePipeline.execute(m_frame);
+            runtime.renderer->render(m_frame);
 
             // Frame pacing
             sleep(frameStart);
@@ -224,6 +229,11 @@ namespace ic
                 *m_runtime->window);
     }
 
+    void AppBase::createRenderer()
+    {
+        m_runtime->renderer = std::make_unique<Renderer>(m_spec.rendererSpec);
+    }
+
     void AppBase::bindEventSink()
     {
         m_runtime->window->bindEventSink(
@@ -239,7 +249,8 @@ namespace ic
         {
             m_runtime->input.get(),
             m_runtime->window.get(),
-            m_runtime->jobs.get()
+            m_runtime->jobs.get(),
+            m_runtime->renderer.get()
         };
     }
 

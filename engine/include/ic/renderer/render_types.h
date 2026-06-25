@@ -4,13 +4,6 @@
 
 namespace ic 
 {
-    enum class QueueType : uint8_t
-    {
-        Graphics,
-        Compute,
-        Transfer
-    };
-
     // A single, tightly packed indirect draw command (12 bytes)
     // Fed to GPU via DrawIndexedIndirect or ExecuteIndirect
     struct DrawCommand 

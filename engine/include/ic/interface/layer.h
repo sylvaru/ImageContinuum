@@ -1,6 +1,5 @@
 // ic/interface/layer.h
 #pragma once
-#include "ic/renderer/renderer_path/renderer_path.h"
 
 namespace ic
 {
@@ -9,7 +8,6 @@ namespace ic
     struct LayerSpecification
     {
         std::string debugName = "Layer";
-        RenderPath preferredPath = RenderPath::ClusteredForward;
     };
 
     class Layer

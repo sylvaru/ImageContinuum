@@ -2,7 +2,6 @@
 #pragma once
 #include "event_queue.h"
 #include <array>
-#include <atomic>
 #include "ic/core/events.h"
 
 namespace ic

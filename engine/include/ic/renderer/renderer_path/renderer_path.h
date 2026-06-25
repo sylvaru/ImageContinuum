@@ -5,24 +5,15 @@
 namespace ic
 {
 	class FrameGraphBuilder;
-	struct RenderScenePacket;
-	
-	// Todo: All 3 of these render paths should 
-	// be using visibility buffers eventually
-	enum class RenderPath : uint8_t
-	{
-		ClusteredForward,
-		Deferred,
-		PathTraced
-	};
 
 	class RendererPath
 	{
 	public:
 		virtual ~RendererPath() = default;
 
-		virtual void setupGraph(
-			FrameGraphBuilder& builder,
-			const RenderScenePacket& packet) = 0;
+		virtual void buildFrameGraph(
+			FrameGraphBuilder& builder) = 0;
+		
+		virtual void buildPassData() {}
 	};
 }

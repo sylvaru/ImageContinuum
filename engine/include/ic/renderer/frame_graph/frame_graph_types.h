@@ -1,18 +1,135 @@
 // ic/renderer/frame_graph/frame_graph_types.h
 #pragma once
-#include <span>
 
 namespace ic
 {
-    struct CompiledNode;
-    struct Barrier;
-    struct ResourceLifetime;
+    using GraphNodeId = uint32_t;
+    using GraphResourceId = uint32_t;
 
-    struct CompiledFramePlan
+    enum class QueueType : uint8_t
     {
-        std::span<const CompiledNode> nodes;
-        std::span<const Barrier> barriers;
-        std::span<const ResourceLifetime> resources;
+        Graphics,
+        Compute,
+        Transfer
     };
 
+    enum class GraphNodeType
+    {
+        Graphics,
+        Compute,
+        Transfer,
+        Present
+    };
+
+    enum class GraphResourceType : uint8_t
+    {
+        Texture,
+        Buffer
+    };
+
+    enum class AccessType : uint8_t
+    {
+        Read,
+        Write,
+        ReadWrite
+    };
+
+    enum class ResourceUsage : uint8_t
+    {
+        SampledTexture,
+        StorageTexture,
+
+        ColorAttachment,
+        DepthAttachment,
+
+        VertexBuffer,
+        IndexBuffer,
+
+        ConstantBuffer,
+        StorageBuffer,
+
+        TransferSrc,
+        TransferDst,
+
+        Present
+    };
+
+    struct Barrier
+    {
+        GraphResourceId resource;
+
+        ResourceUsage before;
+
+        ResourceUsage after;
+
+        QueueType sourceQueue;
+
+        QueueType destinationQueue;
+    };
+
+    struct Dependency
+    {
+        GraphNodeId source;
+        GraphNodeId destination;
+    };
+
+    struct GraphNode
+    {
+        GraphNodeId id;
+
+        QueueType queue;
+
+        GraphNodeType type;
+
+        uint32_t firstRead;
+        uint32_t readCount;
+
+        uint32_t firstWrite;
+        uint32_t writeCount;
+
+        uint32_t payloadIndex;
+    };
+
+    struct ExecutionNode
+    {
+        GraphNodeId nodeId;
+
+        QueueType queue;
+
+        GraphNodeType type;
+
+        uint32_t firstBarrier;
+        uint32_t barrierCount;
+
+        uint32_t firstDependency;
+        uint32_t dependencyCount;
+
+        uint32_t payloadIndex;
+    };
+
+    struct GraphResource
+    {
+        GraphResourceId id;
+        GraphResourceType type;
+
+        uint32_t firstAccess;
+        uint32_t accessCount;
+    };
+
+    struct ResourceAccess 
+    {
+        GraphNodeId node;
+        GraphResourceId resource;
+        AccessType access;
+        ResourceUsage usage;
+    };
+
+    struct ResourceLifetime
+    {
+        GraphResourceId resource;
+
+        uint32_t firstUse;
+
+        uint32_t lastUse;
+    };
 }

@@ -23,7 +23,7 @@ namespace ic
         EventFrame* eventFrame;
         Input* input;
         JobSystem* jobs;
-        //RendererBackend* renderer;
+        //Renderer* renderer;
 
         FrameArena* arena;
     };
