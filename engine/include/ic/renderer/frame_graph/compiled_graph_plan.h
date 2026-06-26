@@ -17,6 +17,8 @@ namespace ic
 
         std::span<const ResourceBarrier> barriers;
 
+        std::span<const NodeSchedule> nodeSchedules;
+
         std::span<const ResourceLifetime> resourceLifetimes;
     };
 

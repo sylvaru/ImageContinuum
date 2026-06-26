@@ -20,6 +20,7 @@ namespace ic
         m_executionOrder.clear();
         m_chainMap.clear();
         m_resourceChains.clear();
+        m_nodeSchedules.clear();
   
         auto nodes = builder.nodes();
 
@@ -45,11 +46,13 @@ namespace ic
 
         debugLog();
 
-        return {
+        return 
+        {
             .nodes = std::span<const ExecutionNode>(m_nodes),
             .executionOrder = std::span<const GraphNodeId>(m_executionOrder),
             .dependencies = std::span<const Dependency>(m_dependencies),
             .barriers = std::span<const ResourceBarrier>(m_barriers),
+            .nodeSchedules = std::span<const NodeSchedule>(m_nodeSchedules),
             .resourceLifetimes = std::span<const ResourceLifetime>(m_resourceLifetimes)
         };
     }
