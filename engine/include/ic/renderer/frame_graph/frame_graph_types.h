@@ -62,55 +62,19 @@ namespace ic
         GraphNodeId fromNode;
         GraphNodeId toNode;
 
+        AccessType fromAccess;
+        AccessType toAccess;
+
         ResourceUsage oldUsage;
         ResourceUsage newUsage;
     };
 
-    struct Dependency
-    {
-        GraphNodeId source;
-        GraphNodeId destination;
-    };
-
-    struct GraphNode
-    {
-        GraphNodeId id;
-
-        QueueType queue;
-        GraphNodeType type;
-
-        uint32_t payloadIndex;
-    };
-
-    struct ExecutionNode
-    {
-        GraphNodeId nodeId;
-
-        QueueType queue;
-
-        GraphNodeType type;
-
-        uint32_t firstBarrier;
-        uint32_t barrierCount;
-
-        uint32_t firstDependency;
-        uint32_t dependencyCount;
-
-        uint32_t payloadIndex;
-    };
-
-    struct ResourceAccess 
+    struct ResourceAccess
     {
         GraphNodeId node;
         GraphResourceId resource;
         AccessType access;
         ResourceUsage usage;
-    };
-
-    struct NodeRecord
-    {
-        GraphNode graphNode;
-        std::pmr::vector<ResourceAccess> accesses;
     };
 
     struct GraphResource
@@ -130,4 +94,53 @@ namespace ic
 
         uint32_t lastUse;
     };
+
+    struct Dependency
+    {
+        GraphNodeId source;
+        GraphNodeId destination;
+    };
+
+    struct GraphNode
+    {
+        GraphNodeId id;
+
+        QueueType queue;
+        GraphNodeType type;
+
+        uint32_t payloadIndex;
+    };
+
+    struct NodeRecord
+    {
+        GraphNode graphNode;
+        std::pmr::vector<ResourceAccess> accesses;
+    };
+
+    struct NodeSchedule
+    {
+        GraphNodeId node;
+
+        std::pmr::vector<uint32_t> incomingBarrierIndices;
+        std::pmr::vector<uint32_t> outgoingBarrierIndices;
+    };
+
+    struct ExecutionNode
+    {
+        GraphNodeId nodeId;
+
+        QueueType queue;
+
+        GraphNodeType type;
+
+        uint32_t firstBarrier;
+        uint32_t barrierCount;
+
+        uint32_t firstDependency;
+        uint32_t dependencyCount;
+
+        uint32_t payloadIndex;
+    };
+
+
 }

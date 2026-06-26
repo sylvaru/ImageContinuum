@@ -21,9 +21,7 @@ namespace ic
         m_chainMap.clear();
         m_resourceChains.clear();
   
-
         auto nodes = builder.nodes();
-
 
         // Build node list
         for (const auto& node : nodes)
@@ -43,6 +41,7 @@ namespace ic
         buildExecutionOrder();
         buildResourceLifetimes();
         buildBarriers();
+        buildNodeSchedules();
 
         debugLog();
 
@@ -282,20 +281,73 @@ namespace ic
                 const auto& prev = sorted[i - 1];
                 const auto& curr = sorted[i];
 
-                if (prev.access == curr.access &&
-                    prev.usage == curr.usage)
-                {
-                    continue;
-                }
+                const bool needsBarrier =
+                    prev.access == AccessType::Write ||
+                    curr.access == AccessType::Write ||
+                    prev.usage != curr.usage;
+
+                if (!needsBarrier) continue;
 
                 m_barriers.push_back({
                     .resource = chain.resource,
                     .fromNode = prev.node,
                     .toNode = curr.node,
+                    .fromAccess = prev.access,
+                    .toAccess = curr.access,
                     .oldUsage = prev.usage,
                     .newUsage = curr.usage
                     });
             }
+        }
+    }
+
+    void FrameGraphCompiler::buildNodeSchedules()
+    {
+        m_nodeSchedules.clear();
+        m_nodeSchedules.reserve(m_nodes.size());
+
+        // Create one schedule per node
+        for (GraphNodeId i = 0; i < m_nodes.size(); ++i)
+        {
+            NodeSchedule schedule{
+                .node = i,
+                .incomingBarrierIndices = std::pmr::vector<uint32_t>(m_nodes.get_allocator()),
+                .outgoingBarrierIndices = std::pmr::vector<uint32_t>(m_nodes.get_allocator())
+            };
+
+            m_nodeSchedules.push_back(std::move(schedule));
+        }
+
+        // Assign barriers
+        for (uint32_t i = 0; i < m_barriers.size(); ++i)
+        {
+            const auto& barrier = m_barriers[i];
+
+            m_nodeSchedules[barrier.toNode]
+                .incomingBarrierIndices
+                .push_back(i);
+
+            m_nodeSchedules[barrier.fromNode]
+                .outgoingBarrierIndices
+                .push_back(i);
+        }
+    }
+
+    static const char* toString(ResourceUsage usage)
+    {
+        switch (usage)
+        {
+        case ResourceUsage::ColorAttachment: return "ColorAttachment";
+        case ResourceUsage::DepthAttachment: return "DepthAttachment";
+        case ResourceUsage::SampledTexture:  return "SampledTexture";
+        case ResourceUsage::ConstantBuffer: return "ConstantBuffer";
+        case ResourceUsage::StorageBuffer: return "StorageBuffer";
+        case ResourceUsage::StorageTexture: return "StorageTexture";
+        case ResourceUsage::TransferDst: return "TransferDst";
+        case ResourceUsage::TransferSrc: return "TransferSrc";
+            
+
+        default: return "Unknown";
         }
     }
 
@@ -393,13 +445,70 @@ namespace ic
         for (const auto& b : m_barriers)
         {
             spdlog::info(
-                "Resource {} | {}:{} -> {}:{}",
+                "Resource {} | "
+                "Node {} [{}:{}] -> "
+                "Node {} [{}:{}]",
                 b.resource,
                 b.fromNode,
-                static_cast<int>(b.oldUsage),
+                b.fromAccess == AccessType::Write ? "WRITE" : "READ",
+                toString(b.oldUsage),
                 b.toNode,
-                static_cast<int>(b.newUsage)
+                b.toAccess == AccessType::Write ? "WRITE" : "READ",
+                toString(b.newUsage)
             );
+        }
+
+        spdlog::info("Node Schedules:");
+
+        for (const auto& schedule : m_nodeSchedules)
+        {
+            spdlog::info("Node {}:", schedule.node);
+
+            // Incoming
+            spdlog::info("Incoming Barriers:");
+
+            if (schedule.incomingBarrierIndices.empty())
+            {
+                spdlog::info("(none)");
+            }
+            else
+            {
+                for (uint32_t index : schedule.incomingBarrierIndices)
+                {
+                    const auto& barrier = m_barriers[index];
+
+                    spdlog::info(
+                        "        Resource {} | {} -> {} | {} -> {}",
+                        barrier.resource,
+                        barrier.fromNode,
+                        barrier.toNode,
+                        toString(barrier.oldUsage),
+                        toString(barrier.newUsage));
+                }
+            }
+
+            // Outgoing
+            spdlog::info("Outgoing Barriers:");
+
+            if (schedule.outgoingBarrierIndices.empty())
+            {
+                spdlog::info("(none)");
+            }
+            else
+            {
+                for (uint32_t index : schedule.outgoingBarrierIndices)
+                {
+                    const auto& barrier = m_barriers[index];
+
+                    spdlog::info(
+                        " Resource {} | {} -> {} | {} -> {}",
+                        barrier.resource,
+                        barrier.fromNode,
+                        barrier.toNode,
+                        toString(barrier.oldUsage),
+                        toString(barrier.newUsage));
+                }
+            }
         }
 
         // Validation 

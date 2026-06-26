@@ -32,6 +32,7 @@ namespace ic
             , m_resourceChains(memory)
             , m_chainMap(memory)
             , m_adjacencyLists(memory)
+            , m_nodeSchedules(memory)
         {}
 
         CompiledGraphPlan compile(
@@ -49,6 +50,8 @@ namespace ic
 
         void buildBarriers();
 
+        void buildNodeSchedules();
+
     private:
 
         void debugLog();
@@ -61,5 +64,6 @@ namespace ic
         std::pmr::unordered_map<GraphResourceId, ResourceChain> m_chainMap;
         std::pmr::vector<ResourceChain> m_resourceChains;
         std::pmr::vector<std::pmr::vector<GraphNodeId>> m_adjacencyLists;
+        std::pmr::vector<NodeSchedule> m_nodeSchedules;
     };
 }
