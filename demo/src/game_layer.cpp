@@ -11,3 +11,4 @@ void GameLayer::onUpdate(
 void GameLayer::onRender([[maybe_unused]] float alpha) {
 	/* Submit flat data buffers */ 
 }
+

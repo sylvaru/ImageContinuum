@@ -6,7 +6,7 @@
 void DemoApp::onInit()
 {
 	spdlog::info("[ Demo App ] onInit..");
-	pushLayer<GameLayer>();
+	m_gameLayer = &pushLayer<GameLayer>();
 }
 
 void DemoApp::onUpdate([[maybe_unused]] float dt)

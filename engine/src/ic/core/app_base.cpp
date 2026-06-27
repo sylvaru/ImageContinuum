@@ -62,6 +62,8 @@ namespace ic
         // Todo: use toml++ for easily configuring
         // static initialization data
 
+        spdlog::info("[AppBase] initAppBase...");
+
         createPlatform();
         createWindow();
         createInput();
@@ -84,10 +86,11 @@ namespace ic
         onInit(); // Client app configuration happens here
 
         m_clock.reset();
-        m_frame.jobs = m_runtime->jobs.get();
-        m_frame.input = m_runtime->input.get();
+        m_frame.services = &m_services;
         
         auto& runtime = *m_runtime;
+
+        spdlog::info("[AppBase] run... Entering main loop");
 
         // Main Loop
         while (!m_runtime->window->shouldClose())

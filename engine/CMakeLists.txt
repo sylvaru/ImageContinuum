@@ -81,7 +81,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/renderer.h"
     "src/ic/renderer/renderer.cpp" 
     "include/ic/renderer/frame_graph/frame_graph_arena.h"
-    "include/ic/renderer/renderer_types.h")
+    "include/ic/renderer/renderer_types.h" )
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine

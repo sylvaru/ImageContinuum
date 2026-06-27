@@ -4,28 +4,23 @@
 
 namespace ic
 {
+    struct AppServices;
     struct EventFrame;
-    struct Input;
-    class FrameArena;
-    class JobSystem;
+
+    class FrameArena;    
     
 
     struct FrameContext
     {
         uint64_t frameIndex;
-
         float deltaTime;
         float timeSinceStart;
         float interpolationAlpha;
-
         uint32_t gpuFrameIndex;
-        
-        EventFrame* eventFrame;
-        Input* input;
-        JobSystem* jobs;
-        //Renderer* renderer;
 
-        FrameArena* arena;
+        FrameArena* arena = nullptr;
+        EventFrame* eventFrame = nullptr;
+        AppServices* services = nullptr;
     };
 
 

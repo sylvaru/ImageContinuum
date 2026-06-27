@@ -6,7 +6,6 @@ namespace ic
 {
     struct GLFWContext
     {
-    public:
         GLFWContext()
         {
             if (!glfwInit())

@@ -16,7 +16,7 @@ public:
     void onUpdate(float dt) override;
     void onShutdown() override;
 
-	GameLayer& getGameLayer() { return m_gameLayer; }
+	GameLayer* getGameLayer() { return m_gameLayer; }
 
 private:
     static AppSpecification createSpecification()
@@ -31,5 +31,5 @@ private:
         return spec;
     }
 
-	GameLayer m_gameLayer;
+	GameLayer* m_gameLayer = nullptr;
 };

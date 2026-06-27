@@ -12,15 +12,7 @@
 
 namespace ic 
 {
-    struct AppServices
-    {
-        Input* input;
-        Window* window;
-        JobSystem* jobSystem;
-        Renderer* renderer;
-        //AssetManager* assetManager;
-        //SceneManager* sceneManager;
-    };
+
 
     struct AppSpecification
     {
@@ -31,6 +23,16 @@ namespace ic
         RendererSpecification rendererSpec;
 
         static constexpr size_t kMaxFramesInFlight = 2;
+    };
+
+    struct AppServices
+    {
+        Input* input;
+        Window* window;
+        JobSystem* jobSystem;
+        Renderer* renderer;
+        //AssetManager* assetManager;
+        //SceneManager* sceneManager;
     };
 
     class AppBase
@@ -88,6 +90,7 @@ namespace ic
 
         void buildServices();
         void bindEventSink();
+
         void sleep(const auto& frameStart);
 
         void handleInputEvent(Event& e);
@@ -102,7 +105,7 @@ namespace ic
         AppServices m_services{};
         FrameContext m_frame{};
         
-        static constexpr float kTargetFPS = 60.0f;
+        static constexpr float kTargetFPS = 5.0f;
         static constexpr float kTargetFrameTime = 1.0f / kTargetFPS;
     };
 }

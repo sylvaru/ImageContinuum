@@ -51,6 +51,8 @@ namespace ic
 
     void Renderer::init(RendererSpecification& spec)
     {
+        spdlog::info("[Renderer] init...");
+
         m_runtime->backend->initialize(spec);
 
         rebuildGraph();

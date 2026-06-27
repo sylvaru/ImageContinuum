@@ -16,9 +16,11 @@ namespace ic
         Layer(const LayerSpecification& spec = {}) : m_spec(spec) {}
         virtual ~Layer() = default;
 
+        virtual void onAttack() {}
+        virtual void onDetach() {}
         virtual void onUpdate(FrameContext& ctx) = 0;
         virtual void onRender(float alpha) = 0;
-        virtual void onEvent(const Event&) {} // Only for system/UI events
+        virtual bool onEvent(const Event&) { return false; } // Only for system/UI events. false = not consumed
 
         const LayerSpecification& spec() const { return m_spec;  }
 

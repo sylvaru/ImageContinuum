@@ -10,5 +10,4 @@ class GameLayer : public ic::Layer
 public:
     void onUpdate(ic::FrameContext& ctx) override;
     void onRender(float alpha) override;
-    //void onEvent(ic::Event& e);
 };
