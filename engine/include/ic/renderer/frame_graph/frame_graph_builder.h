@@ -66,6 +66,8 @@ namespace ic
 			GraphResourceId resource,
 			ResourceUsage usage);
 
+		GraphResourceId importTexture(ImportedResourceDesc desc);
+
 		void clear();
 
 	private:

@@ -20,6 +20,8 @@ namespace ic
         std::span<const NodeSchedule> nodeSchedules;
 
         std::span<const ResourceLifetime> resourceLifetimes;
+
+        std::span<const GraphResource> resources;
     };
 
 }

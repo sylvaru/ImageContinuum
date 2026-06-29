@@ -7,7 +7,7 @@
 
 namespace ic 
 {
-    class JobCounter;
+
     /*
 
         Job System — executes frame DAG nodes and graph passes in parallel.
@@ -20,6 +20,33 @@ namespace ic
           wake proportionally to work arriving.
 
     */
+
+    class JobCounter
+    {
+    public:
+        JobCounter() : m_value(0) {}
+
+        void increment(uint32_t count = 1)
+        {
+            m_value.fetch_add(count, std::memory_order_release);
+        }
+
+        void decrement(uint32_t count = 1)
+        {
+            m_value.fetch_sub(count, std::memory_order_acq_rel);
+        }
+
+        uint32_t value() const
+        {
+            return m_value.load(std::memory_order_acquire);
+        }
+
+        bool done() const { return value() == 0; }
+
+    private:
+        std::atomic<uint32_t> m_value;
+    };
+
 
 
     static constexpr size_t kJobInlineStorageBytes = 64;
@@ -49,28 +76,6 @@ namespace ic
         }
     };
 
-
-
-    class JobCounter
-    {
-    public:
-        JobCounter() : m_value(0) {}
-
-        void increment(uint32_t count = 1) 
-        { m_value.fetch_add(count, std::memory_order_release); }
-
-        void decrement(uint32_t count = 1) 
-        { m_value.fetch_sub(count, std::memory_order_acq_rel); }
-
-        uint32_t value() const 
-        { return m_value.load(std::memory_order_acquire); }
-
-        bool done() const { return value() == 0; }
-
-    private:
-        std::atomic<uint32_t> m_value;
-    };
-
     class JobSystem
     {
     public:
@@ -92,6 +97,11 @@ namespace ic
         // Blocks the calling thread (main thread) 
         // and works on remaining jobs until counter is 0
         void waitForCounter(JobCounter* counter);
+
+        uint32_t workerCount() const
+        {
+            return static_cast<uint32_t>(m_workers.size());
+        }
 
     private:
 

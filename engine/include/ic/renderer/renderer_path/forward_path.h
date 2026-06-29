@@ -9,77 +9,38 @@ namespace ic
     class ForwardRendererPath : public RendererPath
     {
     public:
-        GraphNodeId geometryNode;
-        GraphNodeId shadowNode;
-        GraphNodeId lightingNode;
-        GraphNodeId postNode;
 
-        GraphResourceId gbuffer;
-        GraphResourceId shadowMap;
-        GraphResourceId litColor;
+        GraphResourceId backBuffer;
 
         void buildFrameGraph(FrameGraphBuilder& builder) override
         {
             // Resources
-            gbuffer = builder.createTexture();
-            shadowMap = builder.createTexture();
-            litColor = builder.createTexture();
+            backBuffer = builder.importTexture({
+                .type = ImportedResource::Swapchain,
+                .initialUsage = ResourceUsage::Present
+                });
 
-            // Pass 0: Geometry
-            geometryNode = builder.addGraphNode(
-                GeometryPassData{},
-                GraphNodeType::Graphics,
-                QueueType::Graphics);
+            auto clearNode =
+                builder.addGraphNode(
+                    ClearPassData{},
+                    GraphNodeType::Graphics,
+                    QueueType::Graphics);
 
             builder.write(
-                geometryNode,
-                gbuffer,
+                clearNode,
+                backBuffer,
                 ResourceUsage::ColorAttachment);
 
-
-            // Pass 1: Shadow
-            shadowNode = builder.addGraphNode(
-                ShadowPassData{},
-                GraphNodeType::Graphics,
-                QueueType::Graphics);
-
-            builder.write(
-                shadowNode,
-                shadowMap,
-                ResourceUsage::DepthAttachment);
-
-
-            // Pass 2: Lighting
-            lightingNode = builder.addGraphNode(
-                LightingPassData{},
-                GraphNodeType::Graphics,
-                QueueType::Graphics);
+            auto presentNode =
+                builder.addGraphNode(
+                    PresentPassData{},
+                    GraphNodeType::Present,
+                    QueueType::Graphics);
 
             builder.read(
-                lightingNode,
-                gbuffer,
-                ResourceUsage::SampledTexture);
-
-            builder.read(
-                lightingNode,
-                shadowMap,
-                ResourceUsage::SampledTexture);
-
-            builder.write(
-                lightingNode,
-                litColor,
-                ResourceUsage::ColorAttachment);
-
-            // Pass 3: Post
-            postNode = builder.addGraphNode(
-                PostProcessPassData{},
-                GraphNodeType::Graphics,
-                QueueType::Graphics);
-
-            builder.read(
-                postNode,
-                litColor,
-                ResourceUsage::SampledTexture);
+                presentNode,
+                backBuffer,
+                ResourceUsage::Present);
         }
     };
 

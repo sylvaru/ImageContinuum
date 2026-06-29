@@ -16,6 +16,7 @@ namespace ic
 		m_resources.push_back({
 			.id = id,
 			.type = GraphResourceType::Texture,
+			.ownership = ResourceOwnership::Transient,
 			.firstAccess = 0,
 			.accessCount = 0
 			});
@@ -33,6 +34,27 @@ namespace ic
 		m_resources.push_back({
 			.id = id,
 			.type = GraphResourceType::Buffer,
+			.ownership = ResourceOwnership::Transient,
+			.firstAccess = 0,
+			.accessCount = 0
+			});
+
+		return id;
+	}
+
+	GraphResourceId FrameGraphBuilder::importTexture(
+		ImportedResourceDesc desc)
+	{
+		GraphResourceId id =
+			static_cast<GraphResourceId>(m_resources.size());
+
+		m_resources.push_back({
+			.id = id,
+			.type = GraphResourceType::Texture,
+			.ownership = ResourceOwnership::Imported,
+			.imported = desc.type,
+			.initialUsage = desc.initialUsage,
+			.initialAccess = AccessType::Read,
 			.firstAccess = 0,
 			.accessCount = 0
 			});

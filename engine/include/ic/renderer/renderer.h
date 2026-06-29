@@ -7,6 +7,7 @@ namespace ic
     struct FrameContext;
     struct RendererSpecification;
 
+    class Window;
     class RendererBackend;
     class RendererPath;
 
@@ -14,16 +15,22 @@ namespace ic
     class Renderer
     {
     public:
-        Renderer(const RendererSpecification& spec);
+        Renderer(
+            const RendererSpecification& spec);
 
         ~Renderer();
 
 
-        void init(RendererSpecification& spec);
+        void init(
+            RendererSpecification& spec,
+            Window& window,
+            uint32_t workerCount
+        );
         void render(FrameContext& frame);
         void rebuildGraph();
 
-        static Scope<RendererBackend> createBackend(RendererBackendType type);
+        static Scope<RendererBackend> createBackend(
+            RendererBackendType type);
 
         static Scope<RendererPath> createPath(RenderPathType type);
 

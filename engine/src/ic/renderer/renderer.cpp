@@ -10,6 +10,9 @@
 #include "ic/renderer/frame_graph/frame_graph_arena.h"
 #include "ic/renderer/frame_graph/compiled_graph_plan.h"
 
+#ifdef _WIN32
+#include "ic/renderer/dx12_backend/dx12_backend.h"
+#endif
 
 namespace ic
 {
@@ -39,7 +42,8 @@ namespace ic
         }
     };
 
-    Renderer::Renderer(const RendererSpecification& spec)
+    Renderer::Renderer(
+        const RendererSpecification& spec)
     {
         m_runtime = std::make_unique<Runtime>(
             createBackend(spec.backendType),
@@ -49,17 +53,19 @@ namespace ic
     Renderer::~Renderer()
     {}
 
-    void Renderer::init(RendererSpecification& spec)
+    void Renderer::init(
+        RendererSpecification& spec,
+        Window& window,
+        uint32_t workerCount)
     {
         spdlog::info("[Renderer] init...");
 
-        m_runtime->backend->initialize(spec);
+        m_runtime->backend->initialize(spec, window, workerCount);
 
         rebuildGraph();
     }
 
-    void Renderer::render(
-        [[maybe_unused]] FrameContext& frame)
+    void Renderer::render(FrameContext& frame)
     {
         auto& rt = *m_runtime;
 
@@ -88,18 +94,22 @@ namespace ic
     }
 
     Scope<RendererBackend> 
-        Renderer::createBackend(RendererBackendType type)
+        Renderer::createBackend(
+            RendererBackendType type)
     {
         switch (type)
         {
         case RendererBackendType::Vulkan:
             return std::make_unique<VulkanBackend>();
 
-        //case RendererBackendType::DX12:
-        //    return std::make_unique<DX12Backend>();
-        }
+#ifdef _WIN32
+        case RendererBackendType::DX12:
+            return std::make_unique<DX12Backend>();
 
-        return nullptr;
+#endif
+        default:
+            return nullptr;
+        }
     }
 
     Scope<RendererPath> 

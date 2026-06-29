@@ -10,6 +10,7 @@ endif()
 # Define the Engine Target
 add_library(ImageContinuumEngine ${LIB_TYPE})
 
+
 # Add source files
 target_sources(ImageContinuumEngine PRIVATE
     "include/ic/core/app_base.h" 
@@ -68,7 +69,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/platform/glfw_window.cpp" 
     "src/ic/renderer/vulkan_backend/vulkan_backend.cpp" 
     
-    "src/ic/renderer/renderer_backend.cpp"
+    
     
     "src/ic/core/job_system.cpp"
     "src/ic/renderer/frame_graph/frame_graph_compiler.cpp"
@@ -81,7 +82,41 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/renderer.h"
     "src/ic/renderer/renderer.cpp" 
     "include/ic/renderer/frame_graph/frame_graph_arena.h"
-    "include/ic/renderer/renderer_types.h" )
+    "include/ic/renderer/renderer_types.h"  
+    "include/ic/renderer/vulkan_backend/vulkan_platform.h" 
+    "include/ic/renderer/vulkan_backend/vulkan_adapter.h"
+    "include/ic/renderer/vulkan_backend/vulkan_device.h"
+    "include/ic/renderer/vulkan_backend/vulkan_allocator.h"
+    "include/ic/renderer/vulkan_backend/vulkan_swapchain.h"
+    "include/ic/renderer/vulkan_backend/vulkan_command_system.h"
+
+    "src/ic/renderer/vulkan_backend/vulkan_platform.cpp" 
+    "src/ic/renderer/vulkan_backend/vulkan_adapter.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_device.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_allocator.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_swapchain.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_command_system.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_instance.cpp"
+    "include/ic/renderer/vulkan_backend/vulkan_instance.h"
+
+)
+
+    if (WIN32)
+    target_sources(ImageContinuumEngine PRIVATE
+    "include/ic/renderer/dx12_backend/dx12_backend.h"
+    "include/ic/renderer/dx12_backend/dx12_factory.h"
+    "include/ic/renderer/dx12_backend/dx12_adapter.h"
+    "include/ic/renderer/dx12_backend/dx12_swapchain.h"
+    "include/ic/renderer/dx12_backend/dx12_command_system.h"
+    "include/ic/renderer/dx12_backend/dx12_allocator.h"
+    )
+    endif()
+
+# Defines
+target_compile_definitions(ImageContinuumEngine
+    PRIVATE
+        $<$<CONFIG:Debug>:IC_DEBUG>
+)
 
 # Define Visibility and Include Paths
 target_include_directories(ImageContinuumEngine

@@ -16,11 +16,16 @@ namespace ic
         float deltaTime;
         float timeSinceStart;
         float interpolationAlpha;
-        uint32_t gpuFrameIndex;
 
         FrameArena* arena = nullptr;
         EventFrame* eventFrame = nullptr;
         AppServices* services = nullptr;
+
+
+        uint32_t gpuFrameIndex(uint32_t framesInFlight) const
+        {
+            return static_cast<uint32_t>(frameIndex % framesInFlight);
+        }
     };
 
 

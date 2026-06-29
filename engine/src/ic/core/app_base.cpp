@@ -74,7 +74,7 @@ namespace ic
         bindEventSink();
         buildServices();
 
-        m_runtime->renderer->init(m_spec.rendererSpec);
+        initRenderer();
     }
 
     int AppBase::run(
@@ -206,16 +206,14 @@ namespace ic
     void AppBase::createJobSystem()
     {
         m_runtime->jobs = std::make_unique<JobSystem>();
-        uint32_t coreCount = std::thread::hardware_concurrency();
-        uint32_t workerCount = coreCount > 1 ? coreCount - 1 : 1;
-        m_runtime->jobs->init(workerCount);
-
+        m_runtime->jobs->init();
     }
 
     void AppBase::createFrameArenas()
     {
         m_runtime->frameArenas =
-            std::make_unique<FrameArenaManager<AppSpecification::kMaxFramesInFlight>>(16 * 1024 * 1024);
+            std::make_unique<FrameArenaManager<AppSpecification::kMaxFramesInFlight>>
+            (16 * 1024 * 1024);
     }
 
     void AppBase::createWindow()
@@ -234,7 +232,18 @@ namespace ic
 
     void AppBase::createRenderer()
     {
-        m_runtime->renderer = std::make_unique<Renderer>(m_spec.rendererSpec);
+        m_runtime->renderer = std::make_unique<Renderer>(
+            m_spec.rendererSpec);
+    }
+
+    void AppBase::initRenderer()
+    {
+        auto workerCount = m_runtime->jobs->workerCount();
+
+        m_runtime->renderer->init(
+            m_spec.rendererSpec,
+            *m_runtime->window,
+            workerCount);
     }
 
     void AppBase::bindEventSink()

@@ -7,7 +7,9 @@ namespace ic
     enum class RendererBackendType : uint8_t
     {
         Vulkan,
+#ifdef _WIN32
         DX12
+#endif
     };
 
     enum class RenderPathType : uint8_t

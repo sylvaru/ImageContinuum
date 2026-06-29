@@ -55,6 +55,18 @@ namespace ic
         Present
     };
 
+    enum class ResourceOwnership : uint8_t
+    {
+        Transient,
+        Imported
+    };
+
+    enum class ImportedResource : uint8_t
+    {
+        None,
+        Swapchain
+    };
+
     struct ResourceBarrier
     {
         GraphResourceId resource;
@@ -75,12 +87,32 @@ namespace ic
         GraphResourceId resource;
         AccessType access;
         ResourceUsage usage;
+
+        bool external = false;
+        bool firstUse = false;
+    };
+
+    struct ResourceState
+    {
+        ResourceUsage usage;
+        AccessType access;
+    };
+
+    struct ImportedResourceDesc
+    {
+        ImportedResource type;
+        ResourceUsage initialUsage;
     };
 
     struct GraphResource
     {
         GraphResourceId id;
+
         GraphResourceType type;
+        ResourceOwnership ownership;
+        ImportedResource imported;
+        ResourceUsage initialUsage;
+        AccessType initialAccess;
 
         uint32_t firstAccess;
         uint32_t accessCount;

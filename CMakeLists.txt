@@ -12,6 +12,7 @@ option(IC_BUILD_TESTS "Build tests" ON)
 option(IC_BUILD_EDITOR "Build editor" OFF)
 option(IC_BUILD_SHARED "Build libraries as shared" OFF)
 
+
 # Setup the scalable compiler warnings module
 include(cmake/CompilerWarnings.cmake)
 

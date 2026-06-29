@@ -4,12 +4,26 @@ project(ImageContinuumVendors CXX)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # =========================================================
-# Vulkan Headers
+# Vulkan headers
 # =========================================================
+
+find_package(Vulkan REQUIRED)
 add_library(vulkan-headers INTERFACE)
 target_include_directories(vulkan-headers INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/vulkan-headers/include>
 )
+# =========================================================
+# GPUOpen VulkanMemoryAllocator
+# =========================================================
+add_subdirectory(vulkan-memory-allocator)
+
+# =========================================================
+# DirectX12
+# =========================================================
+
+# =========================================================
+# MoltenVK 
+# =========================================================
 
 # =========================================================
 # Toml++
@@ -125,6 +139,12 @@ add_library(ic_thirdparty INTERFACE)
 add_dependencies(ic_thirdparty concurrentqueue)
 
 target_link_libraries(ic_thirdparty INTERFACE
+    tomlplusplus::tomlplusplus
+    fastgltf::fastgltf
+    EnTT::EnTT
+    Tracy::TracyClient
+    Vulkan::Vulkan
+    GPUOpen::VulkanMemoryAllocator
     vulkan-headers
     glfw
     spdlog
@@ -133,8 +153,5 @@ target_link_libraries(ic_thirdparty INTERFACE
     concurrentqueue
     stb
     imgui
-    tomlplusplus::tomlplusplus
-    fastgltf::fastgltf
-    EnTT::EnTT
-    Tracy::TracyClient
+
 )

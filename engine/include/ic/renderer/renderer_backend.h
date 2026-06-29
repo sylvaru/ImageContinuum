@@ -7,14 +7,21 @@ namespace ic
 {
     struct CompiledGraphPlan;
     struct FrameContext;
+
     struct RendererSpecification;
+
+    class Window;
 
     class RendererBackend
     {
     public:
         virtual ~RendererBackend() = default;
 
-        virtual void initialize(const RendererSpecification& spec) = 0;
+        virtual void initialize(
+            const RendererSpecification& spec,
+            Window& window,
+            uint32_t workerCount
+        ) = 0;
         virtual void shutdown() = 0;
 
         virtual void execute(

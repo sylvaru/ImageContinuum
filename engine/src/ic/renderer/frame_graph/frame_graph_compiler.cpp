@@ -46,14 +46,17 @@ namespace ic
 
         debugLog();
 
-        return 
+        auto resources = builder.resources();
+
+        return
         {
             .nodes = std::span<const ExecutionNode>(m_nodes),
             .executionOrder = std::span<const GraphNodeId>(m_executionOrder),
             .dependencies = std::span<const Dependency>(m_dependencies),
             .barriers = std::span<const ResourceBarrier>(m_barriers),
             .nodeSchedules = std::span<const NodeSchedule>(m_nodeSchedules),
-            .resourceLifetimes = std::span<const ResourceLifetime>(m_resourceLifetimes)
+            .resourceLifetimes = std::span<const ResourceLifetime>(m_resourceLifetimes),
+            .resources = std::span<const GraphResource>(resources)
         };
     }
 
@@ -206,6 +209,12 @@ namespace ic
             std::sort(sorted.begin(), sorted.end(),
                 [&](const ResourceAccess& a, const ResourceAccess& b)
                 {
+                    const bool aExternal = a.external;
+                    const bool bExternal = b.external;
+
+                    if (aExternal != bExternal)
+                        return aExternal;
+
                     return execIndex[a.node] < execIndex[b.node];
                 });
 
@@ -241,9 +250,37 @@ namespace ic
         m_resourceChains.clear();
         m_resourceChains.reserve(m_chainMap.size());
 
-        for (auto& [_, chain] : m_chainMap)
+        for (auto& [id, chain] : m_chainMap)
         {
             m_resourceChains.push_back(std::move(chain));
+        }
+
+        auto resources = builder.resources();
+
+        for (auto& chain : m_resourceChains)
+        {
+            const auto& resource = resources[chain.resource];
+
+            if (resource.ownership != ResourceOwnership::Imported)
+                continue;
+
+            if (chain.accesses.empty())
+                continue;
+
+
+            if (resource.ownership == ResourceOwnership::Imported)
+            {
+                ResourceAccess initial{};
+                initial.node = chain.accesses.front().node;
+                initial.resource = chain.resource;
+
+                initial.access = resource.initialAccess;
+                initial.usage = resource.initialUsage;
+                initial.external = true;
+                initial.firstUse = true;
+
+                chain.accesses.insert(chain.accesses.begin(), initial);
+            }
         }
     }
 
@@ -251,7 +288,6 @@ namespace ic
     {
         m_barriers.clear();
 
-        // Map node -> execution index
         std::pmr::vector<uint32_t> execIndex(
             m_nodes.size(),
             0,
@@ -259,29 +295,34 @@ namespace ic
         );
 
         for (uint32_t i = 0; i < m_executionOrder.size(); ++i)
-        {
             execIndex[m_executionOrder[i]] = i;
-        }
 
-        // For each resource chain
         for (const auto& chain : m_resourceChains)
         {
             if (chain.accesses.size() < 2)
                 continue;
 
-            // Sort accesses by execution order
             auto sorted = chain.accesses;
 
-            std::sort(sorted.begin(), sorted.end(),
+            std::stable_sort(sorted.begin(), sorted.end(),
                 [&](const ResourceAccess& a, const ResourceAccess& b)
                 {
-                    return execIndex[a.node] < execIndex[b.node];
+                    const uint32_t aIndex = execIndex[a.node];
+                    const uint32_t bIndex = execIndex[b.node];
+
+                    if (aIndex != bIndex)
+                        return aIndex < bIndex;
+
+                    if (a.firstUse != b.firstUse)
+                        return a.firstUse;
+
+                    return false;
                 });
 
-            // Generate transitions
+            ResourceAccess prev = sorted[0];
+
             for (size_t i = 1; i < sorted.size(); ++i)
             {
-                const auto& prev = sorted[i - 1];
                 const auto& curr = sorted[i];
 
                 const bool needsBarrier =
@@ -289,17 +330,20 @@ namespace ic
                     curr.access == AccessType::Write ||
                     prev.usage != curr.usage;
 
-                if (!needsBarrier) continue;
+                if (needsBarrier)
+                {
+                    m_barriers.push_back({
+                        .resource = chain.resource,
+                        .fromNode = prev.node,
+                        .toNode = curr.node,
+                        .fromAccess = prev.access,
+                        .toAccess = curr.access,
+                        .oldUsage = prev.usage,
+                        .newUsage = curr.usage
+                        });
+                }
 
-                m_barriers.push_back({
-                    .resource = chain.resource,
-                    .fromNode = prev.node,
-                    .toNode = curr.node,
-                    .fromAccess = prev.access,
-                    .toAccess = curr.access,
-                    .oldUsage = prev.usage,
-                    .newUsage = curr.usage
-                    });
+                prev = curr;
             }
         }
     }
@@ -307,10 +351,24 @@ namespace ic
     void FrameGraphCompiler::buildNodeSchedules()
     {
         m_nodeSchedules.clear();
-        m_nodeSchedules.reserve(m_nodes.size());
 
-        // Create one schedule per node
-        for (GraphNodeId i = 0; i < m_nodes.size(); ++i)
+        const size_t nodeCount = m_nodes.size();
+
+        std::pmr::vector<uint32_t> nodeRemap(
+            nodeCount,
+            0,
+            m_nodes.get_allocator()
+        );
+
+        for (uint32_t i = 0; i < nodeCount; ++i)
+        {
+            nodeRemap[i] = i;
+        }
+
+        m_nodeSchedules.reserve(nodeCount);
+
+        // Create schedules
+        for (GraphNodeId i = 0; i < nodeCount; ++i)
         {
             NodeSchedule schedule{
                 .node = i,
@@ -326,13 +384,14 @@ namespace ic
         {
             const auto& barrier = m_barriers[i];
 
-            m_nodeSchedules[barrier.toNode]
-                .incomingBarrierIndices
-                .push_back(i);
+            if (barrier.fromNode >= nodeCount || barrier.toNode >= nodeCount)
+                continue;
 
-            m_nodeSchedules[barrier.fromNode]
-                .outgoingBarrierIndices
-                .push_back(i);
+            const uint32_t from = nodeRemap[barrier.fromNode];
+            const uint32_t to = nodeRemap[barrier.toNode];
+
+            m_nodeSchedules[to].incomingBarrierIndices.push_back(i);
+            m_nodeSchedules[from].outgoingBarrierIndices.push_back(i);
         }
     }
 
@@ -348,6 +407,7 @@ namespace ic
         case ResourceUsage::StorageTexture: return "StorageTexture";
         case ResourceUsage::TransferDst: return "TransferDst";
         case ResourceUsage::TransferSrc: return "TransferSrc";
+        case ResourceUsage::Present: return "Present";
             
 
         default: return "Unknown";
@@ -390,7 +450,9 @@ namespace ic
                 const auto& a = chain.accesses[i - 1];
                 const auto& b = chain.accesses[i];
 
-                if (a.node == b.node)
+                if (a.node == b.node &&
+                    !a.firstUse &&
+                    !b.firstUse)
                 {
                     spdlog::warn(
                         "Duplicate access detected on resource {} in node {}",

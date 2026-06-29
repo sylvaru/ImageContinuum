@@ -79,6 +79,8 @@ namespace ic
         struct PlatformState;
 
         void initAppBase(int argc, char** argv);
+        void initRenderer();
+
         void shutdown();
 
         void createJobSystem();
