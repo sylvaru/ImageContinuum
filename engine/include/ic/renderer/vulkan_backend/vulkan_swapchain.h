@@ -8,6 +8,13 @@ namespace ic
     class VulkanDevice;
     class Window;
 
+    enum class SwapchainState
+    {
+        Valid,
+        OutOfDate,
+        Minimized
+    };
+
 
     class VulkanSwapchain
     {
@@ -47,12 +54,22 @@ namespace ic
             return m_imageViews[index];
         }
 
+        SwapchainState state() const
+        {
+            return m_state;
+        }
+
+        bool validForRendering() const
+        {
+            return m_state == SwapchainState::Valid;
+        }
+
         VkFormat format() const { return m_format; }
         VkExtent2D extent() const { return m_extent; }
 
     private:
 
-        void createSwapchain();
+        bool createSwapchain();
         void createImageViews();
 
         VkSurfaceFormatKHR chooseSurfaceFormat(
@@ -80,6 +97,7 @@ namespace ic
 
         VkFormat m_format{};
         VkExtent2D m_extent{};
+        SwapchainState m_state = SwapchainState::Valid;
 
         uint32_t m_currentImage = 0;
     };

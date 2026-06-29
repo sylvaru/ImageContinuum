@@ -19,7 +19,9 @@ namespace ic
 		m_surface = surface;
 		m_window = &window;
 
-		createSwapchain();
+        if (!createSwapchain())
+            return;
+
 		createImageViews();
 
 		spdlog::info(
@@ -28,51 +30,6 @@ namespace ic
 			m_extent.width,
 			m_extent.height);
 	}
-
-
-	void VulkanSwapchain::recreate()
-	{
-		vkDeviceWaitIdle(
-			m_device->device());
-
-		shutdown();
-
-		createSwapchain();
-		createImageViews();
-
-		spdlog::info(
-			"[VulkanSwapchain] Recreated ({}x{})",
-			m_extent.width,
-			m_extent.height);
-	}
-
-    uint32_t VulkanSwapchain::acquireNextImage(
-        VkSemaphore imageAvailable)
-    {
-        VkResult result =
-            vkAcquireNextImageKHR(
-                m_device->device(),
-                m_swapchain,
-                UINT64_MAX,
-                imageAvailable,
-                VK_NULL_HANDLE,
-                &m_currentImage);
-
-        switch (result)
-        {
-        case VK_SUCCESS:
-        case VK_SUBOPTIMAL_KHR:
-            return m_currentImage;
-
-        case VK_ERROR_OUT_OF_DATE_KHR:
-            recreate();
-            return UINT32_MAX;
-
-        default:
-            throw std::runtime_error(
-                "Failed to acquire swapchain image.");
-        }
-    }
 
     bool VulkanSwapchain::present(
         VkQueue presentQueue,
@@ -110,7 +67,7 @@ namespace ic
 
         case VK_SUBOPTIMAL_KHR:
         case VK_ERROR_OUT_OF_DATE_KHR:
-            recreate();
+            m_state = SwapchainState::OutOfDate;
             return false;
 
         default:
@@ -119,7 +76,57 @@ namespace ic
         }
     }
 
-    void VulkanSwapchain::createSwapchain()
+
+    void VulkanSwapchain::recreate()
+    {
+        vkDeviceWaitIdle(m_device->device());
+
+        shutdown();
+
+        if (!createSwapchain())
+            return;
+
+        createImageViews();
+
+        spdlog::info(
+            "[VulkanSwapchain] Recreated ({}x{})",
+            m_extent.width,
+            m_extent.height);
+    }
+
+
+    uint32_t VulkanSwapchain::acquireNextImage(
+        VkSemaphore imageAvailable)
+    {
+        if (m_state != SwapchainState::Valid)
+            return UINT32_MAX;
+
+        VkResult result =
+            vkAcquireNextImageKHR(
+                m_device->device(),
+                m_swapchain,
+                UINT64_MAX,
+                imageAvailable,
+                VK_NULL_HANDLE,
+                &m_currentImage);
+
+        switch (result)
+        {
+        case VK_SUCCESS:
+        case VK_SUBOPTIMAL_KHR:
+            return m_currentImage;
+
+        case VK_ERROR_OUT_OF_DATE_KHR:
+            m_state = SwapchainState::OutOfDate;
+            return UINT32_MAX;
+
+        default:
+            throw std::runtime_error(
+                "Failed to acquire swapchain image.");
+        }
+    }
+
+    bool VulkanSwapchain::createSwapchain()
     {
         const auto& support =
             m_adapter->querySwapchainSupport(m_adapter->device());
@@ -134,6 +141,13 @@ namespace ic
             chooseExtent(
                 support.capabilities,
                 *m_window);
+
+        if (extent.width == 0 || extent.height == 0)
+        {
+            m_state = SwapchainState::Minimized;
+            m_extent = extent;
+            return false;
+        }
 
         uint32_t imageCount =
             support.capabilities.minImageCount + 1;
@@ -236,8 +250,10 @@ namespace ic
         m_format =
             surfaceFormat.format;
 
-        m_extent =
-            extent;
+        m_extent = extent;
+
+        m_state = SwapchainState::Valid;
+        return true;
     }
 
     void VulkanSwapchain::createImageViews()

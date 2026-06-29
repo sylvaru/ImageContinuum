@@ -742,6 +742,11 @@ namespace ic
 
     void VulkanBackend::onSwapchainRecreated()
     {
+        m_swapchain.recreate();
+
+        if (!m_swapchain.validForRendering())
+            return;
+
         initSwapchainSync();
         m_imageStates.clear();
     }
