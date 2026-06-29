@@ -7,12 +7,13 @@
 #include "ic/renderer/vulkan_backend/vulkan_device.h"
 #include "ic/renderer/vulkan_backend/vulkan_swapchain.h"
 #include "ic/renderer/vulkan_backend/vulkan_command_system.h"
+#include "ic/renderer/vulkan_backend/vulkan_descriptor_system.h"
 
 namespace ic
 {
     class Window;
 
-    class VulkanBackend : public RendererBackend
+    class VulkanBackend final : public RendererBackend
     {
     public:
 
@@ -51,15 +52,17 @@ namespace ic
         void executeGraph(
             const CompiledGraphPlan& plan,
             const FrameContext& ctx,
-            VkCommandBuffer cmd,
-            VkImage swapchainImage);
+            VkImage swapchainImage,
+            VkImageLayout swapchainInitialLayout,
+            std::vector<VkCommandBuffer>& commandBuffers);
 
         void applyBarriers(
             VkCommandBuffer cmd,
             std::span<const ResourceBarrier> barriers,
             std::span<const GraphResource> resources,
             const ExecutionNode& node,
-            VkImage swapchainImage);
+            VkImage swapchainImage,
+            VkImageLayout swapchainInitialLayout);
 
         void dispatchNode(
             const ExecutionNode& node,
@@ -71,10 +74,11 @@ namespace ic
             VkCommandBuffer cmd,
             const ResourceBarrier& barrier,
             std::span<const GraphResource> resources,
-            VkImage swapchainImage);
+            VkImage swapchainImage,
+            VkImageLayout swapchainInitialLayout);
 
         void submitFrame(
-            VkCommandBuffer cmd,
+            std::span<const VkCommandBuffer> commandBuffers,
             FrameSync& sync,
             VkSemaphore renderFinished);
 
@@ -119,6 +123,7 @@ namespace ic
         uint32_t m_currentSwapchainImage = 0;
         std::vector<VkSemaphore> m_imageRenderFinished;
         std::vector<VkFence> m_imagesInFlight;
+        std::vector<VkImageLayout> m_swapchainImageLayouts;
 
         VulkanInstance m_instance;
         VulkanPlatform m_platform;
@@ -126,5 +131,7 @@ namespace ic
         VulkanDevice m_device;
         VulkanSwapchain m_swapchain;
         VulkanCommandSystem m_commandSystem;
+        VulkanDescriptorSystem m_descriptorSystem;
+        uint32_t m_workerSlots = 1;
     };
 }

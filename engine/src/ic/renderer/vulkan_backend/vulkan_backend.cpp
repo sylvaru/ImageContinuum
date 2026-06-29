@@ -5,6 +5,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <future>
+
 namespace ic
 {
 	void VulkanBackend::initialize(
@@ -37,6 +39,7 @@ namespace ic
 
         const uint32_t workerSlots =
             workerCount == 0 ? 1 : workerCount;
+        m_workerSlots = workerSlots;
 
         initFrameSync(spec);
 
@@ -45,6 +48,10 @@ namespace ic
 			m_adapter.info().queueFamilies.graphics,
 			framesInFlight,
 			workerSlots);
+
+        m_descriptorSystem.init(
+            m_device.device(),
+            m_device.info());
 
 	}
 
@@ -58,6 +65,7 @@ namespace ic
         destroySwapchainSync();
         destroyFrameSync();
 
+        m_descriptorSystem.shutdown();
         m_commandSystem.shutdown();
         m_swapchain.shutdown();
         m_device.shutdown();
@@ -101,6 +109,11 @@ namespace ic
         VkImage swapchainImage =
             m_swapchain.image(imageIndex);
 
+        const VkImageLayout swapchainInitialLayout =
+            imageIndex < m_swapchainImageLayouts.size()
+                ? m_swapchainImageLayouts[imageIndex]
+                : VK_IMAGE_LAYOUT_UNDEFINED;
+
         if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE)
         {
             vkWaitForFences(
@@ -121,32 +134,28 @@ namespace ic
 
         m_commandSystem.beginFrame(frameSlot);
 
-        // Begin frame command recording
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        beginInfo.pInheritanceInfo = nullptr;
-
-        VkCommandBuffer cmd =
-            m_commandSystem.beginFrameCommandBuffer(
-                frameSlot, 0);
-
-
-        vkBeginCommandBuffer(cmd, &beginInfo);
-
-        // Execute compiled graph plan
-        executeGraph(plan, ctx, cmd, swapchainImage);
-
-        vkEndCommandBuffer(cmd);
+        std::vector<VkCommandBuffer> commandBuffers;
+        executeGraph(
+            plan,
+            ctx,
+            swapchainImage,
+            swapchainInitialLayout,
+            commandBuffers);
 
         VkSemaphore renderFinished =
             m_imageRenderFinished[imageIndex];
 
         // Submit
         submitFrame(
-            cmd,
+            commandBuffers,
             frameSync,
             renderFinished);
+
+        if (imageIndex < m_swapchainImageLayouts.size())
+        {
+            m_swapchainImageLayouts[imageIndex] =
+                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        }
 
         // Present
         const bool presented =
@@ -162,7 +171,7 @@ namespace ic
     }
 
     void VulkanBackend::submitFrame(
-        VkCommandBuffer cmd,
+        std::span<const VkCommandBuffer> commandBuffers,
         FrameSync& sync,
         VkSemaphore renderFinished)
     {
@@ -176,8 +185,9 @@ namespace ic
         submit.pWaitSemaphores = &sync.imageAvailable;
         submit.pWaitDstStageMask = &waitStage;
 
-        submit.commandBufferCount = 1;
-        submit.pCommandBuffers = &cmd;
+        submit.commandBufferCount =
+            static_cast<uint32_t>(commandBuffers.size());
+        submit.pCommandBuffers = commandBuffers.data();
 
         submit.signalSemaphoreCount = 1;
         submit.pSignalSemaphores = &renderFinished;
@@ -198,29 +208,88 @@ namespace ic
     void VulkanBackend::executeGraph(
         const CompiledGraphPlan& plan,
         const FrameContext& ctx,
-        VkCommandBuffer cmd,
-        VkImage swapchainImage)
+        VkImage swapchainImage,
+        VkImageLayout swapchainInitialLayout,
+        std::vector<VkCommandBuffer>& commandBuffers)
     {
-        // executionOrder is already topologically sorted
-        for (GraphNodeId nodeId : plan.executionOrder)
+        auto recordNode =
+            [&](GraphNodeId nodeId, uint32_t workerIndex)
+            {
+                auto lease =
+                    m_commandSystem.acquireFrameCommandBuffer(
+                        static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size()),
+                        workerIndex);
+
+                VkCommandBuffer cmd =
+                    lease.commandBuffer();
+
+                VkCommandBufferBeginInfo beginInfo{};
+                beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                beginInfo.pInheritanceInfo = nullptr;
+
+                if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS)
+                {
+                    throw std::runtime_error(
+                        "Failed to begin Vulkan command buffer.");
+                }
+
+                const ExecutionNode& node =
+                    plan.nodes[nodeId];
+
+                applyBarriers(
+                    cmd,
+                    plan.barriers,
+                    plan.resources,
+                    node,
+                    swapchainImage,
+                    swapchainInitialLayout);
+
+                dispatchNode(
+                    node,
+                    ctx,
+                    cmd,
+                    swapchainImage);
+
+                if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
+                {
+                    throw std::runtime_error(
+                        "Failed to end Vulkan command buffer.");
+                }
+
+                return cmd;
+            };
+
+        if (plan.executionLevels.empty())
         {
-            const ExecutionNode& node =
-                plan.nodes[nodeId];
+            for (uint32_t i = 0; i < plan.executionOrder.size(); ++i)
+            {
+                commandBuffers.push_back(
+                    recordNode(plan.executionOrder[i], i % m_workerSlots));
+            }
 
-            // Apply barriers for this node
-            applyBarriers(
-                cmd,
-                plan.barriers,
-                plan.resources,
-                node,
-                swapchainImage);
+            return;
+        }
 
-            // Dispatch node work
-            dispatchNode(
-                node,
-                ctx,
-                cmd,
-                swapchainImage);
+        for (const std::pmr::vector<GraphNodeId>& level : plan.executionLevels)
+        {
+            std::vector<std::future<VkCommandBuffer>> futures;
+            futures.reserve(level.size());
+
+            for (uint32_t i = 0; i < level.size(); ++i)
+            {
+                futures.push_back(
+                    std::async(
+                        std::launch::async,
+                        recordNode,
+                        level[i],
+                        i % m_workerSlots));
+            }
+
+            for (auto& future : futures)
+            {
+                commandBuffers.push_back(future.get());
+            }
         }
     }
 
@@ -229,7 +298,8 @@ namespace ic
         std::span<const ResourceBarrier> barriers,
         std::span<const GraphResource> resources,
         const ExecutionNode& node,
-        VkImage swapchainImage)
+        VkImage swapchainImage,
+        VkImageLayout swapchainInitialLayout)
     {
         for (const ResourceBarrier& barrier : barriers)
         {
@@ -241,7 +311,8 @@ namespace ic
                 cmd,
                 barrier,
                 resources,
-                swapchainImage);
+                swapchainImage,
+                swapchainInitialLayout);
         }
     }
 
@@ -249,7 +320,8 @@ namespace ic
         VkCommandBuffer cmd,
         const ResourceBarrier& barrier,
         std::span<const GraphResource> resources,
-        VkImage swapchainImage)
+        VkImage swapchainImage,
+        VkImageLayout swapchainInitialLayout)
     {
 
         VkImageMemoryBarrier vkBarrier{};
@@ -260,12 +332,15 @@ namespace ic
 
         VkImage image = VK_NULL_HANDLE;
 
+        bool isSwapchainImage = false;
+
         if (resource.ownership == ResourceOwnership::Imported)
         {
             switch (resource.imported)
             {
             case ImportedResource::Swapchain:
                 image = swapchainImage;
+                isSwapchainImage = true;
                 break;
             }
         }
@@ -276,18 +351,22 @@ namespace ic
         }
         vkBarrier.image = image;
 
-        const VkImageLayout trackedLayout =
-            getOrInitImageLayout(image);
+        const bool isExternalFirstUse =
+            isSwapchainImage &&
+            barrier.fromNode == barrier.toNode;
 
-        vkBarrier.oldLayout = trackedLayout;
+        vkBarrier.oldLayout = isExternalFirstUse
+            ? swapchainInitialLayout
+            : usageToLayout(barrier.oldUsage);
+
         vkBarrier.newLayout = usageToLayout(barrier.newUsage);
 
         vkBarrier.srcAccessMask =
-            trackedLayout == VK_IMAGE_LAYOUT_UNDEFINED
-            ? 0
-            : accessMaskFor(
-                barrier.oldUsage,
-                barrier.fromAccess);
+            vkBarrier.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                ? 0
+                : accessMaskFor(
+                    barrier.oldUsage,
+                    barrier.fromAccess);
 
         vkBarrier.dstAccessMask =
             accessMaskFor(
@@ -316,7 +395,7 @@ namespace ic
                 barrier.oldUsage,
                 barrier.fromAccess);
 
-        if (trackedLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+        if (vkBarrier.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
         {
             srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         }
@@ -339,9 +418,6 @@ namespace ic
             0, nullptr,
             0, nullptr,
             1, &vkBarrier);
-
-        m_imageStates[image].layout = vkBarrier.newLayout;
-        m_imageStates[image].access = barrier.toAccess;
     }
 
     void VulkanBackend::dispatchNode(
@@ -668,6 +744,9 @@ namespace ic
 
         m_imageRenderFinished.resize(imageCount, VK_NULL_HANDLE);
         m_imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
+        m_swapchainImageLayouts.assign(
+            imageCount,
+            VK_IMAGE_LAYOUT_UNDEFINED);
 
         VkSemaphoreCreateInfo semInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
 
@@ -738,6 +817,7 @@ namespace ic
 
         m_imageRenderFinished.clear();
         m_imagesInFlight.clear();
+        m_swapchainImageLayouts.clear();
     }
 
     void VulkanBackend::onSwapchainRecreated()

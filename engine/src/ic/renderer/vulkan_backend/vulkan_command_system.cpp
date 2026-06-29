@@ -21,8 +21,11 @@ namespace ic
         {
             frame.workerPools.resize(maxWorkers);
 
-            for (auto& worker : frame.workerPools)
+            for (std::unique_ptr<WorkerPool>& workerPtr : frame.workerPools)
             {
+                workerPtr = std::make_unique<WorkerPool>();
+                WorkerPool& worker = *workerPtr;
+
                 VkCommandPoolCreateInfo poolInfo{};
                 poolInfo.sType =
                     VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -66,8 +69,10 @@ namespace ic
 
         for (auto& frame : m_frames)
         {
-            for (auto& worker : frame.workerPools)
+            for (std::unique_ptr<WorkerPool>& workerPtr : frame.workerPools)
             {
+                WorkerPool& worker = *workerPtr;
+
                 if (worker.pool != VK_NULL_HANDLE)
                 {
                     vkDestroyCommandPool(
@@ -91,13 +96,57 @@ namespace ic
 
     void VulkanCommandSystem::beginFrame(uint32_t frameIndex)
     {
-        for (auto& worker : m_frames[frameIndex].workerPools)
+        for (std::unique_ptr<WorkerPool>& workerPtr : m_frames[frameIndex].workerPools)
         {
+            WorkerPool& worker = *workerPtr;
+            std::scoped_lock lock(worker.mutex);
+            worker.nextCommandBuffer = 0;
             vkResetCommandPool(
                 m_device,
                 worker.pool,
                 0);
         }
+    }
+
+    VulkanCommandSystem::RecordingLease
+        VulkanCommandSystem::acquireFrameCommandBuffer(
+            uint32_t frameIndex,
+            uint32_t workerIndex)
+    {
+        FrameData& frame =
+            m_frames[frameIndex % m_frames.size()];
+
+        WorkerPool& pool =
+            *frame.workerPools[workerIndex];
+
+        std::unique_lock lock(pool.mutex);
+
+        if (pool.nextCommandBuffer >= pool.commandBuffers.size())
+        {
+            VkCommandBufferAllocateInfo allocInfo{};
+            allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            allocInfo.commandPool = pool.pool;
+            allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            allocInfo.commandBufferCount = 1;
+
+            VkCommandBuffer commandBuffer = VK_NULL_HANDLE;
+
+            if (vkAllocateCommandBuffers(
+                m_device,
+                &allocInfo,
+                &commandBuffer) != VK_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Failed to allocate Vulkan frame command buffer.");
+            }
+
+            pool.commandBuffers.push_back(commandBuffer);
+        }
+
+        VkCommandBuffer commandBuffer =
+            pool.commandBuffers[pool.nextCommandBuffer++];
+
+        return RecordingLease(commandBuffer, std::move(lock));
     }
 
     VkCommandBuffer VulkanCommandSystem::beginFrameCommandBuffer(
@@ -108,7 +157,7 @@ namespace ic
             m_frames[frameIndex % m_frames.size()];
 
         WorkerPool& pool =
-            frame.workerPools[workerIndex];
+            *frame.workerPools[workerIndex];
 
         if (pool.primary == VK_NULL_HANDLE)
         {
@@ -138,7 +187,7 @@ namespace ic
         allocInfo.commandPool =
             m_frames[frameIndex]
             .workerPools[workerIndex]
-            .pool;
+            ->pool;
 
         allocInfo.level =
             VK_COMMAND_BUFFER_LEVEL_PRIMARY;

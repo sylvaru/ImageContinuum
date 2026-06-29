@@ -13,6 +13,8 @@ namespace ic
 
         std::span<const GraphNodeId> executionOrder;
 
+        std::span<const std::pmr::vector<GraphNodeId>> executionLevels;
+
         std::span<const Dependency> dependencies;
 
         std::span<const ResourceBarrier> barriers;

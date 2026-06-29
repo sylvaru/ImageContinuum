@@ -1,5 +1,6 @@
 #pragma once
 
+#include <vulkan/vulkan.h>
 
 namespace ic
 {
@@ -8,6 +9,7 @@ namespace ic
         DynamicRendering,
         Synchronization2,
         DescriptorIndexing,
+        DescriptorHeap,
         DescriptorBuffer,
         BufferDeviceAddress
     };
@@ -17,9 +19,13 @@ namespace ic
         bool dynamicRendering = false;
         bool synchronization2 = false;
         bool descriptorIndexing = false;
+        bool descriptorHeap = false;
+        bool descriptorHeapAvailable = false;
         bool descriptorBuffer = false;
         bool bufferDeviceAddress = false;
         bool timelineSemaphore = false;
+        bool maintenance5 = false;
+        bool extendedFlags = false;
     };
 
     struct QueueFamilyIndices
@@ -59,6 +65,21 @@ namespace ic
         SwapChainSupportDetails swapchainSupport;
 
         VulkanFeatureSupport supportedFeatures;
+
+        VkPhysicalDeviceDescriptorIndexingFeatures descriptorIndexingFeatures{};
+        VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures{};
+        VkPhysicalDeviceVulkan13Features vulkan13Features{};
+        VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphoreFeatures{};
+
+#ifdef VK_EXT_descriptor_buffer
+        VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBufferFeatures{};
+        VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptorBufferProperties{};
+#endif
+
+#ifdef VK_EXT_descriptor_heap
+        VkPhysicalDeviceDescriptorHeapFeaturesEXT descriptorHeapFeatures{};
+        VkPhysicalDeviceDescriptorHeapPropertiesEXT descriptorHeapProperties{};
+#endif
     };
 
 

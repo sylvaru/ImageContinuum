@@ -5,7 +5,7 @@
 namespace ic
 {
 
-	class VulkanAllocator
+	class VulkanResourceAllocator
 	{
 		void init(
 			VkInstance,

@@ -33,6 +33,7 @@ namespace ic
             , m_chainMap(memory)
             , m_adjacencyLists(memory)
             , m_nodeSchedules(memory)
+            , m_executionLevels(memory)
         {}
 
         CompiledGraphPlan compile(
@@ -41,6 +42,7 @@ namespace ic
         void buildDependencies();
 
         void buildExecutionOrder();
+        void buildExecutionLevels();
 
         void buildResourceLifetimes();
 
@@ -65,5 +67,6 @@ namespace ic
         std::pmr::vector<ResourceChain> m_resourceChains;
         std::pmr::vector<std::pmr::vector<GraphNodeId>> m_adjacencyLists;
         std::pmr::vector<NodeSchedule> m_nodeSchedules;
+        std::pmr::vector<std::pmr::vector<GraphNodeId>> m_executionLevels;
     };
 }

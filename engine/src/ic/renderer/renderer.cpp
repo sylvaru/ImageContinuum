@@ -10,6 +10,8 @@
 #include "ic/renderer/frame_graph/frame_graph_arena.h"
 #include "ic/renderer/frame_graph/compiled_graph_plan.h"
 
+#include <spdlog/spdlog.h>
+
 #ifdef _WIN32
 #include "ic/renderer/dx12_backend/dx12_backend.h"
 #endif

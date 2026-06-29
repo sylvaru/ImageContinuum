@@ -86,20 +86,21 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/vulkan_backend/vulkan_platform.h" 
     "include/ic/renderer/vulkan_backend/vulkan_adapter.h"
     "include/ic/renderer/vulkan_backend/vulkan_device.h"
-    "include/ic/renderer/vulkan_backend/vulkan_allocator.h"
+    "include/ic/renderer/vulkan_backend/vulkan_resource_allocator.h"
     "include/ic/renderer/vulkan_backend/vulkan_swapchain.h"
     "include/ic/renderer/vulkan_backend/vulkan_command_system.h"
 
     "src/ic/renderer/vulkan_backend/vulkan_platform.cpp" 
     "src/ic/renderer/vulkan_backend/vulkan_adapter.cpp"
     "src/ic/renderer/vulkan_backend/vulkan_device.cpp"
-    "src/ic/renderer/vulkan_backend/vulkan_allocator.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_resource_allocator.cpp"
     "src/ic/renderer/vulkan_backend/vulkan_swapchain.cpp"
     "src/ic/renderer/vulkan_backend/vulkan_command_system.cpp"
     "src/ic/renderer/vulkan_backend/vulkan_instance.cpp"
     "include/ic/renderer/vulkan_backend/vulkan_instance.h"
 
-)
+    "include/ic/renderer/vulkan_backend/vulkan_descriptor_system.h" 
+    "src/ic/renderer/vulkan_backend/vulkan_descriptor_system.cpp")
 
     if (WIN32)
     target_sources(ImageContinuumEngine PRIVATE
@@ -108,7 +109,18 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/dx12_backend/dx12_adapter.h"
     "include/ic/renderer/dx12_backend/dx12_swapchain.h"
     "include/ic/renderer/dx12_backend/dx12_command_system.h"
-    "include/ic/renderer/dx12_backend/dx12_allocator.h"
+    "include/ic/renderer/dx12_backend/dx12_resource_allocator.h"
+    "include/ic/renderer/dx12_backend/dx12_device.h" 
+    "include/ic/renderer/dx12_backend/dx12_descriptor_system.h" 
+
+    "src/ic/renderer/dx12_backend/dx12_backend.cpp"
+    "src/ic/renderer/dx12_backend/dx12_device.cpp" 
+    "src/ic/renderer/dx12_backend/dx12_resource_allocator.cpp"
+    "src/ic/renderer/dx12_backend/dx12_adapter.cpp"
+    "src/ic/renderer/dx12_backend/dx12_swapchain.cpp" 
+    "src/ic/renderer/dx12_backend/dx12_factory.cpp" 
+    "src/ic/renderer/dx12_backend/dx12_command_system.cpp"
+    "src/ic/renderer/dx12_backend/dx12_descriptor_system.cpp"
     )
     endif()
 
@@ -148,3 +160,12 @@ target_link_libraries(ImageContinuumEngine
     PRIVATE
         ic_compiler_warnings
 )
+
+if (WIN32)
+    target_link_libraries(ImageContinuumEngine
+        PRIVATE
+            d3d12
+            dxgi
+            dxguid
+    )
+endif()

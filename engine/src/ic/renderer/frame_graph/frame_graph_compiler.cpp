@@ -18,6 +18,7 @@ namespace ic
         m_resourceLifetimes.clear();
         m_dependencies.clear();
         m_executionOrder.clear();
+        m_executionLevels.clear();
         m_chainMap.clear();
         m_resourceChains.clear();
         m_nodeSchedules.clear();
@@ -40,6 +41,7 @@ namespace ic
         buildDependencies();
         buildAdjacencyLists();
         buildExecutionOrder();
+        buildExecutionLevels();
         buildResourceLifetimes();
         buildBarriers();
         buildNodeSchedules();
@@ -52,6 +54,7 @@ namespace ic
         {
             .nodes = std::span<const ExecutionNode>(m_nodes),
             .executionOrder = std::span<const GraphNodeId>(m_executionOrder),
+            .executionLevels = std::span<const std::pmr::vector<GraphNodeId>>(m_executionLevels),
             .dependencies = std::span<const Dependency>(m_dependencies),
             .barriers = std::span<const ResourceBarrier>(m_barriers),
             .nodeSchedules = std::span<const NodeSchedule>(m_nodeSchedules),
@@ -182,6 +185,66 @@ namespace ic
             m_executionOrder.size() == nodeCount &&
             "FrameGraph contains dependency cycle"
         );
+    }
+
+    void FrameGraphCompiler::buildExecutionLevels()
+    {
+        const size_t nodeCount = m_nodes.size();
+
+        std::pmr::vector<uint32_t> inDegree(
+            nodeCount, 0, m_nodes.get_allocator());
+
+        for (const auto& dep : m_dependencies)
+        {
+            inDegree[dep.destination]++;
+        }
+
+        std::pmr::vector<GraphNodeId> currentLevel(m_nodes.get_allocator());
+        currentLevel.reserve(nodeCount);
+
+        for (GraphNodeId node = 0; node < nodeCount; ++node)
+        {
+            if (inDegree[node] == 0)
+            {
+                currentLevel.push_back(node);
+            }
+        }
+
+        m_executionLevels.clear();
+
+        size_t scheduledCount = 0;
+
+        while (!currentLevel.empty())
+        {
+            std::sort(currentLevel.begin(), currentLevel.end());
+
+            std::pmr::vector<GraphNodeId> level(
+                currentLevel.begin(),
+                currentLevel.end(),
+                m_nodes.get_allocator());
+
+            scheduledCount += level.size();
+            m_executionLevels.push_back(std::move(level));
+
+            std::pmr::vector<GraphNodeId> nextLevel(m_nodes.get_allocator());
+
+            for (GraphNodeId node : currentLevel)
+            {
+                for (GraphNodeId destination : m_adjacencyLists[node])
+                {
+                    if (--inDegree[destination] == 0)
+                    {
+                        nextLevel.push_back(destination);
+                    }
+                }
+            }
+
+            currentLevel = std::move(nextLevel);
+        }
+
+        assert(
+            scheduledCount == nodeCount &&
+            "FrameGraph contains dependency cycle");
     }
 
     void FrameGraphCompiler::buildResourceLifetimes()
@@ -493,6 +556,19 @@ namespace ic
         for (GraphNodeId id : m_executionOrder)
         {
             spdlog::info("{}", id);
+        }
+
+        spdlog::info("Execution Levels:");
+        for (uint32_t levelIndex = 0; levelIndex < m_executionLevels.size(); ++levelIndex)
+        {
+            std::string nodes;
+            for (GraphNodeId id : m_executionLevels[levelIndex])
+            {
+                nodes += std::to_string(id);
+                nodes += " ";
+            }
+
+            spdlog::info("Level {} | {}", levelIndex, nodes);
         }
 
         spdlog::info("Resource Lifetimes:");

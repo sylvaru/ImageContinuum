@@ -1,5 +1,7 @@
 #pragma once
 #include <vulkan/vulkan.h>
+#include <memory>
+#include <mutex>
 
 /*
 
@@ -44,6 +46,44 @@ namespace ic
 
         void beginFrame(uint32_t frameIndex);
 
+        class RecordingLease
+        {
+        public:
+            RecordingLease() = default;
+            RecordingLease(const RecordingLease&) = delete;
+            RecordingLease& operator=(const RecordingLease&) = delete;
+            RecordingLease(RecordingLease&&) noexcept = default;
+            RecordingLease& operator=(RecordingLease&&) noexcept = default;
+
+            VkCommandBuffer commandBuffer() const
+            {
+                return m_commandBuffer;
+            }
+
+            explicit operator bool() const
+            {
+                return m_commandBuffer != VK_NULL_HANDLE;
+            }
+
+        private:
+            friend class VulkanCommandSystem;
+
+            RecordingLease(
+                VkCommandBuffer commandBuffer,
+                std::unique_lock<std::mutex>&& lock)
+                : m_commandBuffer(commandBuffer)
+                , m_lock(std::move(lock))
+            {
+            }
+
+            VkCommandBuffer m_commandBuffer = VK_NULL_HANDLE;
+            std::unique_lock<std::mutex> m_lock;
+        };
+
+        RecordingLease acquireFrameCommandBuffer(
+            uint32_t frameIndex,
+            uint32_t workerIndex);
+
         VkCommandBuffer beginFrameCommandBuffer(
             uint32_t frameIndex,
             uint32_t workerIndex);
@@ -63,11 +103,14 @@ namespace ic
         {
             VkCommandPool pool = VK_NULL_HANDLE;
             VkCommandBuffer primary = VK_NULL_HANDLE;
+            std::vector<VkCommandBuffer> commandBuffers;
+            uint32_t nextCommandBuffer = 0;
+            std::mutex mutex;
         };
 
         struct FrameData
         {
-            std::vector<WorkerPool> workerPools;
+            std::vector<std::unique_ptr<WorkerPool>> workerPools;
         };
 
         VkDevice m_device = VK_NULL_HANDLE;

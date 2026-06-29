@@ -24,7 +24,11 @@ private:
         AppSpecification spec;
 
         spec.appName = "Demo App";
+#ifdef _WIN32
+        spec.rendererSpec.backendType = RendererBackendType::DX12;
+#else
         spec.rendererSpec.backendType = RendererBackendType::Vulkan;
+#endif
         spec.rendererSpec.pathType = RenderPathType::Forward;
         spec.window.width = 1920;
         spec.window.height = 1080;
