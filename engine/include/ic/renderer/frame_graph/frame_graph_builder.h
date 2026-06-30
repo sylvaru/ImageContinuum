@@ -1,8 +1,10 @@
 #pragma once
 #include <vector>
 #include <span>
+#include <string_view>
 #include "frame_graph_types.h"
 #include "frame_graph_pass.h"
+#include "ic/renderer/render_pipeline.h"
 
 
 namespace ic
@@ -12,6 +14,89 @@ namespace ic
 	class FrameGraphBuilder
 	{
 	public:
+        class GraphicsPassBuilder
+        {
+        public:
+            GraphicsPassBuilder(
+                FrameGraphBuilder& builder,
+                GraphNodeId node)
+                : m_builder(builder)
+                , m_node(node)
+            {}
+
+            GraphicsPassBuilder& pipeline(std::string_view logicalName);
+            GraphicsPassBuilder& color(GraphResourceId resource);
+            GraphicsPassBuilder& depth(GraphResourceId resource);
+
+            operator GraphNodeId() const
+            {
+                return m_node;
+            }
+
+        private:
+            FrameGraphBuilder& m_builder;
+            GraphNodeId m_node;
+        };
+
+        class ComputePassBuilder
+        {
+        public:
+            ComputePassBuilder(
+                FrameGraphBuilder& builder,
+                GraphNodeId node)
+                : m_builder(builder)
+                , m_node(node)
+            {}
+
+            ComputePassBuilder& pipeline(std::string_view logicalName);
+            ComputePassBuilder& dispatch(
+                uint32_t groupCountX,
+                uint32_t groupCountY = 1,
+                uint32_t groupCountZ = 1);
+            ComputePassBuilder& read(
+                GraphResourceId resource,
+                ResourceUsage usage);
+            ComputePassBuilder& write(
+                GraphResourceId resource,
+                ResourceUsage usage);
+
+            operator GraphNodeId() const
+            {
+                return m_node;
+            }
+
+        private:
+            FrameGraphBuilder& m_builder;
+            GraphNodeId m_node;
+        };
+
+        class TransferPassBuilder
+        {
+        public:
+            TransferPassBuilder(
+                FrameGraphBuilder& builder,
+                GraphNodeId node)
+                : m_builder(builder)
+                , m_node(node)
+            {}
+
+            TransferPassBuilder& read(
+                GraphResourceId resource,
+                ResourceUsage usage = ResourceUsage::TransferSrc);
+            TransferPassBuilder& write(
+                GraphResourceId resource,
+                ResourceUsage usage = ResourceUsage::TransferDst);
+
+            operator GraphNodeId() const
+            {
+                return m_node;
+            }
+
+        private:
+            FrameGraphBuilder& m_builder;
+            GraphNodeId m_node;
+        };
+
 		explicit FrameGraphBuilder(std::pmr::memory_resource* memory)
 			: m_memory(memory)
 			, m_nodes(memory)
@@ -51,6 +136,10 @@ namespace ic
 			return id;
 		}
 
+        GraphicsPassBuilder addGraphicsPass(std::string_view name);
+        ComputePassBuilder addComputePass(std::string_view name);
+        TransferPassBuilder addTransferPass(std::string_view name);
+
 		// Resource creation
 		GraphResourceId createTexture(); // TextureDesc desc
 		GraphResourceId createBuffer(); // BufferDesc desc
@@ -69,6 +158,20 @@ namespace ic
 		GraphResourceId importTexture(ImportedResourceDesc desc);
 
 		void clear();
+
+        void setGraphicsPassPipeline(
+            GraphNodeId node,
+            PipelineId pipeline);
+
+        void setComputePassPipeline(
+            GraphNodeId node,
+            PipelineId pipeline);
+
+        void setComputePassDispatch(
+            GraphNodeId node,
+            uint32_t groupCountX,
+            uint32_t groupCountY,
+            uint32_t groupCountZ);
 
 	private:
 

@@ -108,8 +108,10 @@ namespace ic
 
     void JobSystem::executeTask(JobTask& task)
     {
-        task.invoke(task.storage);
-        if (task.destroy) task.destroy(task.storage);
+        if (task.function)
+        {
+            task.function();
+        }
         if (task.counter) task.counter->decrement();
     }
 

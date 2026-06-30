@@ -1,0 +1,39 @@
+[scene]
+name = "ImageContinuum Demo Scene"
+
+[[entities]]
+id = 1
+name = "Main Camera"
+
+[entities.transform]
+translation = [0.0, 1.5, 5.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+
+[entities.camera]
+primary = true
+vertical_fov_degrees = 90.0
+near = 0.1
+far = 1000.0
+
+[[entities]]
+id = 2
+name = "Cornell Box"
+model = "CornellBox-Original.gltf"
+
+[entities.transform]
+translation = [0.0, 0.0, 0.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+
+[[entities]]
+id = 3
+name = "Sun"
+
+[entities.transform]
+rotation = [-0.4, 0.2, 0.0, 1.0]
+
+[entities.light]
+type = "directional"
+color = [1.0, 0.95, 0.85]
+intensity = 4.0

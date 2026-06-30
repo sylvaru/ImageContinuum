@@ -33,6 +33,7 @@ namespace ic
             compiledNode.nodeId = node.graphNode.id;
             compiledNode.queue = node.graphNode.queue;
             compiledNode.type = node.graphNode.type;
+            compiledNode.payloadIndex = node.graphNode.payloadIndex;
 
             m_nodes.push_back(compiledNode);
         }
@@ -49,6 +50,7 @@ namespace ic
         debugLog();
 
         auto resources = builder.resources();
+        auto payloads = builder.payloads();
 
         return
         {
@@ -59,7 +61,8 @@ namespace ic
             .barriers = std::span<const ResourceBarrier>(m_barriers),
             .nodeSchedules = std::span<const NodeSchedule>(m_nodeSchedules),
             .resourceLifetimes = std::span<const ResourceLifetime>(m_resourceLifetimes),
-            .resources = std::span<const GraphResource>(resources)
+            .resources = std::span<const GraphResource>(resources),
+            .payloads = std::span<const PassPayload>(payloads)
         };
     }
 

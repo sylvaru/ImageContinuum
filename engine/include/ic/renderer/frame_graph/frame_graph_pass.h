@@ -1,13 +1,32 @@
 // ic/renderer/frame_graph/graph_pass.h
 #pragma once
+#include <string>
+
+#include "ic/renderer/render_pipeline.h"
 
 namespace ic
 {
     class FrameGraphBuilder;
 
-    struct GraphicsPassData {};
+    struct GraphicsPassData
+    {
+        std::string name;
+        PipelineId pipeline = {};
+    };
 
-    struct ComputePassData {};
+    struct TransferPassData
+    {
+        std::string name;
+    };
+
+    struct ComputePassData
+    {
+        std::string name;
+        PipelineId pipeline = {};
+        uint32_t groupCountX = 1;
+        uint32_t groupCountY = 1;
+        uint32_t groupCountZ = 1;
+    };
 
     struct ClearPassData {};
 
@@ -25,9 +44,11 @@ namespace ic
     using PassPayload =
         std::variant<
         ClearPassData,
+        GraphicsPassData,
         GeometryPassData,
         LightingPassData,
         ComputePassData,
+        TransferPassData,
         PresentPassData,
         ShadowPassData,
         PostProcessPassData>;

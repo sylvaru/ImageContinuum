@@ -1,0 +1,45 @@
+[scene]
+name = "Cornell Box"
+
+[[entities]]
+id = 1
+name = "Main Camera"
+
+[entities.transform]
+translation = [0.0, 1.0, 4.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+
+[entities.camera]
+primary = true
+vertical_fov_degrees = 60.0
+near = 0.05
+far = 100.0
+
+[entities.fly_camera]
+move_speed = 3.0
+fast_move_multiplier = 4.0
+mouse_sensitivity = 0.0025
+capture_mouse = true
+
+[[entities]]
+id = 2
+name = "Cornell Box"
+model = "CornellBox-Original.gltf"
+
+[entities.transform]
+translation = [0.0, 0.0, 0.0]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [1.0, 1.0, 1.0]
+
+[[entities]]
+id = 3
+name = "Key Light"
+
+[entities.transform]
+rotation = [-0.6, 0.4, 0.0, 1.0]
+
+[entities.light]
+type = "directional"
+color = [1.0, 0.95, 0.85]
+intensity = 3.0

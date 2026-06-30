@@ -8,10 +8,16 @@
 #include "ic/renderer/vulkan_backend/vulkan_swapchain.h"
 #include "ic/renderer/vulkan_backend/vulkan_command_system.h"
 #include "ic/renderer/vulkan_backend/vulkan_descriptor_system.h"
+#include "ic/renderer/vulkan_backend/vulkan_pipeline_manager.h"
+#include "ic/renderer/vulkan_backend/vulkan_resource_allocator.h"
+#include "ic/renderer/renderer_gpu_assets.h"
+
+#include <glm/glm.hpp>
 
 namespace ic
 {
     class Window;
+    class PipelineLibrary;
 
     class VulkanBackend final : public RendererBackend
     {
@@ -19,6 +25,7 @@ namespace ic
 
         void initialize(
             const RendererSpecification& spec,
+            const PipelineLibrary& pipelineLibrary,
             Window& window,
             uint32_t workerCount) override;
 
@@ -26,7 +33,18 @@ namespace ic
 
         void execute(
             const CompiledGraphPlan& plan,
-            const FrameContext& ctx) override;
+            const FrameContext& ctx,
+            const SceneRenderView& scene) override;
+
+        VulkanResourceAllocator& resourceAllocator()
+        {
+            return m_resourceAllocator;
+        }
+
+        const VulkanResourceAllocator& resourceAllocator() const
+        {
+            return m_resourceAllocator;
+        }
 
         struct FrameSync
         {
@@ -47,11 +65,43 @@ namespace ic
             AccessType access;
         };
 
+        struct UploadedModel
+        {
+            VulkanBuffer vertexBuffer;
+            VulkanBuffer indexBuffer;
+            std::vector<GpuMesh> meshes;
+            std::vector<glm::mat4> meshTransforms;
+            std::vector<GpuMaterialData> materials;
+            bool uploaded = false;
+        };
+
+        struct FrameSceneResources
+        {
+            VulkanBuffer frameConstants;
+            VulkanBuffer objects;
+            VulkanBuffer materials;
+
+            VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+            VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+
+            uint32_t objectCapacity = 0;
+            uint32_t materialCapacity = 0;
+        };
+
+        struct DrawItem
+        {
+            UploadedModel* model = nullptr;
+            uint32_t objectIndex = 0;
+            uint32_t meshIndex = 0;
+            uint32_t materialIndex = 0;
+        };
+
     private:
 
         void executeGraph(
             const CompiledGraphPlan& plan,
             const FrameContext& ctx,
+            const SceneRenderView& scene,
             VkImage swapchainImage,
             VkImageLayout swapchainInitialLayout,
             std::vector<VkCommandBuffer>& commandBuffers);
@@ -65,8 +115,10 @@ namespace ic
             VkImageLayout swapchainInitialLayout);
 
         void dispatchNode(
+            const CompiledGraphPlan& plan,
             const ExecutionNode& node,
             const FrameContext& ctx,
+            const SceneRenderView& scene,
             VkCommandBuffer cmd,
             VkImage swapchainImage);
 
@@ -83,16 +135,59 @@ namespace ic
             VkSemaphore renderFinished);
 
         void executeGraphicsNode(
+            const CompiledGraphPlan& plan,
             const ExecutionNode& node,
             const FrameContext& ctx,
+            const SceneRenderView& scene,
             VkCommandBuffer cmd,
             VkImage swapchainImage);
+
+        void executeComputeNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
+            const FrameContext& ctx,
+            VkCommandBuffer cmd);
+
+        void executeTransferNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
+            const FrameContext& ctx,
+            VkCommandBuffer cmd);
+
+        void destroySceneResources();
+        void ensureDepthTarget();
+        void destroyDepthTarget();
+        void ensureComputeTestResources(
+            const VulkanComputePipeline& pipeline);
+
+        UploadedModel* requestModel(
+            AssetHandle handle,
+            const AssetManager& assets);
+
+        bool prepareSceneResources(
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            GraphicsPipelineHandle pipelineHandle,
+            std::vector<DrawItem>& draws);
+
+        GraphicsPipelineHandle pipelineForNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node);
+
+        ComputePipelineHandle computePipelineForNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node);
+
+        void updateFrameDescriptors(
+            FrameSceneResources& resources,
+            GraphicsPipelineHandle pipelineHandle);
 
         void initFrameSync(const RendererSpecification& spec);
         void initSwapchainSync();
         void destroyFrameSync();
         void destroySwapchainSync();
         void onSwapchainRecreated();
+        TextureFormat swapchainTextureFormat() const;
 
         VkImageLayout usageToLayout(ResourceUsage usage) const;
 
@@ -132,6 +227,23 @@ namespace ic
         VulkanSwapchain m_swapchain;
         VulkanCommandSystem m_commandSystem;
         VulkanDescriptorSystem m_descriptorSystem;
+        VulkanPipelineManager m_pipelineManager;
+        VulkanResourceAllocator m_resourceAllocator;
+
+        VulkanTexture m_depthTexture;
+        VkImageView m_depthImageView = VK_NULL_HANDLE;
+        VkImageLayout m_depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        uint32_t m_depthWidth = 0;
+        uint32_t m_depthHeight = 0;
+        VulkanBuffer m_computeTestBuffer;
+        VkDescriptorPool m_computeTestDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorSet m_computeTestDescriptorSet = VK_NULL_HANDLE;
+
+        const PipelineLibrary* m_pipelineLibrary = nullptr;
+        std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash> m_pipelineHandles;
+        std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash> m_computePipelineHandles;
+        std::unordered_map<AssetHandle, UploadedModel, AssetHandleHash> m_uploadedModels;
+        std::vector<FrameSceneResources> m_sceneFrameResources;
         uint32_t m_workerSlots = 1;
     };
 }

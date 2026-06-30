@@ -3,6 +3,9 @@
 #include "game_layer.h"
 #include "ic/renderer/renderer_specification.h"
 
+#include <cstdlib>
+#include <string_view>
+
 using namespace ic;
 
 class DemoApp : public AppBase
@@ -25,11 +28,13 @@ private:
 
         spec.appName = "Demo App";
 #ifdef _WIN32
-        spec.rendererSpec.backendType = RendererBackendType::DX12;
+        spec.rendererSpec.backendType = RendererBackendType::Vulkan;
 #else
         spec.rendererSpec.backendType = RendererBackendType::Vulkan;
 #endif
         spec.rendererSpec.pathType = RenderPathType::Forward;
+        spec.rendererSpec.pipelineLibraryPath =
+            "demo/res/pipelines/forward.toml";
         spec.window.width = 1920;
         spec.window.height = 1080;
         return spec;

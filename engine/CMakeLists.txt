@@ -35,7 +35,10 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/renderer_specification.h" 
      
     "include/ic/renderer/render_types.h"
+    "include/ic/renderer/render_pipeline.h"
+    "include/ic/renderer/pipeline_library.h"
     "include/ic/renderer/render_world.h"
+    "include/ic/renderer/renderer_gpu_assets.h"
      
     "include/ic/renderer/vulkan_backend/vulkan_backend.h" 
     
@@ -57,6 +60,16 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/core/memory/frame_arena_manager.h"
     "include/ic/core/memory/frame_arena_storage.h"
     "include/ic/renderer/frame_graph/frame_graph_compiler.h"
+    "include/ic/scene/scene_types.h"
+    "include/ic/scene/scene_components.h"
+    "include/ic/scene/scene_render_view.h"
+    "include/ic/scene/scene_entity.h"
+    "include/ic/scene/scene_entity.inl"
+    "include/ic/scene/scene.h"
+    "include/ic/scene/scene_manager.h"
+    "include/ic/scene/scene_camera_controller_system.h"
+    "include/ic/scene/scene_transform_utils.h"
+    "include/ic/scene/scene_transform_system.h"
 
     "src/ic/core/app_base.cpp" 
     "src/ic/core/layer_stack.cpp" 
@@ -74,6 +87,10 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/core/job_system.cpp"
     "src/ic/renderer/frame_graph/frame_graph_compiler.cpp"
     "src/ic/core/memory/frame_arena.cpp" 
+    "src/ic/scene/scene.cpp"
+    "src/ic/scene/scene_manager.cpp"
+    "src/ic/scene/scene_transform_utils.cpp"
+    "src/ic/scene/scene_transform_system.cpp"
 
     "include/ic/renderer/frame_graph/frame_graph_builder.h" 
     "src/ic/renderer/frame_graph/frame_graph_builder.cpp"  
@@ -81,6 +98,8 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/frame_graph/frame_graph_cache.h"
     "include/ic/renderer/renderer.h"
     "src/ic/renderer/renderer.cpp" 
+    "src/ic/renderer/pipeline_library.cpp"
+    "src/ic/renderer/renderer_gpu_assets.cpp"
     "include/ic/renderer/frame_graph/frame_graph_arena.h"
     "include/ic/renderer/renderer_types.h"  
     "include/ic/renderer/vulkan_backend/vulkan_platform.h" 
@@ -89,6 +108,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/vulkan_backend/vulkan_resource_allocator.h"
     "include/ic/renderer/vulkan_backend/vulkan_swapchain.h"
     "include/ic/renderer/vulkan_backend/vulkan_command_system.h"
+    "include/ic/renderer/vulkan_backend/vulkan_pipeline_manager.h"
 
     "src/ic/renderer/vulkan_backend/vulkan_platform.cpp" 
     "src/ic/renderer/vulkan_backend/vulkan_adapter.cpp"
@@ -96,11 +116,35 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/renderer/vulkan_backend/vulkan_resource_allocator.cpp"
     "src/ic/renderer/vulkan_backend/vulkan_swapchain.cpp"
     "src/ic/renderer/vulkan_backend/vulkan_command_system.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_pipeline_manager.cpp"
     "src/ic/renderer/vulkan_backend/vulkan_instance.cpp"
     "include/ic/renderer/vulkan_backend/vulkan_instance.h"
 
     "include/ic/renderer/vulkan_backend/vulkan_descriptor_system.h" 
-    "src/ic/renderer/vulkan_backend/vulkan_descriptor_system.cpp")
+    "src/ic/renderer/vulkan_backend/vulkan_descriptor_system.cpp"
+    "include/ic/renderer/renderer_gpu_assets.h"
+    "include/ic/renderer/renderer_gpu_assets.h"
+    "src/ic/renderer/renderer_gpu_assets.cpp"
+    "src/ic/core/asset_manager.cpp" 
+    "include/ic/core/asset_manager.h"
+
+    "include/ic/scene/scene.h"
+    "include/ic/scene/scene_manager.h"
+    "include/ic/scene/scene_transform_utils.h"
+    "include/ic/scene/scene_transform_system.h"
+    "include/ic/scene/scene_camera_controller_system.h"
+    "include/ic/scene/scene_components.h"
+    "include/ic/scene/scene_render_view.h"
+    "include/ic/scene/scene_entity.h"
+    "include/ic/scene/scene_types.h"
+
+    "src/ic/scene/scene_manager.cpp"
+    "src/ic/scene/scene_camera_controller_system.cpp"
+    "src/ic/scene/scene_transform_utils.cpp"
+    "src/ic/scene/scene_transform_system.cpp"
+    "src/ic/scene/scene.cpp"
+    "src/ic/scene/scene_camera_controller_system.cpp"
+    )
 
     if (WIN32)
     target_sources(ImageContinuumEngine PRIVATE
@@ -112,6 +156,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/dx12_backend/dx12_resource_allocator.h"
     "include/ic/renderer/dx12_backend/dx12_device.h" 
     "include/ic/renderer/dx12_backend/dx12_descriptor_system.h" 
+    "include/ic/renderer/dx12_backend/dx12_pipeline_manager.h" 
 
     "src/ic/renderer/dx12_backend/dx12_backend.cpp"
     "src/ic/renderer/dx12_backend/dx12_device.cpp" 
@@ -121,6 +166,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/renderer/dx12_backend/dx12_factory.cpp" 
     "src/ic/renderer/dx12_backend/dx12_command_system.cpp"
     "src/ic/renderer/dx12_backend/dx12_descriptor_system.cpp"
+    "src/ic/renderer/dx12_backend/dx12_pipeline_manager.cpp"
     )
     endif()
 
@@ -165,6 +211,7 @@ if (WIN32)
     target_link_libraries(ImageContinuumEngine
         PRIVATE
             d3d12
+            d3dcompiler
             dxgi
             dxguid
     )

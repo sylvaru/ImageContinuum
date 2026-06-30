@@ -150,7 +150,7 @@ namespace ic
 
 	bool GLFWInput::isKeyPressed(IcKey key) const
 	{
-		return m_keysPressed.test(static_cast<size_t>(key));
+		return m_keys.test(static_cast<size_t>(key));
 	}
 
 	bool GLFWInput::isMouseButtonPressed(MouseButton button) const

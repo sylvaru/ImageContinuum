@@ -3,6 +3,7 @@
 #include <thread>
 #include <atomic>
 #include <semaphore>
+#include <functional>
 #include <concurrentqueue.h>
 
 namespace ic 
@@ -49,29 +50,17 @@ namespace ic
 
 
 
-    static constexpr size_t kJobInlineStorageBytes = 64;
-
     struct JobTask
     {
-        alignas(8) std::byte storage[kJobInlineStorageBytes];
-        void (*invoke)(std::byte*)  { nullptr };
-        void (*destroy)(std::byte*) { nullptr };
-        JobCounter* counter         { nullptr };
+        std::function<void()> function;
+        JobCounter* counter { nullptr };
 
         template<typename F>
         static JobTask make(F&& fn, JobCounter* ctr = nullptr)
         {
-            static_assert(sizeof(F) <= kJobInlineStorageBytes,
-                "JobTask closure too large — increase kJobInlineStorageBytes "
-                "or reduce captures");
-            static_assert(std::is_trivially_destructible_v<F> || true,
-                "Non-trivial destructors supported via destroy ptr");
-
             JobTask t;
             t.counter = ctr;
-            new (t.storage) F(std::forward<F>(fn));
-            t.invoke = [](std::byte* s) {(*std::launder(reinterpret_cast<F*>(s)))(); };
-            t.destroy = [](std::byte* s) { std::launder(reinterpret_cast<F*>(s))->~F(); };
+            t.function = std::forward<F>(fn);
             return t;
         }
     };

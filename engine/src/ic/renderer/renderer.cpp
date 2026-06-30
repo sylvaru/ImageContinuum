@@ -9,6 +9,8 @@
 #include "ic/renderer/frame_graph/frame_graph_compiler.h"
 #include "ic/renderer/frame_graph/frame_graph_arena.h"
 #include "ic/renderer/frame_graph/compiled_graph_plan.h"
+#include "ic/renderer/pipeline_library.h"
+#include "ic/scene/scene_render_view.h"
 
 #include <spdlog/spdlog.h>
 
@@ -27,6 +29,7 @@ namespace ic
 
         Scope<RendererBackend> backend;
         Scope<RendererPath> path;
+        PipelineLibrary pipelineLibrary;
 
         FrameGraphBuilder builder;
         FrameGraphCompiler compiler;
@@ -62,12 +65,29 @@ namespace ic
     {
         spdlog::info("[Renderer] init...");
 
-        m_runtime->backend->initialize(spec, window, workerCount);
+        if (!spec.pipelineLibraryPath.empty())
+        {
+            m_runtime->pipelineLibrary.load(spec.pipelineLibraryPath);
+        }
+
+        m_runtime->backend->initialize(
+            spec,
+            m_runtime->pipelineLibrary,
+            window,
+            workerCount);
 
         rebuildGraph();
     }
 
     void Renderer::render(FrameContext& frame)
+    {
+        static const SceneRenderView emptyScene{};
+        render(frame, emptyScene);
+    }
+
+    void Renderer::render(
+        FrameContext& frame,
+        [[maybe_unused]] const SceneRenderView& scene)
     {
         auto& rt = *m_runtime;
 
@@ -78,7 +98,16 @@ namespace ic
 
         rt.backend->execute(
             rt.compiledGraphPlan,
-            frame);
+            frame,
+            scene);
+    }
+
+    void Renderer::shutdown()
+    {
+        if (m_runtime && m_runtime->backend)
+        {
+            m_runtime->backend->shutdown();
+        }
     }
 
     void Renderer::rebuildGraph()

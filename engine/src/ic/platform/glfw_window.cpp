@@ -12,7 +12,7 @@ namespace ic
         m_window = glfwCreateWindow(
             spec.width,
             spec.height,
-            "App",
+            spec.title.c_str(),
             nullptr,
             nullptr
         );
@@ -59,6 +59,13 @@ namespace ic
     void* GLFWWindow::getNativeHandle() const
     {
         return m_window;
+    }
+
+    void GLFWWindow::setTitle(std::string_view title)
+    {
+        glfwSetWindowTitle(
+            m_window,
+            std::string(title).c_str());
     }
 
     void GLFWWindow::bindEventSink(EventCallbackFn fn)

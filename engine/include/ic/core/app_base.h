@@ -27,12 +27,13 @@ namespace ic
 
     struct AppServices
     {
-        Input* input;
-        Window* window;
-        JobSystem* jobSystem;
-        Renderer* renderer;
-        //AssetManager* assetManager;
-        //SceneManager* sceneManager;
+        Input* input = nullptr;
+        Window* window = nullptr;
+        Renderer* renderer = nullptr;
+
+        JobSystem* jobSystem = nullptr;
+        AssetManager* assetManager = nullptr;
+        SceneManager* sceneManager = nullptr;
     };
 
     class AppBase
@@ -56,8 +57,11 @@ namespace ic
         template<typename T, typename... Args>
         T& pushLayer(Args&&... args)
         {
-            return m_layerStack.emplaceLayer<T>(
+            T& layer = m_layerStack.emplaceLayer<T>(
                 std::forward<Args>(args)...);
+
+            layer.onAttach(m_services);
+            return layer;
         }
 
     public:
@@ -89,6 +93,8 @@ namespace ic
         void createInput();
         void createFrameArenas();
         void createRenderer();
+        void createAssetManager();
+        void createSceneManager();
 
         void buildServices();
         void bindEventSink();
@@ -107,7 +113,7 @@ namespace ic
         AppServices m_services{};
         FrameContext m_frame{};
         
-        static constexpr float kTargetFPS = 5.0f;
+        static constexpr float kTargetFPS = 144.0f;
         static constexpr float kTargetFrameTime = 1.0f / kTargetFPS;
     };
 }

@@ -22,6 +22,8 @@ namespace ic
 
         void* getNativeHandle() const override;
 
+        void setTitle(std::string_view title) override;
+
         void requestClose() override;
 
         void bindEventSink(EventCallbackFn fn) override;

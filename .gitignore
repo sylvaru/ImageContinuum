@@ -2,5 +2,8 @@
 .vs
 # Ignore build directory
 out
-# Ignore compiled SPIR-V shaders
-demo/res/shaders/spirV/*.spv
+# Ignore compiled shaders
+demo/res/compiled_shaders/vulkan/*.spv
+demo/res/compiled_shaders/dx12/*.dxil
+
+.agents

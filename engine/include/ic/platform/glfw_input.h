@@ -56,7 +56,7 @@ namespace ic
         double m_scrollX = 0.0;
         double m_scrollY = 0.0;
 
-        bool m_cursorLocked = true;
+        bool m_cursorLocked = false;
 
         // Mouse buttons
         bool m_mouseButtons[8]{};

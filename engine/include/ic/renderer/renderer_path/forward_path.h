@@ -11,6 +11,8 @@ namespace ic
     public:
 
         GraphResourceId backBuffer;
+        GraphResourceId sceneDepth;
+        GraphResourceId visibilityBuffer;
 
         void buildFrameGraph(FrameGraphBuilder& builder) override
         {
@@ -19,17 +21,32 @@ namespace ic
                 .type = ImportedResource::Swapchain,
                 .initialUsage = ResourceUsage::Present
                 });
+            sceneDepth = builder.createTexture();
+            visibilityBuffer = builder.createBuffer();
 
-            auto clearNode =
-                builder.addGraphNode(
-                    ClearPassData{},
-                    GraphNodeType::Graphics,
-                    QueueType::Graphics);
+            builder.addComputePass("Visibility")
+                .pipeline("visibility_test")
+                .dispatch(64)
+                .write(visibilityBuffer, ResourceUsage::StorageBuffer);
 
-            builder.write(
-                clearNode,
-                backBuffer,
-                ResourceUsage::ColorAttachment);
+            builder.addComputePass("IndependentCompute")
+                .pipeline("independent_compute_test")
+                .dispatch(64)
+                .write(visibilityBuffer, ResourceUsage::StorageBuffer);
+
+            builder.addGraphicsPass("DepthPrepass")
+                .pipeline("depth_prepass")
+                .depth(sceneDepth);
+
+            auto forwardNode = builder.addGraphicsPass("ForwardOpaque")
+                .pipeline("forward_bindless")
+                .color(backBuffer)
+                .depth(sceneDepth);
+
+            builder.read(
+                forwardNode,
+                visibilityBuffer,
+                ResourceUsage::StorageBuffer);
 
             auto presentNode =
                 builder.addGraphNode(

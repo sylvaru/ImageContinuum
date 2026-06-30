@@ -12,10 +12,13 @@ namespace ic
 
     struct FrameContext
     {
-        uint64_t frameIndex;
-        float deltaTime;
-        float timeSinceStart;
-        float interpolationAlpha;
+        uint64_t frameIndex = 0;
+        float deltaTime = 0.0f;
+        float timeSinceStart = 0.0f;
+        float interpolationAlpha = 0.0f;
+
+        uint32_t windowWidth = 0;
+        uint32_t windowHeight = 0;
 
         FrameArena* arena = nullptr;
         EventFrame* eventFrame = nullptr;

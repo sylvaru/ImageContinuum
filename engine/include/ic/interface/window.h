@@ -33,6 +33,8 @@ namespace ic
 
         virtual void* getNativeHandle() const = 0;
 
+        virtual void setTitle(std::string_view title) = 0;
+
         virtual void requestClose() = 0;
 
         virtual void bindEventSink(EventCallbackFn fn) = 0;

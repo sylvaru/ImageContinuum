@@ -14,6 +14,11 @@
 #include "ic/core/memory/frame_arena.h"
 #include "ic/core/memory/frame_arena_manager.h"
 #include "ic/renderer/renderer.h"
+#include "ic/core/asset_manager.h"
+#include "ic/scene/scene_manager.h"
+
+#include <algorithm>
+#include <filesystem>
 
 #include <spdlog/spdlog.h>
 
@@ -34,6 +39,8 @@ namespace ic
         Scope<EventQueue>           eventQueue;
         Scope<FrameArenaManager<AppSpecification::kMaxFramesInFlight>> 
                                     frameArenas;
+        Scope<AssetManager>         assetManager;
+        Scope<SceneManager>         sceneManager;
         Scope<Renderer>             renderer;
         
         EventFrameBuffer<AppSpecification::kMaxFramesInFlight> 
@@ -59,8 +66,6 @@ namespace ic
         [[maybe_unused]] int argc,
         [[maybe_unused]] char** argv)
     {
-        // Todo: use toml++ for easily configuring
-        // static initialization data
 
         spdlog::info("[AppBase] initAppBase...");
 
@@ -69,6 +74,8 @@ namespace ic
         createInput();
         createJobSystem();
         createFrameArenas();
+        createAssetManager();
+        createSceneManager();
         createRenderer();
 
         bindEventSink();
@@ -102,18 +109,25 @@ namespace ic
             ++m_frame.frameIndex;
             m_frame.deltaTime = m_clock.tick();
             m_frame.timeSinceStart = m_clock.getTimeSinceStart();
+            m_frame.windowWidth = runtime.window->getWidth();
+            m_frame.windowHeight = runtime.window->getHeight();
             
             auto& arena = m_runtime->frameArenas->beginFrame(m_frame.frameIndex);
             arena.reset();
             m_frame.arena = &arena;
 
+            runtime.input->beginFrame();
             runtime.window->pollEvents();
             runtime.eventBuffer.ingest(*m_runtime->eventQueue);
-            runtime.input->beginFrame();
             runtime.eventBuffer.beginFrame(m_frame);
-           
+
             runtime.framePipeline.execute(m_frame);
-            runtime.renderer->render(m_frame);
+            runtime.assetManager->update();
+            runtime.sceneManager->update(m_frame);
+
+            runtime.renderer->render(
+                m_frame,
+                runtime.sceneManager->renderView());
 
             // Frame pacing
             sleep(frameStart);
@@ -148,11 +162,9 @@ namespace ic
 
     void AppBase::handleInputEvent(Event& e)
     {
-
-        if (e.type == EventType::KeyPressed &&
-            e.key.key == IcKey::ESCAPE)
+        if (m_runtime->input)
         {
-            m_runtime->window->requestClose();
+            m_runtime->input->onEvent(e);
         }
 
         if (e.type == EventType::MouseButtonPressed)
@@ -236,6 +248,30 @@ namespace ic
             m_spec.rendererSpec);
     }
 
+    void AppBase::createAssetManager()
+    {
+        m_runtime->assetManager = std::make_unique<AssetManager>();
+
+        AssetManagerDesc desc{};
+        desc.assetRoot = std::filesystem::path("assets");
+        desc.maxConcurrentLoads = std::max(1u, m_runtime->jobs->workerCount());
+
+        m_runtime->assetManager->init(desc, *m_runtime->jobs);
+    }
+
+    void AppBase::createSceneManager()
+    {
+        m_runtime->sceneManager = std::make_unique<SceneManager>();
+
+        SceneManagerDesc desc{};
+        desc.enableAsyncSceneLoading = true;
+
+        m_runtime->sceneManager->init(
+            desc,
+            *m_runtime->assetManager,
+            *m_runtime->jobs);
+    }
+
     void AppBase::initRenderer()
     {
         auto workerCount = m_runtime->jobs->workerCount();
@@ -257,19 +293,29 @@ namespace ic
 
     void AppBase::buildServices()
     {
-        m_services =
-        {
-            m_runtime->input.get(),
-            m_runtime->window.get(),
-            m_runtime->jobs.get(),
-            m_runtime->renderer.get()
-        };
+        m_services.input = m_runtime->input.get();
+        m_services.window = m_runtime->window.get();
+        m_services.renderer = m_runtime->renderer.get();
+
+        m_services.jobSystem = m_runtime->jobs.get();
+        m_services.assetManager = m_runtime->assetManager.get();
+        m_services.sceneManager = m_runtime->sceneManager.get();
     }
 
     void AppBase::shutdown()
     {
-        onShutdown(); // client (DemoApp)
+        if (m_runtime->renderer)
+            m_runtime->renderer->shutdown();
 
-        if (m_runtime->jobs) m_runtime->jobs->shutdown();
+        if (m_runtime->sceneManager)
+            m_runtime->sceneManager->shutdown();
+
+        if (m_runtime->assetManager)
+            m_runtime->assetManager->shutdown();
+
+        if (m_runtime->jobs)
+            m_runtime->jobs->shutdown();
+
+        onShutdown(); // client (DemoApp)
     }
 }

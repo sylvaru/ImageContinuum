@@ -7,9 +7,11 @@ namespace ic
 {
     struct CompiledGraphPlan;
     struct FrameContext;
+    struct SceneRenderView;
 
     struct RendererSpecification;
 
+    class PipelineLibrary;
     class Window;
 
     class RendererBackend
@@ -19,6 +21,7 @@ namespace ic
 
         virtual void initialize(
             const RendererSpecification& spec,
+            const PipelineLibrary& pipelineLibrary,
             Window& window,
             uint32_t workerCount
         ) = 0;
@@ -26,7 +29,8 @@ namespace ic
 
         virtual void execute(
             const CompiledGraphPlan& plan,
-            const FrameContext& frame) = 0;
+            const FrameContext& frame,
+            const SceneRenderView& scene) = 0;
 
         // Opaque backend management methods acting entirely on handles
         //virtual void createBuffer(

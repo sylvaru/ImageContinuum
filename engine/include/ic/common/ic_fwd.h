@@ -8,6 +8,8 @@ namespace ic
 
     class JobSystem;
     class Renderer;
+    class AssetManager;
+    class SceneManager;
 
     enum class EventChannel;
 }

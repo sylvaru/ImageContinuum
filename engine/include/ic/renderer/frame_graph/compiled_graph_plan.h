@@ -1,6 +1,7 @@
 // ic/renderer/frame_graph/compiled_graph_plan.h
 #pragma once
 #include <span>
+#include "frame_graph_pass.h"
 #include "frame_graph_types.h"
 
 namespace ic
@@ -24,6 +25,8 @@ namespace ic
         std::span<const ResourceLifetime> resourceLifetimes;
 
         std::span<const GraphResource> resources;
+
+        std::span<const PassPayload> payloads;
     };
 
 }

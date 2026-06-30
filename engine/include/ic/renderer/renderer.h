@@ -6,6 +6,7 @@ namespace ic
 {
     struct FrameContext;
     struct RendererSpecification;
+    struct SceneRenderView;
 
     class Window;
     class RendererBackend;
@@ -27,6 +28,10 @@ namespace ic
             uint32_t workerCount
         );
         void render(FrameContext& frame);
+        void render(
+            FrameContext& frame,
+            const SceneRenderView& scene);
+        void shutdown();
         void rebuildGraph();
 
         static Scope<RendererBackend> createBackend(

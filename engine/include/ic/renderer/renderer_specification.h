@@ -1,5 +1,6 @@
 // ic/rendering/renderer_specification.h
 #pragma once
+#include <filesystem>
 
 namespace ic
 {
@@ -26,6 +27,7 @@ namespace ic
         bool                enableValidation = true;
         bool                enableImGui = true;
         uint32_t            framesInFlight = 2;
+        std::filesystem::path pipelineLibraryPath;
     };
 
 }
