@@ -36,6 +36,9 @@ namespace ic
             const FrameContext& ctx,
             const SceneRenderView& scene) override;
 
+        bool beginDebugGuiFrame() override;
+        void endDebugGuiFrame() override;
+
         VulkanResourceAllocator& resourceAllocator()
         {
             return m_resourceAllocator;
@@ -104,6 +107,13 @@ namespace ic
             const SceneRenderView& scene,
             VkImage swapchainImage,
             VkImageLayout swapchainInitialLayout,
+            std::vector<VkCommandBuffer>& commandBuffers);
+
+        void initImGui(Window& window);
+        void shutdownImGui();
+        void recordImGui(
+            const FrameContext& ctx,
+            VkImage swapchainImage,
             std::vector<VkCommandBuffer>& commandBuffers);
 
         void applyBarriers(
@@ -245,5 +255,7 @@ namespace ic
         std::unordered_map<AssetHandle, UploadedModel, AssetHandleHash> m_uploadedModels;
         std::vector<FrameSceneResources> m_sceneFrameResources;
         uint32_t m_workerSlots = 1;
+        bool m_imguiEnabled = false;
+        bool m_imguiFrameActive = false;
     };
 }

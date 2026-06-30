@@ -32,6 +32,15 @@ namespace ic
             const FrameContext& frame,
             const SceneRenderView& scene) = 0;
 
+        virtual bool beginDebugGuiFrame()
+        {
+            return false;
+        }
+
+        virtual void endDebugGuiFrame()
+        {
+        }
+
         // Opaque backend management methods acting entirely on handles
         //virtual void createBuffer(
         //    BufferHandle,

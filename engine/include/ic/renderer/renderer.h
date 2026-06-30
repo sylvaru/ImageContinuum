@@ -31,6 +31,8 @@ namespace ic
         void render(
             FrameContext& frame,
             const SceneRenderView& scene);
+        bool beginDebugGuiFrame();
+        void endDebugGuiFrame();
         void shutdown();
         void rebuildGraph();
 

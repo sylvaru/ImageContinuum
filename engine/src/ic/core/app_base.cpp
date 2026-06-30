@@ -16,6 +16,7 @@
 #include "ic/renderer/renderer.h"
 #include "ic/core/asset_manager.h"
 #include "ic/scene/scene_manager.h"
+#include "ic/core/debug_gui_layer.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -76,6 +77,10 @@ namespace ic
         createFrameArenas();
         createAssetManager();
         createSceneManager();
+        if (m_spec.useDebugGui)
+        {
+            m_spec.rendererSpec.enableImGui = true;
+        }
         createRenderer();
 
         bindEventSink();
@@ -91,6 +96,10 @@ namespace ic
         
         initAppBase(argc, argv);
         onInit(); // Client app configuration happens here
+        if (m_spec.useDebugGui)
+        {
+            pushLayer<DebugGuiLayer>();
+        }
 
         m_clock.reset();
         m_frame.services = &m_services;
@@ -124,6 +133,13 @@ namespace ic
             runtime.framePipeline.execute(m_frame);
             runtime.assetManager->update();
             runtime.sceneManager->update(m_frame);
+
+            if (m_spec.useDebugGui &&
+                runtime.renderer->beginDebugGuiFrame())
+            {
+                m_layerStack.renderAll(m_frame.interpolationAlpha);
+                runtime.renderer->endDebugGuiFrame();
+            }
 
             runtime.renderer->render(
                 m_frame,
@@ -167,6 +183,11 @@ namespace ic
             m_runtime->input->onEvent(e);
         }
 
+        if (e.type == EventType::KeyPressed && e.key.key == IcKey::ESCAPE)
+        {
+            m_runtime->window->requestClose();
+        }
+
         if (e.type == EventType::MouseButtonPressed)
         {
             spdlog::info(
@@ -178,10 +199,6 @@ namespace ic
     {
         switch (e.type)
         {
-        case EventType::WindowResize:
-            // window and renderer swapchain resize later
-            break;
-
         case EventType::WindowClose:
             m_runtime->window->requestClose();
             break;

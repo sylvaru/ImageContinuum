@@ -20,9 +20,18 @@ namespace ic
         if (!m_window)
             throw std::runtime_error("Failed to create GLFW window");
 
-        initCallbacks();
-
         glfwSetWindowUserPointer(m_window, this);
+
+        int framebufferWidth = 0;
+        int framebufferHeight = 0;
+        glfwGetFramebufferSize(
+            m_window,
+            &framebufferWidth,
+            &framebufferHeight);
+        m_width = static_cast<uint32_t>(std::max(framebufferWidth, 0));
+        m_height = static_cast<uint32_t>(std::max(framebufferHeight, 0));
+
+        initCallbacks();
     }
 
     GLFWWindow::~GLFWWindow()
@@ -79,6 +88,7 @@ namespace ic
         setupMouseCallback();
         setupCursorCallback();
         setupScrollCallback();
+        setupFramebufferSizeCallback();
     }
 
     void GLFWWindow::setupKeyCallback()
@@ -150,6 +160,25 @@ namespace ic
                 if (!self || !self->m_eventCallback) return;
 
                 self->m_eventCallback(makeMouseScrolled(dx, dy));
+            });
+    }
+
+    void GLFWWindow::setupFramebufferSizeCallback()
+    {
+        glfwSetFramebufferSizeCallback(m_window,
+            [](GLFWwindow* w, int width, int height)
+            {
+                auto* self = static_cast<GLFWWindow*>(glfwGetWindowUserPointer(w));
+                if (!self) return;
+
+                self->m_width = static_cast<uint32_t>(std::max(width, 0));
+                self->m_height = static_cast<uint32_t>(std::max(height, 0));
+
+                if (self->m_eventCallback)
+                {
+                    self->m_eventCallback(
+                        makeWindowResize(self->m_width, self->m_height));
+                }
             });
     }
 }

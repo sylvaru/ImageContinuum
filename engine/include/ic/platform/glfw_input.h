@@ -20,6 +20,7 @@ namespace ic
 
         // Query API (frame snapshot)
         bool isKeyPressed(IcKey key) const override;
+        bool wasKeyPressed(IcKey key) const override;
         bool isMouseButtonPressed(MouseButton button) const override;
 
         void consumeMouseDelta(double& dx, double& dy) override;

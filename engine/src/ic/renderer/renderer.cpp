@@ -4,7 +4,8 @@
 #include "ic/renderer/renderer_backend.h"
 #include "ic/renderer/vulkan_backend/vulkan_backend.h"
 #include "ic/renderer/renderer_path/renderer_path.h"
-#include "ic/renderer/renderer_path/forward_path.h"
+#include "ic/renderer/renderer_path/forward.h"
+#include "ic/renderer/renderer_path/path_tracer.h"
 #include "ic/renderer/frame_graph/frame_graph_builder.h"
 #include "ic/renderer/frame_graph/frame_graph_compiler.h"
 #include "ic/renderer/frame_graph/frame_graph_arena.h"
@@ -102,6 +103,21 @@ namespace ic
             scene);
     }
 
+    bool Renderer::beginDebugGuiFrame()
+    {
+        return m_runtime &&
+            m_runtime->backend &&
+            m_runtime->backend->beginDebugGuiFrame();
+    }
+
+    void Renderer::endDebugGuiFrame()
+    {
+        if (m_runtime && m_runtime->backend)
+        {
+            m_runtime->backend->endDebugGuiFrame();
+        }
+    }
+
     void Renderer::shutdown()
     {
         if (m_runtime && m_runtime->backend)
@@ -151,11 +167,13 @@ namespace ic
         case RenderPathType::Forward:
             return std::make_unique<ForwardRendererPath>();
 
+        case RenderPathType::PathTraced:
+            return std::make_unique<PathTracerRendererPath>();
+
             //case RenderPathType::Deferred:
             //    return std::make_unique<DeferredRendererPath>();
 
-            //case RenderPathType::PathTraced:
-            //    return std::make_unique<PathTracerRendererPath>();
+
         }
 
         return nullptr;

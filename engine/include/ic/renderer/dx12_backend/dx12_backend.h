@@ -37,6 +37,9 @@ namespace ic
             const FrameContext& ctx,
             const SceneRenderView& scene) override;
 
+        bool beginDebugGuiFrame() override;
+        void endDebugGuiFrame() override;
+
         DX12ResourceAllocator& resourceAllocator()
         {
             return m_resourceAllocator;
@@ -94,6 +97,13 @@ namespace ic
             const CompiledGraphPlan& plan,
             const FrameContext& ctx,
             const SceneRenderView& scene,
+            ID3D12Resource* swapchainImage,
+            std::vector<ID3D12CommandList*>& commandLists);
+
+        void initImGui(Window& window);
+        void shutdownImGui();
+        void recordImGui(
+            const FrameContext& ctx,
             ID3D12Resource* swapchainImage,
             std::vector<ID3D12CommandList*>& commandLists);
 
@@ -207,5 +217,7 @@ namespace ic
         uint32_t m_workerSlots = 1;
         std::vector<FrameSync> m_frameSync;
         std::unordered_map<ID3D12Resource*, ResourceState> m_resourceStates;
+        bool m_imguiEnabled = false;
+        bool m_imguiFrameActive = false;
 	};
 }

@@ -27,6 +27,7 @@ private:
         AppSpecification spec;
 
         spec.appName = "Demo App";
+        spec.useDebugGui = true;
 #ifdef _WIN32
         spec.rendererSpec.backendType = RendererBackendType::Vulkan;
 #else

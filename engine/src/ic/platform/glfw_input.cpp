@@ -153,6 +153,11 @@ namespace ic
 		return m_keys.test(static_cast<size_t>(key));
 	}
 
+	bool GLFWInput::wasKeyPressed(IcKey key) const
+	{
+		return m_keysPressed.test(static_cast<size_t>(key));
+	}
+
 	bool GLFWInput::isMouseButtonPressed(MouseButton button) const
 	{
 		return m_mouseButtons[static_cast<int>(button)];

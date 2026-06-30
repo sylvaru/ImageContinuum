@@ -18,6 +18,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/core/event_frame_buffer.h" 
     "include/ic/core/frame_context.h"
     "include/ic/core/frame_pipeline.h"
+    "include/ic/core/debug_gui_layer.h"
 
     "include/ic/common/ic_common.h" 
     "include/ic/common/ic_key_codes.h"  
@@ -45,7 +46,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/renderer_backend.h"
     "include/ic/renderer/render_handles.h" 
     "include/ic/renderer/renderer_path/renderer_path.h" 
-    "include/ic/renderer/renderer_path/forward_path.h"
+    "include/ic/renderer/renderer_path/forward.h"
     "include/ic/core/job_system.h" 
     "include/ic/util/util.h"
     "include/ic/core/memory/frame_arena_region.h"
@@ -72,6 +73,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/scene/scene_transform_system.h"
 
     "src/ic/core/app_base.cpp" 
+    "src/ic/core/debug_gui_layer.cpp"
     "src/ic/core/layer_stack.cpp" 
     "src/ic/core/event_queue.cpp"
      
@@ -144,7 +146,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/scene/scene_transform_system.cpp"
     "src/ic/scene/scene.cpp"
     "src/ic/scene/scene_camera_controller_system.cpp"
-    )
+     "include/ic/renderer/renderer_path/path_tracer.h")
 
     if (WIN32)
     target_sources(ImageContinuumEngine PRIVATE

@@ -10,6 +10,10 @@
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <spdlog/spdlog.h>
+#include <GLFW/glfw3.h>
+#include <imgui.h>
+#include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_vulkan.h>
 
 #include <algorithm>
 #include <future>
@@ -71,6 +75,11 @@ namespace ic
         m_pipelineManager.init(m_device.device());
         m_sceneFrameResources.resize(framesInFlight);
         m_pipelineLibrary = &pipelineLibrary;
+
+        if (spec.enableImGui)
+        {
+            initImGui(window);
+        }
 	}
 
 	void VulkanBackend::shutdown()
@@ -80,6 +89,7 @@ namespace ic
             vkDeviceWaitIdle(m_device.device());
         }
 
+        shutdownImGui();
         destroySceneResources();
         m_pipelineManager.shutdown();
 
@@ -165,6 +175,10 @@ namespace ic
             swapchainImage,
             swapchainInitialLayout,
             commandBuffers);
+        recordImGui(
+            ctx,
+            swapchainImage,
+            commandBuffers);
 
         VkSemaphore renderFinished =
             m_imageRenderFinished[imageIndex];
@@ -192,6 +206,188 @@ namespace ic
         {
             onSwapchainRecreated();
         }
+    }
+
+    bool VulkanBackend::beginDebugGuiFrame()
+    {
+        if (!m_imguiEnabled || m_imguiFrameActive)
+        {
+            return false;
+        }
+
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        m_imguiFrameActive = true;
+        return true;
+    }
+
+    void VulkanBackend::endDebugGuiFrame()
+    {
+        if (!m_imguiFrameActive)
+        {
+            return;
+        }
+
+        ImGui::Render();
+        m_imguiFrameActive = false;
+    }
+
+    void VulkanBackend::initImGui(Window& window)
+    {
+        if (m_imguiEnabled)
+        {
+            return;
+        }
+
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+        ImGui::StyleColorsDark();
+
+        auto* glfwWindow =
+            static_cast<GLFWwindow*>(window.getNativeHandle());
+        if (!ImGui_ImplGlfw_InitForVulkan(glfwWindow, true))
+        {
+            throw std::runtime_error(
+                "Failed to initialize ImGui GLFW backend.");
+        }
+
+        const VkFormat colorFormat = m_swapchain.format();
+        VkPipelineRenderingCreateInfoKHR renderingInfo{};
+        renderingInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachmentFormats = &colorFormat;
+
+        const uint32_t imageCount =
+            std::max(2u, static_cast<uint32_t>(m_swapchain.images().size()));
+
+        ImGui_ImplVulkan_InitInfo initInfo{};
+        initInfo.ApiVersion = VK_API_VERSION_1_3;
+        initInfo.Instance = m_instance.instance();
+        initInfo.PhysicalDevice = m_adapter.device();
+        initInfo.Device = m_device.device();
+        initInfo.QueueFamily = m_adapter.info().queueFamilies.graphics;
+        initInfo.Queue = m_device.graphicsQueue();
+        initInfo.DescriptorPoolSize = 64;
+        initInfo.MinImageCount = imageCount;
+        initInfo.ImageCount = imageCount;
+        initInfo.UseDynamicRendering = true;
+        initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        initInfo.PipelineInfoMain.PipelineRenderingCreateInfo = renderingInfo;
+
+        if (!ImGui_ImplVulkan_Init(&initInfo))
+        {
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+            throw std::runtime_error(
+                "Failed to initialize ImGui Vulkan backend.");
+        }
+
+        m_imguiEnabled = true;
+    }
+
+    void VulkanBackend::shutdownImGui()
+    {
+        if (!m_imguiEnabled)
+        {
+            return;
+        }
+
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+
+        m_imguiEnabled = false;
+        m_imguiFrameActive = false;
+    }
+
+    void VulkanBackend::recordImGui(
+        const FrameContext& ctx,
+        VkImage swapchainImage,
+        std::vector<VkCommandBuffer>& commandBuffers)
+    {
+        if (!m_imguiEnabled)
+        {
+            return;
+        }
+
+        ImDrawData* drawData = ImGui::GetDrawData();
+        if (!drawData || drawData->TotalVtxCount == 0)
+        {
+            return;
+        }
+
+        auto lease =
+            m_commandSystem.acquireFrameCommandBuffer(
+                static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size()),
+                0);
+
+        VkCommandBuffer cmd = lease.commandBuffer();
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to begin Vulkan ImGui command buffer.");
+        }
+
+        transitionImage(
+            cmd,
+            swapchainImage,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            0,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+        VkRenderingAttachmentInfo colorAttachment{};
+        colorAttachment.sType =
+            VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAttachment.imageView =
+            m_swapchain.imageView(m_currentSwapchainImage);
+        colorAttachment.imageLayout =
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+        VkRenderingInfo renderingInfo{};
+        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        renderingInfo.renderArea = { {0, 0}, m_swapchain.extent() };
+        renderingInfo.layerCount = 1;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments = &colorAttachment;
+
+        vkCmdBeginRendering(cmd, &renderingInfo);
+        ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
+        vkCmdEndRendering(cmd);
+
+        transitionImage(
+            cmd,
+            swapchainImage,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            0,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+        if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to end Vulkan ImGui command buffer.");
+        }
+
+        commandBuffers.push_back(cmd);
     }
 
     void VulkanBackend::submitFrame(

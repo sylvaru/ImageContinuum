@@ -20,6 +20,7 @@ namespace ic
         virtual void onMouseButtonReleased(MouseButton b) = 0;
 
         virtual bool isKeyPressed(IcKey key) const = 0;
+        virtual bool wasKeyPressed(IcKey key) const = 0;
         virtual bool isMouseButtonPressed(MouseButton button) const = 0;
 
         virtual void consumeMouseDelta(double& dx, double& dy) = 0;

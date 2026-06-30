@@ -22,6 +22,8 @@ namespace ic
 
         RendererSpecification rendererSpec;
 
+        bool useDebugGui = false;
+
         static constexpr size_t kMaxFramesInFlight = 2;
     };
 
@@ -113,7 +115,7 @@ namespace ic
         AppServices m_services{};
         FrameContext m_frame{};
         
-        static constexpr float kTargetFPS = 144.0f;
+        static constexpr float kTargetFPS = 3000.0f;
         static constexpr float kTargetFrameTime = 1.0f / kTargetFPS;
     };
 }

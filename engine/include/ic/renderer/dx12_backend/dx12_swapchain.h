@@ -94,7 +94,7 @@ namespace ic
         uint32_t m_currentBackBufferIndex = 0;
         uint32_t m_width = 0;
         uint32_t m_height = 0;
-        bool m_vsync = true;
+        bool m_vsync = false;
 
         DXGI_FORMAT m_format = DXGI_FORMAT_R8G8B8A8_UNORM;
         DX12SwapchainState m_state = DX12SwapchainState::OutOfDate;

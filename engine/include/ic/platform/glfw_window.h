@@ -35,6 +35,7 @@ namespace ic
         void setupMouseCallback();
         void setupCursorCallback();
         void setupScrollCallback();
+        void setupFramebufferSizeCallback();
 
   
     private:

@@ -10,6 +10,10 @@
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
 #include <spdlog/spdlog.h>
+#include <GLFW/glfw3.h>
+#include <imgui.h>
+#include <backends/imgui_impl_dx12.h>
+#include <backends/imgui_impl_glfw.h>
 
 #include <stdexcept>
 #include <future>
@@ -65,6 +69,11 @@ namespace ic
         m_sceneFrameResources.resize(framesInFlight);
         m_pipelineLibrary = &pipelineLibrary;
 
+        if (spec.enableImGui)
+        {
+            initImGui(window);
+        }
+
         spdlog::info("[DX12Backend] Initialized");
     }
 
@@ -72,6 +81,7 @@ namespace ic
     {
         waitForGpu();
 
+        shutdownImGui();
         destroySceneResources();
         destroyFrameSync();
         m_pipelineManager.shutdown();
@@ -124,6 +134,10 @@ namespace ic
             scene,
             swapchainImage,
             commandLists);
+        recordImGui(
+            ctx,
+            swapchainImage,
+            commandLists);
 
         if (!commandLists.empty())
         {
@@ -139,6 +153,165 @@ namespace ic
         {
             recreateSwapchain();
         }
+    }
+
+    bool DX12Backend::beginDebugGuiFrame()
+    {
+        if (!m_imguiEnabled || m_imguiFrameActive)
+        {
+            return false;
+        }
+
+        ImGui_ImplDX12_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        m_imguiFrameActive = true;
+        return true;
+    }
+
+    void DX12Backend::endDebugGuiFrame()
+    {
+        if (!m_imguiFrameActive)
+        {
+            return;
+        }
+
+        ImGui::Render();
+        m_imguiFrameActive = false;
+    }
+
+    void DX12Backend::initImGui(Window& window)
+    {
+        if (m_imguiEnabled)
+        {
+            return;
+        }
+
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+        ImGui::StyleColorsDark();
+
+        auto* glfwWindow =
+            static_cast<GLFWwindow*>(window.getNativeHandle());
+        if (!ImGui_ImplGlfw_InitForOther(glfwWindow, true))
+        {
+            throw std::runtime_error(
+                "Failed to initialize ImGui GLFW backend.");
+        }
+
+        ImGui_ImplDX12_InitInfo initInfo{};
+        initInfo.Device = m_device.device();
+        initInfo.CommandQueue = m_device.graphicsQueue();
+        initInfo.NumFramesInFlight =
+            static_cast<int>(std::max<size_t>(1, m_frameSync.size()));
+        initInfo.RTVFormat = m_swapchain.format();
+        initInfo.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        initInfo.SrvDescriptorHeap =
+            m_descriptorSystem.shaderResourceHeap();
+        initInfo.UserData = this;
+        initInfo.SrvDescriptorAllocFn =
+            [](ImGui_ImplDX12_InitInfo* info,
+               D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
+               D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
+            {
+                auto* self = static_cast<DX12Backend*>(info->UserData);
+                DX12DescriptorAllocation allocation =
+                    self->m_descriptorSystem.allocateResourceDescriptors(1);
+                *outCpu = allocation.cpuStart;
+                *outGpu = allocation.gpuStart;
+            };
+        initInfo.SrvDescriptorFreeFn =
+            [](ImGui_ImplDX12_InitInfo*,
+               D3D12_CPU_DESCRIPTOR_HANDLE,
+               D3D12_GPU_DESCRIPTOR_HANDLE)
+            {
+            };
+
+        if (!ImGui_ImplDX12_Init(&initInfo))
+        {
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+            throw std::runtime_error(
+                "Failed to initialize ImGui DX12 backend.");
+        }
+
+        m_imguiEnabled = true;
+    }
+
+    void DX12Backend::shutdownImGui()
+    {
+        if (!m_imguiEnabled)
+        {
+            return;
+        }
+
+        ImGui_ImplDX12_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+
+        m_imguiEnabled = false;
+        m_imguiFrameActive = false;
+    }
+
+    void DX12Backend::recordImGui(
+        const FrameContext& ctx,
+        ID3D12Resource* swapchainImage,
+        std::vector<ID3D12CommandList*>& commandLists)
+    {
+        if (!m_imguiEnabled)
+        {
+            return;
+        }
+
+        ImDrawData* drawData = ImGui::GetDrawData();
+        if (!drawData || drawData->TotalVtxCount == 0)
+        {
+            return;
+        }
+
+        auto lease =
+            m_commandSystem.acquireFrameCommandList(
+                static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size()),
+                0);
+
+        ID3D12GraphicsCommandList4* cmd =
+            lease.commandList();
+
+        transitionResource(
+            cmd,
+            swapchainImage,
+            D3D12_RESOURCE_STATE_PRESENT,
+            D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+            m_swapchain.currentRtv();
+        cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            m_descriptorSystem.shaderResourceHeap()
+        };
+        cmd->SetDescriptorHeaps(1, heaps);
+
+        ImGui_ImplDX12_RenderDrawData(drawData, cmd);
+
+        transitionResource(
+            cmd,
+            swapchainImage,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PRESENT);
+
+        throwIfFailed(
+            cmd->Close(),
+            "Failed to close DX12 ImGui command list.");
+
+        commandLists.push_back(
+            static_cast<ID3D12CommandList*>(cmd));
     }
 
     void DX12Backend::executeGraph(

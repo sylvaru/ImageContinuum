@@ -3,16 +3,18 @@
 #include "ic/interface/layer.h"
 #include "ic/scene/scene_types.h"
 
-struct ic::Event;
-struct ic::FrameContext;
+using namespace ic;
 
-class GameLayer : public ic::Layer 
+struct Event;
+struct FrameContext;
+
+class GameLayer : public Layer 
 {
 public:
-    void onAttach(ic::AppServices& services) override;
+    void onAttach(AppServices& services) override;
     void onUpdate(ic::FrameContext& ctx) override;
     void onRender(float alpha) override;
 
 private:
-    ic::SceneHandle m_scene;
+    SceneHandle m_scene;
 };

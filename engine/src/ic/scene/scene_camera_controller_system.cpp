@@ -43,10 +43,10 @@ namespace ic
             auto& transform = view.get<TransformComponent>(entity);
             auto& controller = view.get<FlyCameraControllerComponent>(entity);
 
-            if (keyDown(input, IcKey::ESCAPE))
+            if (input.wasKeyPressed(IcKey::LEFT_ALT))
             {
-                controller.captureMouse = false;
-                if (input.isCursorLocked())
+                controller.captureMouse = !controller.captureMouse;
+                if (!controller.captureMouse && input.isCursorLocked())
                 {
                     input.lockCursor(false);
                 }
