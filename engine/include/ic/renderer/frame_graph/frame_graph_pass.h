@@ -1,7 +1,11 @@
 // ic/renderer/frame_graph/graph_pass.h
 #pragma once
+#include <concepts>
+#include <cstdint>
 #include <string>
+#include <variant>
 
+#include "ic/renderer/frame_graph/frame_graph_types.h"
 #include "ic/renderer/render_pipeline.h"
 
 namespace ic
@@ -17,6 +21,8 @@ namespace ic
     struct TransferPassData
     {
         std::string name;
+        GraphResourceId source = InvalidGraphResourceId;
+        GraphResourceId destination = InvalidGraphResourceId;
     };
 
     struct ComputePassData
@@ -29,6 +35,46 @@ namespace ic
     };
 
     struct ClearPassData {};
+
+    struct PathTracePassData
+    {
+        uint32_t width = 0;
+        uint32_t height = 0;
+
+        uint32_t groupSizeX = 8;
+        uint32_t groupSizeY = 8;
+        uint32_t groupCountX = 1;
+        uint32_t groupCountY = 1;
+        uint32_t groupCountZ = 1;
+
+        GraphResourceId outputAccumulation = InvalidGraphResourceId;
+        GraphResourceId sceneBuffer = InvalidGraphResourceId;
+        GraphResourceId instanceBuffer = InvalidGraphResourceId;
+        GraphResourceId materialBuffer = InvalidGraphResourceId;
+        GraphResourceId vertexBuffer = InvalidGraphResourceId;
+        GraphResourceId indexBuffer = InvalidGraphResourceId;
+        GraphResourceId bvhNodeBuffer = InvalidGraphResourceId;
+        GraphResourceId bvhTriangleBuffer = InvalidGraphResourceId;
+
+        PipelineId pipeline = makePipelineId("path_trace");
+    };
+
+    struct TonemapPassData
+    {
+        uint32_t width = 0;
+        uint32_t height = 0;
+
+        uint32_t groupSizeX = 8;
+        uint32_t groupSizeY = 8;
+        uint32_t groupCountX = 1;
+        uint32_t groupCountY = 1;
+        uint32_t groupCountZ = 1;
+
+        GraphResourceId inputHDR = InvalidGraphResourceId;
+        GraphResourceId outputBackBuffer = InvalidGraphResourceId;
+
+        PipelineId pipeline = makePipelineId("path_trace_tonemap");
+    };
 
     struct GeometryPassData
     {
@@ -49,6 +95,8 @@ namespace ic
         LightingPassData,
         ComputePassData,
         TransferPassData,
+        PathTracePassData,
+        TonemapPassData,
         PresentPassData,
         ShadowPassData,
         PostProcessPassData>;

@@ -445,6 +445,63 @@ namespace ic
             return setLayout;
         }
 
+        if (layout == PipelineBindingLayoutKind::PathTrace ||
+            layout == PipelineBindingLayoutKind::PathTraceTonemap)
+        {
+            VkDescriptorSetLayoutBinding bindings[6]{};
+
+            bindings[0].binding = 0;
+            bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            bindings[0].descriptorCount = 1;
+            bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[1].binding = 1;
+            bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[1].descriptorCount = 1;
+            bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            const uint32_t bindingCount =
+                layout == PipelineBindingLayoutKind::PathTrace
+                    ? 6u
+                    : 3u;
+
+            if (layout == PipelineBindingLayoutKind::PathTrace)
+            {
+                for (uint32_t i = 2; i < bindingCount; ++i)
+                {
+                    bindings[i].binding = i;
+                    bindings[i].descriptorType =
+                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    bindings[i].descriptorCount = 1;
+                    bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+                }
+            }
+            else
+            {
+                bindings[2].binding = 2;
+                bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                bindings[2].descriptorCount = 1;
+                bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            }
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{};
+            layoutInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            layoutInfo.bindingCount = bindingCount;
+            layoutInfo.pBindings = bindings;
+
+            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            throwIfFailed(
+                vkCreateDescriptorSetLayout(
+                    m_device,
+                    &layoutInfo,
+                    nullptr,
+                    &setLayout),
+                "Failed to create Vulkan path tracing descriptor set layout.");
+
+            return setLayout;
+        }
+
         if (layout != PipelineBindingLayoutKind::ForwardBindless)
         {
             throw std::runtime_error(
@@ -583,6 +640,8 @@ namespace ic
             return VK_FORMAT_R8G8B8A8_UNORM;
         case TextureFormat::RGBA8_SRGB:
             return VK_FORMAT_R8G8B8A8_SRGB;
+        case TextureFormat::RGBA32_Float:
+            return VK_FORMAT_R32G32B32A32_SFLOAT;
         case TextureFormat::BGRA8_UNorm:
             return VK_FORMAT_B8G8R8A8_UNORM;
         case TextureFormat::BGRA8_SRGB:

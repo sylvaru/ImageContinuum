@@ -13,6 +13,11 @@
 namespace ic 
 {
 
+    struct AppResourceRoots
+    {
+        std::filesystem::path assetRoot = "assets";
+        std::filesystem::path modelRoot;
+    };
 
     struct AppSpecification
     {
@@ -21,8 +26,7 @@ namespace ic
         WindowSpecification window;
 
         RendererSpecification rendererSpec;
-
-        bool useDebugGui = false;
+        AppResourceRoots resourceRoots;
 
         static constexpr size_t kMaxFramesInFlight = 2;
     };
@@ -115,7 +119,7 @@ namespace ic
         AppServices m_services{};
         FrameContext m_frame{};
         
-        static constexpr float kTargetFPS = 3000.0f;
+        static constexpr float kTargetFPS = 144.0f;
         static constexpr float kTargetFrameTime = 1.0f / kTargetFPS;
     };
 }

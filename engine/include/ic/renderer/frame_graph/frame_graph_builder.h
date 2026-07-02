@@ -102,6 +102,7 @@ namespace ic
 			, m_nodes(memory)
 			, m_resources(memory)
 			, m_payloads(memory)
+			, m_accesses(memory)
 		{}
 
 		~FrameGraphBuilder() = default;
@@ -129,8 +130,7 @@ namespace ic
 					.queue = queue,
 					.type = type,
 					.payloadIndex = payloadIndex
-				},
-				.accesses = {}
+				}
 				});
 
 			return id;
@@ -141,8 +141,8 @@ namespace ic
         TransferPassBuilder addTransferPass(std::string_view name);
 
 		// Resource creation
-		GraphResourceId createTexture(); // TextureDesc desc
-		GraphResourceId createBuffer(); // BufferDesc desc
+		GraphResourceId createTexture(const TextureDesc& desc = {});
+		GraphResourceId createBuffer(const BufferDesc& desc = {});
 
 		// Dependency declaration
 		void read(
@@ -178,6 +178,7 @@ namespace ic
 		std::pmr::vector<GraphResource> m_resources;
 		std::pmr::vector<NodeRecord> m_nodes;
 		std::pmr::vector<PassPayload> m_payloads;
+		std::pmr::vector<ResourceAccess> m_accesses;
 
 		std::pmr::memory_resource* m_memory;
 	public:
@@ -209,6 +210,13 @@ namespace ic
 			payloads() const noexcept
 		{
 			return m_payloads;
+		}
+
+		[[nodiscard]]
+		std::span<const ResourceAccess>
+			accesses() const noexcept
+		{
+			return m_accesses;
 		}
 	};
 }

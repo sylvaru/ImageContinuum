@@ -103,21 +103,6 @@ namespace ic
             scene);
     }
 
-    bool Renderer::beginDebugGuiFrame()
-    {
-        return m_runtime &&
-            m_runtime->backend &&
-            m_runtime->backend->beginDebugGuiFrame();
-    }
-
-    void Renderer::endDebugGuiFrame()
-    {
-        if (m_runtime && m_runtime->backend)
-        {
-            m_runtime->backend->endDebugGuiFrame();
-        }
-    }
-
     void Renderer::shutdown()
     {
         if (m_runtime && m_runtime->backend)
@@ -179,7 +164,20 @@ namespace ic
         return nullptr;
     }
 
+    bool Renderer::beginDebugGuiFrame()
+    {
+        return m_runtime &&
+            m_runtime->backend &&
+            m_runtime->backend->beginDebugGuiFrame();
+    }
 
+    void Renderer::endDebugGuiFrame()
+    {
+        if (m_runtime && m_runtime->backend)
+        {
+            m_runtime->backend->endDebugGuiFrame();
+        }
+    }
 
 
 }

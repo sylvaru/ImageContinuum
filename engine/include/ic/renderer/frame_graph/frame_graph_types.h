@@ -1,11 +1,16 @@
 // ic/renderer/frame_graph/frame_graph_types.h
 #pragma once
 
+#include "ic/renderer/render_types.h"
+
 namespace ic
 {
 
     using GraphNodeId = uint32_t;
     using GraphResourceId = uint32_t;
+
+    inline constexpr GraphNodeId InvalidGraphNodeId = UINT32_MAX;
+    inline constexpr GraphResourceId InvalidGraphResourceId = UINT32_MAX;
 
     enum class QueueType : uint8_t
     {
@@ -113,6 +118,8 @@ namespace ic
         ImportedResource imported;
         ResourceUsage initialUsage;
         AccessType initialAccess;
+        TextureDesc textureDesc;
+        BufferDesc bufferDesc;
 
         uint32_t firstAccess;
         uint32_t accessCount;
@@ -146,15 +153,23 @@ namespace ic
     struct NodeRecord
     {
         GraphNode graphNode;
-        std::pmr::vector<ResourceAccess> accesses;
     };
 
     struct NodeSchedule
     {
         GraphNodeId node;
 
-        std::pmr::vector<uint32_t> incomingBarrierIndices;
-        std::pmr::vector<uint32_t> outgoingBarrierIndices;
+        uint32_t firstIncomingBarrier = 0;
+        uint32_t incomingBarrierCount = 0;
+
+        uint32_t firstOutgoingBarrier = 0;
+        uint32_t outgoingBarrierCount = 0;
+    };
+
+    struct ExecutionLevel
+    {
+        uint32_t firstNode = 0;
+        uint32_t nodeCount = 0;
     };
 
     struct ExecutionNode

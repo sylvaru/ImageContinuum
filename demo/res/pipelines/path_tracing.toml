@@ -1,0 +1,19 @@
+[pipelines.path_trace]
+type = "Compute"
+bindingLayout = "PathTrace"
+
+[pipelines.path_trace.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/path_trace.cs.dxil"
+
+[pipelines.path_trace.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/path_trace.comp.spv"
+
+[pipelines.path_trace_tonemap]
+type = "Compute"
+bindingLayout = "PathTraceTonemap"
+
+[pipelines.path_trace_tonemap.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/path_trace_tonemap.cs.dxil"
+
+[pipelines.path_trace_tonemap.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/path_trace_tonemap.comp.spv"

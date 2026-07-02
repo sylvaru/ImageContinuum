@@ -11,8 +11,10 @@
 #include "ic/renderer/dx12_backend/dx12_pipeline_manager.h"
 #include "ic/renderer/dx12_backend/dx12_resource_allocator.h"
 #include "ic/renderer/renderer_gpu_assets.h"
+#include "ic/renderer/path_tracing/path_tracer_types.h"
 
 #include <d3d12.h>
+#include <glm/glm.hpp>
 #include <unordered_map>
 
 
@@ -93,6 +95,41 @@ namespace ic
             uint32_t materialIndex = 0;
         };
 
+        struct PathTraceResources
+        {
+            DX12Texture accumulation;
+            DX12Texture tonemap;
+            DX12Buffer pathTraceConstants;
+            DX12Buffer tonemapConstants;
+            DX12Buffer sceneVertices;
+            DX12Buffer sceneMaterials;
+            DX12Buffer sceneTriangles;
+            DX12Buffer sceneBvhNodes;
+
+            DX12DescriptorAllocation accumulationUav;
+            DX12DescriptorAllocation accumulationSrv;
+            DX12DescriptorAllocation tonemapUav;
+            DX12DescriptorAllocation sceneSrvs;
+
+            D3D12_RESOURCE_STATES accumulationState =
+                D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES tonemapState =
+                D3D12_RESOURCE_STATE_COMMON;
+
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t sceneVertexCount = 0;
+            uint32_t sceneMaterialCount = 0;
+            uint32_t sceneTriangleCount = 0;
+            uint32_t sceneBvhNodeCount = 0;
+            uint32_t accumulatedSampleCount = 0;
+            uint64_t sceneVersion = UINT64_MAX;
+            glm::mat4 previousView = glm::mat4(1.0f);
+            glm::mat4 previousProjection = glm::mat4(1.0f);
+            bool resetAccumulation = true;
+            bool hasPreviousCamera = false;
+        };
+
         void executeGraph(
             const CompiledGraphPlan& plan,
             const FrameContext& ctx,
@@ -140,15 +177,37 @@ namespace ic
             const CompiledGraphPlan& plan,
             const ExecutionNode& node,
             const FrameContext& ctx,
+            const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd);
+
+        void executePathTraceNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd);
+
+        void executeTonemapNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
             ID3D12GraphicsCommandList4* cmd);
 
         void executeTransferNode(
             const CompiledGraphPlan& plan,
             const ExecutionNode& node,
             const FrameContext& ctx,
-            ID3D12GraphicsCommandList4* cmd);
+            ID3D12GraphicsCommandList4* cmd,
+            ID3D12Resource* swapchainImage);
 
         void destroySceneResources();
+        void ensurePathTraceResources();
+        void ensurePathTraceSceneResources(
+            const FrameContext& ctx,
+            const SceneRenderView& scene);
+        void destroyPathTraceResources();
+        void destroyPathTraceSceneResources();
+        void uploadPathTraceScene(const PathTraceSceneData& sceneData);
+        void updatePathTraceDescriptors();
         void ensureDepthTarget();
         void destroyDepthTarget();
         void ensureComputeTestBuffer();
@@ -204,6 +263,7 @@ namespace ic
         DX12Buffer m_computeTestBuffer;
         D3D12_RESOURCE_STATES m_computeTestBufferState =
             D3D12_RESOURCE_STATE_COMMON;
+        PathTraceResources m_pathTraceResources;
 
         const PipelineLibrary* m_pipelineLibrary = nullptr;
         std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash> m_pipelineHandles;
@@ -219,5 +279,6 @@ namespace ic
         std::unordered_map<ID3D12Resource*, ResourceState> m_resourceStates;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;
+        std::string m_imguiIniPath;
 	};
 }

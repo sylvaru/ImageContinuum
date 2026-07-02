@@ -25,7 +25,7 @@ namespace ic
         RendererBackendType backendType;
         RenderPathType      pathType;
         bool                enableValidation = true;
-        bool                enableImGui = true;
+        bool                useDebugGui = true;
         uint32_t            framesInFlight = 2;
         std::filesystem::path pipelineLibraryPath;
     };

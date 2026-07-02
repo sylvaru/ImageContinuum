@@ -1,0 +1,21 @@
+[app]
+name = "ImageContinuum Demo"
+
+[window]
+width = 1920
+height = 1080
+
+[paths]
+asset_root = "demo/res"
+model_root = "demo/res/models"
+
+[renderer]
+backend = "DX12"
+path = "Forward"
+validation = true
+debug_gui = true
+frames_in_flight = 2
+pipeline_library = "demo/res/pipelines/forward_.toml"
+
+[scene]
+file = "demo/res/scene_files/cornell_scene.toml"

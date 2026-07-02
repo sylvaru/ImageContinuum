@@ -11,6 +11,7 @@
 #include "ic/renderer/vulkan_backend/vulkan_pipeline_manager.h"
 #include "ic/renderer/vulkan_backend/vulkan_resource_allocator.h"
 #include "ic/renderer/renderer_gpu_assets.h"
+#include "ic/renderer/path_tracing/path_tracer_types.h"
 
 #include <glm/glm.hpp>
 
@@ -99,6 +100,44 @@ namespace ic
             uint32_t materialIndex = 0;
         };
 
+        struct PathTraceResources
+        {
+            VulkanTexture accumulation;
+            VulkanTexture tonemap;
+            VkImageView accumulationView = VK_NULL_HANDLE;
+            VkImageView tonemapView = VK_NULL_HANDLE;
+
+            VulkanBuffer pathTraceConstants;
+            VulkanBuffer tonemapConstants;
+            VulkanBuffer sceneVertices;
+            VulkanBuffer sceneMaterials;
+            VulkanBuffer sceneTriangles;
+            VulkanBuffer sceneBvhNodes;
+
+            VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+            VkDescriptorSet pathTraceDescriptorSet = VK_NULL_HANDLE;
+            VkDescriptorSet tonemapDescriptorSet = VK_NULL_HANDLE;
+
+            VkImageLayout accumulationLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImageLayout tonemapLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t sceneVertexCount = 0;
+            uint32_t sceneMaterialCount = 0;
+            uint32_t sceneTriangleCount = 0;
+            uint32_t sceneBvhNodeCount = 0;
+            uint32_t accumulatedSampleCount = 0;
+            uint64_t sceneVersion = UINT64_MAX;
+            uint64_t lastSceneBuildFrame = UINT64_MAX;
+            glm::mat4 previousView = glm::mat4(1.0f);
+            glm::mat4 previousProjection = glm::mat4(1.0f);
+            bool resetAccumulation = true;
+            bool hasPreviousCamera = false;
+            bool pathTraceDescriptorsDirty = true;
+            bool tonemapDescriptorsDirty = true;
+        };
+
     private:
 
         void executeGraph(
@@ -156,15 +195,40 @@ namespace ic
             const CompiledGraphPlan& plan,
             const ExecutionNode& node,
             const FrameContext& ctx,
+            const SceneRenderView& scene,
+            VkCommandBuffer cmd);
+
+        void executePathTraceNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            VkCommandBuffer cmd);
+
+        void executeTonemapNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
             VkCommandBuffer cmd);
 
         void executeTransferNode(
             const CompiledGraphPlan& plan,
             const ExecutionNode& node,
             const FrameContext& ctx,
-            VkCommandBuffer cmd);
+            VkCommandBuffer cmd,
+            VkImage swapchainImage);
 
         void destroySceneResources();
+        void ensurePathTraceResources();
+        void ensurePathTraceSceneResources(
+            const FrameContext& ctx,
+            const SceneRenderView& scene);
+        void destroyPathTraceResources();
+        void destroyPathTraceSceneResources();
+        void uploadPathTraceScene(const PathTraceSceneData& sceneData);
+        VkImageView createTextureView(const VulkanTexture& texture) const;
+        void updatePathTraceDescriptors(
+            const VulkanComputePipeline* pathTracePipeline,
+            const VulkanComputePipeline* tonemapPipeline);
         void ensureDepthTarget();
         void destroyDepthTarget();
         void ensureComputeTestResources(
@@ -248,6 +312,7 @@ namespace ic
         VulkanBuffer m_computeTestBuffer;
         VkDescriptorPool m_computeTestDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_computeTestDescriptorSet = VK_NULL_HANDLE;
+        PathTraceResources m_pathTraceResources;
 
         const PipelineLibrary* m_pipelineLibrary = nullptr;
         std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash> m_pipelineHandles;
@@ -257,5 +322,6 @@ namespace ic
         uint32_t m_workerSlots = 1;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;
+        std::string m_imguiIniPath;
     };
 }

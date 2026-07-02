@@ -61,7 +61,7 @@ namespace ic
         resourceDesc.SampleDesc.Count = 1;
         resourceDesc.SampleDesc.Quality = 0;
         resourceDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        resourceDesc.Flags = toBufferFlags(desc.usage);
+        resourceDesc.Flags = toBufferFlags(desc);
 
         D3D12_HEAP_PROPERTIES heap =
             heapProperties(desc.memoryUsage);
@@ -224,13 +224,20 @@ namespace ic
     }
 
     D3D12_RESOURCE_FLAGS DX12ResourceAllocator::toBufferFlags(
-        BufferUsageFlags usage) const
+        const BufferDesc& desc) const
     {
         D3D12_RESOURCE_FLAGS flags =
             D3D12_RESOURCE_FLAG_NONE;
 
-        if (hasFlag(usage, BufferUsageFlags::Storage))
+        if (hasFlag(desc.usage, BufferUsageFlags::Storage))
         {
+            if (desc.memoryUsage != ResourceMemoryUsage::GpuOnly)
+            {
+                throw std::runtime_error(
+                    std::string("DX12 storage/UAV buffers must be GPU-only: ") +
+                    (desc.debugName ? desc.debugName : "<unnamed>"));
+            }
+
             flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         }
 
@@ -269,6 +276,8 @@ namespace ic
             return DXGI_FORMAT_R8G8B8A8_UNORM;
         case TextureFormat::RGBA8_SRGB:
             return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        case TextureFormat::RGBA32_Float:
+            return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case TextureFormat::BGRA8_UNorm:
             return DXGI_FORMAT_B8G8R8A8_UNORM;
         case TextureFormat::BGRA8_SRGB:

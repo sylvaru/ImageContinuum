@@ -19,9 +19,15 @@ namespace ic
         m_dependencies.clear();
         m_executionOrder.clear();
         m_executionLevels.clear();
+        m_executionLevelNodes.clear();
         m_chainMap.clear();
         m_resourceChains.clear();
         m_nodeSchedules.clear();
+        m_adjacencyOffsets.clear();
+        m_adjacencyCounts.clear();
+        m_adjacencyEdges.clear();
+        m_incomingBarrierIndices.clear();
+        m_outgoingBarrierIndices.clear();
   
         auto nodes = builder.nodes();
 
@@ -56,10 +62,13 @@ namespace ic
         {
             .nodes = std::span<const ExecutionNode>(m_nodes),
             .executionOrder = std::span<const GraphNodeId>(m_executionOrder),
-            .executionLevels = std::span<const std::pmr::vector<GraphNodeId>>(m_executionLevels),
+            .executionLevels = std::span<const ExecutionLevel>(m_executionLevels),
+            .executionLevelNodes = std::span<const GraphNodeId>(m_executionLevelNodes),
             .dependencies = std::span<const Dependency>(m_dependencies),
             .barriers = std::span<const ResourceBarrier>(m_barriers),
             .nodeSchedules = std::span<const NodeSchedule>(m_nodeSchedules),
+            .incomingBarrierIndices = std::span<const uint32_t>(m_incomingBarrierIndices),
+            .outgoingBarrierIndices = std::span<const uint32_t>(m_outgoingBarrierIndices),
             .resourceLifetimes = std::span<const ResourceLifetime>(m_resourceLifetimes),
             .resources = std::span<const GraphResource>(resources),
             .payloads = std::span<const PassPayload>(payloads)
@@ -118,20 +127,45 @@ namespace ic
 
     void FrameGraphCompiler::buildAdjacencyLists()
     {
-        m_adjacencyLists.clear();
-        m_adjacencyLists.resize(
-            m_nodes.size(), 
-            std::pmr::vector<GraphNodeId>(m_nodes.get_allocator()));
+        const size_t nodeCount = m_nodes.size();
+
+        m_adjacencyOffsets.clear();
+        m_adjacencyCounts.clear();
+        m_adjacencyEdges.clear();
+
+        m_adjacencyOffsets.resize(nodeCount, 0);
+        m_adjacencyCounts.resize(nodeCount, 0);
+        m_adjacencyEdges.resize(m_dependencies.size());
 
         for (const auto& dep : m_dependencies)
         {
-            m_adjacencyLists[dep.source].push_back(dep.destination);
+            ++m_adjacencyCounts[dep.source];
         }
 
-        // Sort adjacency lists
-        for (auto& list : m_adjacencyLists)
+        uint32_t offset = 0;
+        for (size_t i = 0; i < nodeCount; ++i)
         {
-            std::sort(list.begin(), list.end());
+            m_adjacencyOffsets[i] = offset;
+            offset += m_adjacencyCounts[i];
+        }
+
+        std::pmr::vector<uint32_t> cursors(
+            m_adjacencyOffsets.begin(),
+            m_adjacencyOffsets.end(),
+            m_nodes.get_allocator());
+
+        for (const auto& dep : m_dependencies)
+        {
+            const uint32_t index = cursors[dep.source]++;
+            m_adjacencyEdges[index] = dep.destination;
+        }
+
+        for (size_t node = 0; node < nodeCount; ++node)
+        {
+            auto begin =
+                m_adjacencyEdges.begin() + m_adjacencyOffsets[node];
+            auto end = begin + m_adjacencyCounts[node];
+            std::sort(begin, end);
         }
     }
 
@@ -174,8 +208,14 @@ namespace ic
 
             m_executionOrder.push_back(n);
 
-            for (GraphNodeId m : m_adjacencyLists[n])
+            const uint32_t firstEdge = m_adjacencyOffsets[n];
+            const uint32_t edgeCount = m_adjacencyCounts[n];
+
+            for (uint32_t edgeIndex = 0; edgeIndex < edgeCount; ++edgeIndex)
             {
+                const GraphNodeId m =
+                    m_adjacencyEdges[firstEdge + edgeIndex];
+
                 if (--inDegree[m] == 0)
                 {
                     queue.push(m);
@@ -214,6 +254,7 @@ namespace ic
         }
 
         m_executionLevels.clear();
+        m_executionLevelNodes.clear();
 
         size_t scheduledCount = 0;
 
@@ -221,20 +262,32 @@ namespace ic
         {
             std::sort(currentLevel.begin(), currentLevel.end());
 
-            std::pmr::vector<GraphNodeId> level(
-                currentLevel.begin(),
-                currentLevel.end(),
-                m_nodes.get_allocator());
+            ExecutionLevel level{};
+            level.firstNode =
+                static_cast<uint32_t>(m_executionLevelNodes.size());
+            level.nodeCount =
+                static_cast<uint32_t>(currentLevel.size());
 
-            scheduledCount += level.size();
-            m_executionLevels.push_back(std::move(level));
+            m_executionLevelNodes.insert(
+                m_executionLevelNodes.end(),
+                currentLevel.begin(),
+                currentLevel.end());
+
+            scheduledCount += currentLevel.size();
+            m_executionLevels.push_back(level);
 
             std::pmr::vector<GraphNodeId> nextLevel(m_nodes.get_allocator());
 
             for (GraphNodeId node : currentLevel)
             {
-                for (GraphNodeId destination : m_adjacencyLists[node])
+                const uint32_t firstEdge = m_adjacencyOffsets[node];
+                const uint32_t edgeCount = m_adjacencyCounts[node];
+
+                for (uint32_t edgeIndex = 0; edgeIndex < edgeCount; ++edgeIndex)
                 {
+                    const GraphNodeId destination =
+                        m_adjacencyEdges[firstEdge + edgeIndex];
+
                     if (--inDegree[destination] == 0)
                     {
                         nextLevel.push_back(destination);
@@ -298,19 +351,16 @@ namespace ic
         m_resourceChains.clear();
         m_chainMap.clear();
 
-        for (const auto& node : builder.nodes())
+        for (const ResourceAccess& access : builder.accesses())
         {
-            for (const auto& access : node.accesses)
-            {
-                auto& chain =
-                    m_chainMap.try_emplace(
-                        access.resource,
-                        access.resource,
-                        builder.get_allocator()
-                    ).first->second;
+            auto& chain =
+                m_chainMap.try_emplace(
+                    access.resource,
+                    access.resource,
+                    builder.get_allocator()
+                ).first->second;
 
-                chain.accesses.push_back(access);
-            }
+            chain.accesses.push_back(access);
         }
 
         m_resourceChains.clear();
@@ -417,47 +467,91 @@ namespace ic
     void FrameGraphCompiler::buildNodeSchedules()
     {
         m_nodeSchedules.clear();
+        m_incomingBarrierIndices.clear();
+        m_outgoingBarrierIndices.clear();
 
         const size_t nodeCount = m_nodes.size();
 
-        std::pmr::vector<uint32_t> nodeRemap(
+        std::pmr::vector<uint32_t> incomingCounts(
             nodeCount,
             0,
-            m_nodes.get_allocator()
-        );
+            m_nodes.get_allocator());
 
-        for (uint32_t i = 0; i < nodeCount; ++i)
+        std::pmr::vector<uint32_t> outgoingCounts(
+            nodeCount,
+            0,
+            m_nodes.get_allocator());
+
+        for (const ResourceBarrier& barrier : m_barriers)
         {
-            nodeRemap[i] = i;
-        }
-
-        m_nodeSchedules.reserve(nodeCount);
-
-        // Create schedules
-        for (GraphNodeId i = 0; i < nodeCount; ++i)
-        {
-            NodeSchedule schedule{
-                .node = i,
-                .incomingBarrierIndices = std::pmr::vector<uint32_t>(m_nodes.get_allocator()),
-                .outgoingBarrierIndices = std::pmr::vector<uint32_t>(m_nodes.get_allocator())
-            };
-
-            m_nodeSchedules.push_back(std::move(schedule));
-        }
-
-        // Assign barriers
-        for (uint32_t i = 0; i < m_barriers.size(); ++i)
-        {
-            const auto& barrier = m_barriers[i];
-
-            if (barrier.fromNode >= nodeCount || barrier.toNode >= nodeCount)
+            if (barrier.fromNode >= nodeCount ||
+                barrier.toNode >= nodeCount)
+            {
                 continue;
+            }
 
-            const uint32_t from = nodeRemap[barrier.fromNode];
-            const uint32_t to = nodeRemap[barrier.toNode];
+            ++outgoingCounts[barrier.fromNode];
+            ++incomingCounts[barrier.toNode];
+        }
 
-            m_nodeSchedules[to].incomingBarrierIndices.push_back(i);
-            m_nodeSchedules[from].outgoingBarrierIndices.push_back(i);
+        m_nodeSchedules.resize(nodeCount);
+
+        uint32_t incomingOffset = 0;
+        uint32_t outgoingOffset = 0;
+
+        for (GraphNodeId node = 0; node < nodeCount; ++node)
+        {
+            NodeSchedule& schedule = m_nodeSchedules[node];
+            schedule.node = node;
+
+            schedule.firstIncomingBarrier = incomingOffset;
+            schedule.incomingBarrierCount = incomingCounts[node];
+            incomingOffset += incomingCounts[node];
+
+            schedule.firstOutgoingBarrier = outgoingOffset;
+            schedule.outgoingBarrierCount = outgoingCounts[node];
+            outgoingOffset += outgoingCounts[node];
+        }
+
+        m_incomingBarrierIndices.resize(incomingOffset);
+        m_outgoingBarrierIndices.resize(outgoingOffset);
+
+        std::pmr::vector<uint32_t> incomingCursors(
+            nodeCount,
+            0,
+            m_nodes.get_allocator());
+
+        std::pmr::vector<uint32_t> outgoingCursors(
+            nodeCount,
+            0,
+            m_nodes.get_allocator());
+
+        for (uint32_t barrierIndex = 0;
+             barrierIndex < m_barriers.size();
+             ++barrierIndex)
+        {
+            const ResourceBarrier& barrier = m_barriers[barrierIndex];
+
+            if (barrier.fromNode >= nodeCount ||
+                barrier.toNode >= nodeCount)
+            {
+                continue;
+            }
+
+            NodeSchedule& fromSchedule =
+                m_nodeSchedules[barrier.fromNode];
+            NodeSchedule& toSchedule =
+                m_nodeSchedules[barrier.toNode];
+
+            const uint32_t outgoingIndex =
+                fromSchedule.firstOutgoingBarrier +
+                outgoingCursors[barrier.fromNode]++;
+            m_outgoingBarrierIndices[outgoingIndex] = barrierIndex;
+
+            const uint32_t incomingIndex =
+                toSchedule.firstIncomingBarrier +
+                incomingCursors[barrier.toNode]++;
+            m_incomingBarrierIndices[incomingIndex] = barrierIndex;
         }
     }
 
@@ -539,18 +633,21 @@ namespace ic
 
         for (GraphNodeId i = 0; i < m_nodes.size(); ++i)
         {
-            const auto& list = m_adjacencyLists[i];
-
             spdlog::info("Node {}:", i);
 
-            if (list.empty())
+            const uint32_t firstEdge = m_adjacencyOffsets[i];
+            const uint32_t edgeCount = m_adjacencyCounts[i];
+
+            if (edgeCount == 0)
             {
                 spdlog::info("    (empty)");
                 continue;
             }
 
-            for (GraphNodeId dst : list)
+            for (uint32_t edgeIndex = 0; edgeIndex < edgeCount; ++edgeIndex)
             {
+                const GraphNodeId dst =
+                    m_adjacencyEdges[firstEdge + edgeIndex];
                 spdlog::info("    -> {}", dst);
             }
         }
@@ -564,9 +661,12 @@ namespace ic
         spdlog::info("Execution Levels:");
         for (uint32_t levelIndex = 0; levelIndex < m_executionLevels.size(); ++levelIndex)
         {
+            const ExecutionLevel& level = m_executionLevels[levelIndex];
             std::string nodes;
-            for (GraphNodeId id : m_executionLevels[levelIndex])
+            for (uint32_t i = 0; i < level.nodeCount; ++i)
             {
+                const GraphNodeId id =
+                    m_executionLevelNodes[level.firstNode + i];
                 nodes += std::to_string(id);
                 nodes += " ";
             }
@@ -611,14 +711,19 @@ namespace ic
             // Incoming
             spdlog::info("Incoming Barriers:");
 
-            if (schedule.incomingBarrierIndices.empty())
+            if (schedule.incomingBarrierCount == 0)
             {
                 spdlog::info("(none)");
             }
             else
             {
-                for (uint32_t index : schedule.incomingBarrierIndices)
+                for (uint32_t i = 0;
+                     i < schedule.incomingBarrierCount;
+                     ++i)
                 {
+                    const uint32_t index =
+                        m_incomingBarrierIndices[
+                            schedule.firstIncomingBarrier + i];
                     const auto& barrier = m_barriers[index];
 
                     spdlog::info(
@@ -634,14 +739,19 @@ namespace ic
             // Outgoing
             spdlog::info("Outgoing Barriers:");
 
-            if (schedule.outgoingBarrierIndices.empty())
+            if (schedule.outgoingBarrierCount == 0)
             {
                 spdlog::info("(none)");
             }
             else
             {
-                for (uint32_t index : schedule.outgoingBarrierIndices)
+                for (uint32_t i = 0;
+                     i < schedule.outgoingBarrierCount;
+                     ++i)
                 {
+                    const uint32_t index =
+                        m_outgoingBarrierIndices[
+                            schedule.firstOutgoingBarrier + i];
                     const auto& barrier = m_barriers[index];
 
                     spdlog::info(

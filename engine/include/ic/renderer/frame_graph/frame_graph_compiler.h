@@ -31,9 +31,14 @@ namespace ic
             , m_dependencies(memory)
             , m_resourceChains(memory)
             , m_chainMap(memory)
-            , m_adjacencyLists(memory)
+            , m_adjacencyOffsets(memory)
+            , m_adjacencyCounts(memory)
+            , m_adjacencyEdges(memory)
             , m_nodeSchedules(memory)
             , m_executionLevels(memory)
+            , m_executionLevelNodes(memory)
+            , m_incomingBarrierIndices(memory)
+            , m_outgoingBarrierIndices(memory)
         {}
 
         CompiledGraphPlan compile(
@@ -65,8 +70,13 @@ namespace ic
         std::pmr::vector<GraphNodeId> m_executionOrder;
         std::pmr::unordered_map<GraphResourceId, ResourceChain> m_chainMap;
         std::pmr::vector<ResourceChain> m_resourceChains;
-        std::pmr::vector<std::pmr::vector<GraphNodeId>> m_adjacencyLists;
+        std::pmr::vector<uint32_t> m_adjacencyOffsets;
+        std::pmr::vector<uint32_t> m_adjacencyCounts;
+        std::pmr::vector<GraphNodeId> m_adjacencyEdges;
         std::pmr::vector<NodeSchedule> m_nodeSchedules;
-        std::pmr::vector<std::pmr::vector<GraphNodeId>> m_executionLevels;
+        std::pmr::vector<ExecutionLevel> m_executionLevels;
+        std::pmr::vector<GraphNodeId> m_executionLevelNodes;
+        std::pmr::vector<uint32_t> m_incomingBarrierIndices;
+        std::pmr::vector<uint32_t> m_outgoingBarrierIndices;
     };
 }

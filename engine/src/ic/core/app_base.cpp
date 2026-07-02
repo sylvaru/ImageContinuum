@@ -77,16 +77,19 @@ namespace ic
         createFrameArenas();
         createAssetManager();
         createSceneManager();
-        if (m_spec.useDebugGui)
-        {
-            m_spec.rendererSpec.enableImGui = true;
-        }
+
+
         createRenderer();
 
         bindEventSink();
         buildServices();
 
         initRenderer();
+
+        if (m_spec.rendererSpec.useDebugGui)
+        {
+            pushLayer<DebugGuiLayer>();
+        }
     }
 
     int AppBase::run(
@@ -96,10 +99,7 @@ namespace ic
         
         initAppBase(argc, argv);
         onInit(); // Client app configuration happens here
-        if (m_spec.useDebugGui)
-        {
-            pushLayer<DebugGuiLayer>();
-        }
+
 
         m_clock.reset();
         m_frame.services = &m_services;
@@ -134,7 +134,7 @@ namespace ic
             runtime.assetManager->update();
             runtime.sceneManager->update(m_frame);
 
-            if (m_spec.useDebugGui &&
+            if (m_spec.rendererSpec.useDebugGui &&
                 runtime.renderer->beginDebugGuiFrame())
             {
                 m_layerStack.renderAll(m_frame.interpolationAlpha);
@@ -270,7 +270,7 @@ namespace ic
         m_runtime->assetManager = std::make_unique<AssetManager>();
 
         AssetManagerDesc desc{};
-        desc.assetRoot = std::filesystem::path("assets");
+        desc.assetRoot = m_spec.resourceRoots.assetRoot;
         desc.maxConcurrentLoads = std::max(1u, m_runtime->jobs->workerCount());
 
         m_runtime->assetManager->init(desc, *m_runtime->jobs);
@@ -282,6 +282,7 @@ namespace ic
 
         SceneManagerDesc desc{};
         desc.enableAsyncSceneLoading = true;
+        desc.modelRoot = m_spec.resourceRoots.modelRoot;
 
         m_runtime->sceneManager->init(
             desc,

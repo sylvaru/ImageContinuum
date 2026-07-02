@@ -6,8 +6,8 @@ id = 1
 name = "Main Camera"
 
 [entities.transform]
-translation = [0.0, 1.0, 4.0]
-rotation = [0.0, 0.0, 0.0, 1.0]
+translation = [0.0, 1.0, -3.25]
+rotation = [0.0, 1.0, 0.0, 0.0]
 scale = [1.0, 1.0, 1.0]
 
 [entities.camera]
@@ -20,6 +20,8 @@ far = 100.0
 move_speed = 3.0
 fast_move_multiplier = 4.0
 mouse_sensitivity = 0.0025
+yaw = 3.14159265
+pitch = 0.0
 capture_mouse = true
 
 [[entities]]
@@ -29,7 +31,7 @@ model = "CornellBox-Original.gltf"
 
 [entities.transform]
 translation = [0.0, 0.0, 0.0]
-rotation = [0.0, 0.0, 0.0, 1.0]
+rotation = [0.0, 90.0, 0.0, 1.0]
 scale = [1.0, 1.0, 1.0]
 
 [[entities]]

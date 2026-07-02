@@ -376,6 +376,10 @@ namespace ic
             return PipelineBindingLayoutKind::ForwardBindless;
         if (value == "ComputeStorageBuffer")
             return PipelineBindingLayoutKind::ComputeStorageBuffer;
+        if (value == "PathTrace")
+            return PipelineBindingLayoutKind::PathTrace;
+        if (value == "PathTraceTonemap")
+            return PipelineBindingLayoutKind::PathTraceTonemap;
         if (value == "Empty")
             return PipelineBindingLayoutKind::Empty;
         if (value == "Unknown")
@@ -413,6 +417,7 @@ namespace ic
     {
         if (value == "RGBA8_UNorm") return TextureFormat::RGBA8_UNorm;
         if (value == "RGBA8_SRGB") return TextureFormat::RGBA8_SRGB;
+        if (value == "RGBA32_Float") return TextureFormat::RGBA32_Float;
         if (value == "BGRA8_UNorm") return TextureFormat::BGRA8_UNorm;
         if (value == "BGRA8_SRGB") return TextureFormat::BGRA8_SRGB;
         if (value == "D32_Float") return TextureFormat::D32_Float;

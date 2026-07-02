@@ -203,6 +203,7 @@ namespace ic
         float metallicFactor = 1.0f;
         float roughnessFactor = 1.0f;
         float alphaCutoff = 0.5f;
+        glm::vec3 emissiveFactor = glm::vec3(0.0f);
         int32_t baseColorImage = -1;
         int32_t normalImage = -1;
         int32_t metallicRoughnessImage = -1;

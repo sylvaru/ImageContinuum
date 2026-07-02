@@ -17,6 +17,7 @@ namespace ic
         Unknown,
         RGBA8_UNorm,
         RGBA8_SRGB,
+        RGBA32_Float,
         BGRA8_UNorm,
         BGRA8_SRGB,
         D32_Float

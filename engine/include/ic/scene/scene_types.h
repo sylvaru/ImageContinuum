@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 
 #include <entt/entt.hpp>
 
@@ -51,6 +52,7 @@ namespace ic
     {
         bool enableAsyncSceneLoading = true;
         uint32_t maxQueuedSceneLoads = 4;
+        std::filesystem::path modelRoot;
     };
 
     struct SceneLoadOptions

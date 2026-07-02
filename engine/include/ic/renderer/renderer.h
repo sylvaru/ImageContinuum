@@ -27,13 +27,15 @@ namespace ic
             Window& window,
             uint32_t workerCount
         );
+        void shutdown();
+
         void render(FrameContext& frame);
         void render(
             FrameContext& frame,
             const SceneRenderView& scene);
         bool beginDebugGuiFrame();
         void endDebugGuiFrame();
-        void shutdown();
+        
         void rebuildGraph();
 
         static Scope<RendererBackend> createBackend(

@@ -2,6 +2,7 @@
 #include "../common/ic_camera.hlsli"
 #include "../common/ic_materials.hlsli"
 #include "../common/ic_bindless.hlsli"
+#include "../common/brdf.hlsli"
 
 struct VertexInput
 {
@@ -65,9 +66,15 @@ float4 PSMain(VertexOutput input) : SV_Target0
     const float3 lightDirection = safeNormalize(-gFrame.lightDirection, float3(0.0f, 1.0f, 0.0f));
     const float ndotl = saturate(dot(normal, lightDirection));
 
-    const float3 lighting =
-        float3(0.15f, 0.15f, 0.15f) +
-        ndotl * gFrame.lightColor * gFrame.lightIntensity;
+    const float3 ambient = 0.035f * baseColor;
+    const float3 direct =
+        lambertDiffuse(baseColor) *
+        ndotl *
+        gFrame.lightColor *
+        gFrame.lightIntensity;
+    float3 color = ambient + direct;
+    color = color / (color + 1.0f);
+    color = pow(max(color, 0.0f), 1.0f / 2.2f);
 
-    return float4(baseColor * lighting, sampledBaseColor.a * material.baseColorFactor.a);
+    return float4(color, sampledBaseColor.a * material.baseColorFactor.a);
 }

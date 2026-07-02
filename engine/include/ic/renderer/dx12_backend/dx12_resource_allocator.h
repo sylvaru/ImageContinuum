@@ -102,7 +102,7 @@ namespace ic
         void unmap(DX12Buffer& buffer);
 
     private:
-        D3D12_RESOURCE_FLAGS toBufferFlags(BufferUsageFlags usage) const;
+        D3D12_RESOURCE_FLAGS toBufferFlags(const BufferDesc& desc) const;
         D3D12_RESOURCE_FLAGS toTextureFlags(TextureUsageFlags usage) const;
         DXGI_FORMAT toDxgiFormat(TextureFormat format) const;
         D3D12_HEAP_PROPERTIES heapProperties(ResourceMemoryUsage usage) const;

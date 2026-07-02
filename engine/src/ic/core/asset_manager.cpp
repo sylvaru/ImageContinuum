@@ -979,6 +979,10 @@ namespace ic
                 dst.metallicFactor = src.pbrData.metallicFactor;
                 dst.roughnessFactor = src.pbrData.roughnessFactor;
                 dst.alphaCutoff = src.alphaCutoff;
+                dst.emissiveFactor = glm::vec3(
+                    src.emissiveFactor[0],
+                    src.emissiveFactor[1],
+                    src.emissiveFactor[2]);
                 dst.doubleSided = src.doubleSided;
                 dst.alphaBlend = src.alphaMode == fastgltf::AlphaMode::Blend;
                 dst.alphaMask = src.alphaMode == fastgltf::AlphaMode::Mask;

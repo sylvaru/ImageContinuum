@@ -6,7 +6,7 @@
 void DemoApp::onInit()
 {
 	spdlog::info("[ Demo App ] onInit..");
-	m_gameLayer = &pushLayer<GameLayer>();
+	m_gameLayer = &pushLayer<GameLayer>(m_config.startupScenePath);
 }
 
 void DemoApp::onUpdate([[maybe_unused]] float dt)

@@ -60,7 +60,9 @@ namespace ic
         Unknown = 0,
         Empty,
         ForwardBindless,
-        ComputeStorageBuffer
+        ComputeStorageBuffer,
+        PathTrace,
+        PathTraceTonemap
     };
 
     enum class PrimitiveTopologyKind : uint8_t

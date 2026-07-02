@@ -11,6 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(IC_BUILD_TESTS "Build tests" ON)
 option(IC_BUILD_EDITOR "Build editor" OFF)
 option(IC_BUILD_SHARED "Build libraries as shared" OFF)
+option(IC_DEVELOPER_BUILD "Enable developer-only runtime configuration features" ON)
 
 
 # Setup the scalable compiler warnings module

@@ -40,8 +40,7 @@ namespace ic
         // Called at frame start (game thread)
         void beginFrame(FrameContext& ctx)
         {
-            // Ring buffer indexing replacing the XOR (m_write ^= 1) bit hack
-            // This safely scales to 1, 2, or N frames in flight seamlessly
+            // Ring buffer indexing
             const size_t read = m_write;
             m_write = (ctx.frameIndex + 1) % FrameCount;
             ctx.eventFrame = &m_frames[read];

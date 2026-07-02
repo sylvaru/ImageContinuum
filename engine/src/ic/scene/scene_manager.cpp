@@ -63,6 +63,48 @@ namespace ic
             return path.lexically_normal();
         }
 
+        std::filesystem::path resolveExistingRootedPath(
+            const std::filesystem::path& root,
+            const std::filesystem::path& path)
+        {
+            if (root.empty())
+            {
+                return {};
+            }
+
+            std::filesystem::path candidate =
+                (root / path).lexically_normal();
+            if (std::filesystem::exists(candidate))
+            {
+                return std::filesystem::weakly_canonical(candidate);
+            }
+
+            if (root.is_absolute())
+            {
+                return candidate;
+            }
+
+            std::filesystem::path cursor = std::filesystem::current_path();
+            while (!cursor.empty())
+            {
+                candidate = (cursor / root / path).lexically_normal();
+                if (std::filesystem::exists(candidate))
+                {
+                    return std::filesystem::weakly_canonical(candidate);
+                }
+
+                const std::filesystem::path parent = cursor.parent_path();
+                if (parent == cursor)
+                {
+                    break;
+                }
+
+                cursor = parent;
+            }
+
+            return (root / path).lexically_normal();
+        }
+
         float readFloat(
             const toml::table& table,
             std::string_view key,
@@ -124,6 +166,7 @@ namespace ic
 
         std::filesystem::path resolveEntityAssetPath(
             const std::filesystem::path& scenePath,
+            const std::filesystem::path& modelRoot,
             const std::filesystem::path& assetPath)
         {
             if (assetPath.is_absolute())
@@ -131,7 +174,25 @@ namespace ic
                 return assetPath.lexically_normal();
             }
 
-            return (scenePath.parent_path() / assetPath).lexically_normal();
+            if (!modelRoot.empty())
+            {
+                const std::filesystem::path rootedPath =
+                    resolveExistingRootedPath(modelRoot, assetPath);
+                if (std::filesystem::exists(rootedPath))
+                {
+                    return rootedPath;
+                }
+            }
+
+            const std::filesystem::path sceneRelativePath =
+                (scenePath.parent_path() / assetPath).lexically_normal();
+            if (std::filesystem::exists(sceneRelativePath) ||
+                modelRoot.empty())
+            {
+                return sceneRelativePath;
+            }
+
+            return (modelRoot / assetPath).lexically_normal();
         }
     }
 
@@ -252,7 +313,8 @@ namespace ic
 
             try
             {
-                completion.data = loadSceneFile(path, *m_assets, options);
+                completion.data =
+                    loadSceneFile(path, m_desc.modelRoot, *m_assets, options);
                 completion.success = true;
             }
             catch (const std::exception& e)
@@ -273,7 +335,8 @@ namespace ic
 
                 try
                 {
-                    completion.data = loadSceneFile(path, *m_assets, options);
+                    completion.data =
+                        loadSceneFile(path, m_desc.modelRoot, *m_assets, options);
                     completion.success = true;
                 }
                 catch (const std::exception& e)
@@ -558,6 +621,7 @@ namespace ic
 
     std::unique_ptr<SceneManager::LoadedSceneData> SceneManager::loadSceneFile(
         const std::filesystem::path& path,
+        const std::filesystem::path& modelRoot,
         AssetManager& assets,
         const SceneLoadOptions& options)
     {
@@ -608,7 +672,10 @@ namespace ic
             if (auto model = entityTable->get_as<std::string>("model"))
             {
                 desc.modelPath =
-                    resolveEntityAssetPath(resolvedPath, model->get());
+                    resolveEntityAssetPath(
+                        resolvedPath,
+                        modelRoot,
+                        model->get());
 
                 if (options.loadReferencedAssets)
                 {

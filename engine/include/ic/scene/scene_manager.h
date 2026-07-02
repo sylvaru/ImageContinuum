@@ -136,6 +136,7 @@ namespace ic
 
         static std::unique_ptr<LoadedSceneData> loadSceneFile(
             const std::filesystem::path& path,
+            const std::filesystem::path& modelRoot,
             AssetManager& assets,
             const SceneLoadOptions& options);
 

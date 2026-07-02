@@ -6,6 +6,7 @@
 #include "ic/scene/scene_render_view.h"
 #include "ic/renderer/pipeline_library.h"
 #include "ic/renderer/renderer_specification.h"
+#include "ic/renderer/path_tracing/path_trace_scene_builder.h"
 
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
@@ -16,16 +17,139 @@
 #include <backends/imgui_impl_glfw.h>
 
 #include <stdexcept>
-#include <future>
+#include <cmath>
+#include <cstring>
 
 namespace
 {
+    constexpr uint64_t ConstantBufferAlignment = 256;
+    constexpr uint32_t DefaultPathTraceMaxBounces = 4;
+    constexpr uint32_t DefaultPathTraceSamplesPerPixel = 2;
+
     void throwIfFailed(HRESULT hr, const char* message)
     {
         if (FAILED(hr))
         {
             throw std::runtime_error(message);
         }
+    }
+
+    uint64_t alignConstantBufferSize(uint64_t size)
+    {
+        return (size + ConstantBufferAlignment - 1u) &
+            ~(ConstantBufferAlignment - 1u);
+    }
+
+    struct PathTraceConstants
+    {
+        uint32_t renderWidth = 0;
+        uint32_t renderHeight = 0;
+        uint32_t frameIndex = 0;
+        uint32_t accumulatedSampleCount = 0;
+
+        float exposure = 1.0f;
+        uint32_t resetAccumulation = 1;
+        uint32_t maxBounces = 4;
+        uint32_t samplesPerPixel = 1;
+
+        uint32_t sceneVertexCount = 0;
+        uint32_t sceneMaterialCount = 0;
+        uint32_t sceneTriangleCount = 0;
+        uint32_t sceneBvhNodeCount = 0;
+
+        uint32_t useSceneGeometry = 0;
+        uint32_t padding0 = 0;
+        uint32_t padding1 = 0;
+        uint32_t padding2 = 0;
+
+        glm::vec4 cameraPositionAndTanHalfFov = glm::vec4(0.0f);
+        glm::vec4 cameraForwardAndAspect = glm::vec4(0.0f);
+        glm::vec4 cameraRightAndNear = glm::vec4(0.0f);
+        glm::vec4 cameraUpAndFar = glm::vec4(0.0f);
+    };
+
+    struct TonemapConstants
+    {
+        uint32_t renderWidth = 0;
+        uint32_t renderHeight = 0;
+        float exposure = 1.0f;
+        uint32_t padding0 = 0;
+    };
+
+    static_assert(sizeof(PathTraceConstants) == 128);
+    static_assert(sizeof(TonemapConstants) == 16);
+
+    bool matricesDiffer(const glm::mat4& a, const glm::mat4& b)
+    {
+        constexpr float CameraMatrixEpsilon = 1.0e-5f;
+        for (glm::length_t column = 0; column < 4; ++column)
+        {
+            for (glm::length_t row = 0; row < 4; ++row)
+            {
+                if (std::fabs(a[column][row] - b[column][row]) >
+                    CameraMatrixEpsilon)
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    void fillPathTraceCameraConstants(
+        const ic::SceneCameraView& camera,
+        uint32_t width,
+        uint32_t height,
+        PathTraceConstants& constants)
+    {
+        const float fallbackAspect =
+            height == 0u
+                ? 1.0f
+                : static_cast<float>(width) / static_cast<float>(height);
+
+        if (camera.valid != 0u)
+        {
+            const glm::mat4 inverseView = glm::inverse(camera.view);
+            const glm::vec3 right =
+                glm::normalize(glm::vec3(inverseView[0]));
+            const glm::vec3 up =
+                glm::normalize(glm::vec3(inverseView[1]));
+            const glm::vec3 forward =
+                glm::normalize(-glm::vec3(inverseView[2]));
+            const float aspect =
+                camera.aspectRatio > 0.0f
+                    ? camera.aspectRatio
+                    : fallbackAspect;
+            const float tanHalfFov =
+                std::tan(camera.verticalFovRadians * 0.5f);
+
+            constants.cameraPositionAndTanHalfFov =
+                glm::vec4(camera.position, tanHalfFov);
+            constants.cameraForwardAndAspect =
+                glm::vec4(forward, aspect);
+            constants.cameraRightAndNear =
+                glm::vec4(right, camera.nearPlane);
+            constants.cameraUpAndFar =
+                glm::vec4(up, camera.farPlane);
+            return;
+        }
+
+        const glm::vec3 origin(0.0f, 1.05f, -3.25f);
+        const glm::vec3 target(0.0f, 0.95f, 0.95f);
+        const glm::vec3 forward = glm::normalize(target - origin);
+        const glm::vec3 right =
+            glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
+        const glm::vec3 up = glm::normalize(glm::cross(right, forward));
+
+        constants.cameraPositionAndTanHalfFov =
+            glm::vec4(origin, std::tan(glm::radians(39.0f) * 0.5f));
+        constants.cameraForwardAndAspect =
+            glm::vec4(forward, fallbackAspect);
+        constants.cameraRightAndNear =
+            glm::vec4(right, 0.1f);
+        constants.cameraUpAndFar =
+            glm::vec4(up, 100.0f);
     }
 }
 
@@ -69,7 +193,7 @@ namespace ic
         m_sceneFrameResources.resize(framesInFlight);
         m_pipelineLibrary = &pipelineLibrary;
 
-        if (spec.enableImGui)
+        if (spec.useDebugGui)
         {
             initImGui(window);
         }
@@ -155,164 +279,6 @@ namespace ic
         }
     }
 
-    bool DX12Backend::beginDebugGuiFrame()
-    {
-        if (!m_imguiEnabled || m_imguiFrameActive)
-        {
-            return false;
-        }
-
-        ImGui_ImplDX12_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
-
-        m_imguiFrameActive = true;
-        return true;
-    }
-
-    void DX12Backend::endDebugGuiFrame()
-    {
-        if (!m_imguiFrameActive)
-        {
-            return;
-        }
-
-        ImGui::Render();
-        m_imguiFrameActive = false;
-    }
-
-    void DX12Backend::initImGui(Window& window)
-    {
-        if (m_imguiEnabled)
-        {
-            return;
-        }
-
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-
-        ImGui::StyleColorsDark();
-
-        auto* glfwWindow =
-            static_cast<GLFWwindow*>(window.getNativeHandle());
-        if (!ImGui_ImplGlfw_InitForOther(glfwWindow, true))
-        {
-            throw std::runtime_error(
-                "Failed to initialize ImGui GLFW backend.");
-        }
-
-        ImGui_ImplDX12_InitInfo initInfo{};
-        initInfo.Device = m_device.device();
-        initInfo.CommandQueue = m_device.graphicsQueue();
-        initInfo.NumFramesInFlight =
-            static_cast<int>(std::max<size_t>(1, m_frameSync.size()));
-        initInfo.RTVFormat = m_swapchain.format();
-        initInfo.DSVFormat = DXGI_FORMAT_UNKNOWN;
-        initInfo.SrvDescriptorHeap =
-            m_descriptorSystem.shaderResourceHeap();
-        initInfo.UserData = this;
-        initInfo.SrvDescriptorAllocFn =
-            [](ImGui_ImplDX12_InitInfo* info,
-               D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
-               D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
-            {
-                auto* self = static_cast<DX12Backend*>(info->UserData);
-                DX12DescriptorAllocation allocation =
-                    self->m_descriptorSystem.allocateResourceDescriptors(1);
-                *outCpu = allocation.cpuStart;
-                *outGpu = allocation.gpuStart;
-            };
-        initInfo.SrvDescriptorFreeFn =
-            [](ImGui_ImplDX12_InitInfo*,
-               D3D12_CPU_DESCRIPTOR_HANDLE,
-               D3D12_GPU_DESCRIPTOR_HANDLE)
-            {
-            };
-
-        if (!ImGui_ImplDX12_Init(&initInfo))
-        {
-            ImGui_ImplGlfw_Shutdown();
-            ImGui::DestroyContext();
-            throw std::runtime_error(
-                "Failed to initialize ImGui DX12 backend.");
-        }
-
-        m_imguiEnabled = true;
-    }
-
-    void DX12Backend::shutdownImGui()
-    {
-        if (!m_imguiEnabled)
-        {
-            return;
-        }
-
-        ImGui_ImplDX12_Shutdown();
-        ImGui_ImplGlfw_Shutdown();
-        ImGui::DestroyContext();
-
-        m_imguiEnabled = false;
-        m_imguiFrameActive = false;
-    }
-
-    void DX12Backend::recordImGui(
-        const FrameContext& ctx,
-        ID3D12Resource* swapchainImage,
-        std::vector<ID3D12CommandList*>& commandLists)
-    {
-        if (!m_imguiEnabled)
-        {
-            return;
-        }
-
-        ImDrawData* drawData = ImGui::GetDrawData();
-        if (!drawData || drawData->TotalVtxCount == 0)
-        {
-            return;
-        }
-
-        auto lease =
-            m_commandSystem.acquireFrameCommandList(
-                static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size()),
-                0);
-
-        ID3D12GraphicsCommandList4* cmd =
-            lease.commandList();
-
-        transitionResource(
-            cmd,
-            swapchainImage,
-            D3D12_RESOURCE_STATE_PRESENT,
-            D3D12_RESOURCE_STATE_RENDER_TARGET);
-
-        D3D12_CPU_DESCRIPTOR_HANDLE rtv =
-            m_swapchain.currentRtv();
-        cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
-
-        ID3D12DescriptorHeap* heaps[] =
-        {
-            m_descriptorSystem.shaderResourceHeap()
-        };
-        cmd->SetDescriptorHeaps(1, heaps);
-
-        ImGui_ImplDX12_RenderDrawData(drawData, cmd);
-
-        transitionResource(
-            cmd,
-            swapchainImage,
-            D3D12_RESOURCE_STATE_RENDER_TARGET,
-            D3D12_RESOURCE_STATE_PRESENT);
-
-        throwIfFailed(
-            cmd->Close(),
-            "Failed to close DX12 ImGui command list.");
-
-        commandLists.push_back(
-            static_cast<ID3D12CommandList*>(cmd));
-    }
 
     void DX12Backend::executeGraph(
         const CompiledGraphPlan& plan,
@@ -367,24 +333,15 @@ namespace ic
             return;
         }
 
-        for (const std::pmr::vector<GraphNodeId>& level : plan.executionLevels)
+        for (const ExecutionLevel& level : plan.executionLevels)
         {
-            std::vector<std::future<ID3D12CommandList*>> futures;
-            futures.reserve(level.size());
-
-            for (uint32_t i = 0; i < level.size(); ++i)
+            for (uint32_t i = 0; i < level.nodeCount; ++i)
             {
-                futures.push_back(
-                    std::async(
-                        std::launch::async,
-                        recordNode,
-                        level[i],
-                        i % m_workerSlots));
-            }
+                const GraphNodeId nodeId =
+                    plan.executionLevelNodes[level.firstNode + i];
 
-            for (auto& future : futures)
-            {
-                commandLists.push_back(future.get());
+                commandLists.push_back(
+                    recordNode(nodeId, i % m_workerSlots));
             }
         }
     }
@@ -474,11 +431,11 @@ namespace ic
             break;
 
         case GraphNodeType::Compute:
-            executeComputeNode(plan, node, ctx, cmd);
+            executeComputeNode(plan, node, ctx, scene, cmd);
             break;
 
         case GraphNodeType::Transfer:
-            executeTransferNode(plan, node, ctx, cmd);
+            executeTransferNode(plan, node, ctx, cmd, swapchainImage);
             break;
 
         case GraphNodeType::Present:
@@ -488,7 +445,7 @@ namespace ic
 
     void DX12Backend::executeGraphicsNode(
         const CompiledGraphPlan& plan,
-        [[maybe_unused]] const ExecutionNode& node,
+        const ExecutionNode& node,
         const FrameContext& ctx,
         const SceneRenderView& scene,
         ID3D12GraphicsCommandList4* cmd,
@@ -647,10 +604,23 @@ namespace ic
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
         [[maybe_unused]] const FrameContext& ctx,
+        [[maybe_unused]] const SceneRenderView& scene,
         [[maybe_unused]] ID3D12GraphicsCommandList4* cmd)
     {
         if (node.payloadIndex >= plan.payloads.size())
         {
+            return;
+        }
+
+        if (std::get_if<PathTracePassData>(&plan.payloads[node.payloadIndex]))
+        {
+            executePathTraceNode(plan, node, ctx, scene, cmd);
+            return;
+        }
+
+        if (std::get_if<TonemapPassData>(&plan.payloads[node.payloadIndex]))
+        {
+            executeTonemapNode(plan, node, cmd);
             return;
         }
 
@@ -708,11 +678,216 @@ namespace ic
         }
     }
 
+    void DX12Backend::executePathTraceNode(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd)
+    {
+        ensurePathTraceResources();
+        ensurePathTraceSceneResources(ctx, scene);
+
+        DX12ComputePipeline* pipeline =
+            m_pipelineManager.computePipeline(
+                computePipelineForNode(plan, node));
+        if (!pipeline || !m_pathTraceResources.accumulation)
+        {
+            return;
+        }
+
+        const bool hasCamera = scene.camera.valid != 0u;
+        const bool cameraChanged =
+            hasCamera &&
+            (!m_pathTraceResources.hasPreviousCamera ||
+                matricesDiffer(scene.camera.view, m_pathTraceResources.previousView) ||
+                matricesDiffer(
+                    scene.camera.projection,
+                    m_pathTraceResources.previousProjection));
+
+        if (cameraChanged)
+        {
+            m_pathTraceResources.accumulatedSampleCount = 0;
+            m_pathTraceResources.resetAccumulation = true;
+            m_pathTraceResources.previousView = scene.camera.view;
+            m_pathTraceResources.previousProjection = scene.camera.projection;
+            m_pathTraceResources.hasPreviousCamera = true;
+        }
+        else if (!hasCamera)
+        {
+            m_pathTraceResources.hasPreviousCamera = false;
+        }
+
+        if (m_pathTraceResources.accumulationState !=
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        {
+            transitionResource(
+                cmd,
+                m_pathTraceResources.accumulation.resource.Get(),
+                m_pathTraceResources.accumulationState,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            m_pathTraceResources.accumulationState =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+
+        PathTraceConstants constants{};
+        constants.renderWidth = m_pathTraceResources.width;
+        constants.renderHeight = m_pathTraceResources.height;
+        constants.frameIndex = static_cast<uint32_t>(ctx.frameIndex);
+        constants.accumulatedSampleCount =
+            m_pathTraceResources.accumulatedSampleCount;
+        constants.exposure = 1.0f;
+        constants.resetAccumulation =
+            m_pathTraceResources.resetAccumulation ? 1u : 0u;
+        constants.maxBounces = DefaultPathTraceMaxBounces;
+        constants.samplesPerPixel = DefaultPathTraceSamplesPerPixel;
+        constants.sceneVertexCount =
+            m_pathTraceResources.sceneVertexCount;
+        constants.sceneMaterialCount =
+            m_pathTraceResources.sceneMaterialCount;
+        constants.sceneTriangleCount =
+            m_pathTraceResources.sceneTriangleCount;
+        constants.sceneBvhNodeCount =
+            m_pathTraceResources.sceneBvhNodeCount;
+        constants.useSceneGeometry =
+            m_pathTraceResources.sceneTriangleCount != 0u &&
+            m_pathTraceResources.sceneBvhNodeCount != 0u
+                ? 1u
+                : 0u;
+        fillPathTraceCameraConstants(
+            scene.camera,
+            m_pathTraceResources.width,
+            m_pathTraceResources.height,
+            constants);
+
+        std::memcpy(
+            m_pathTraceResources.pathTraceConstants.mapped,
+            &constants,
+            sizeof(constants));
+
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            m_descriptorSystem.shaderResourceHeap()
+        };
+        cmd->SetDescriptorHeaps(1, heaps);
+        cmd->SetComputeRootSignature(pipeline->rootSignature.Get());
+        cmd->SetPipelineState(pipeline->pipelineState.Get());
+        cmd->SetComputeRootConstantBufferView(
+            0,
+            m_pathTraceResources.pathTraceConstants.gpuAddress);
+        cmd->SetComputeRootDescriptorTable(
+            1,
+            m_pathTraceResources.accumulationUav.gpuStart);
+        if (m_pathTraceResources.sceneSrvs.valid())
+        {
+            cmd->SetComputeRootDescriptorTable(
+                2,
+                m_pathTraceResources.sceneSrvs.gpuStart);
+        }
+
+        const uint32_t groupCountX =
+            (m_pathTraceResources.width + 7u) / 8u;
+        const uint32_t groupCountY =
+            (m_pathTraceResources.height + 7u) / 8u;
+        cmd->Dispatch(groupCountX, groupCountY, 1);
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource =
+            m_pathTraceResources.accumulation.resource.Get();
+        cmd->ResourceBarrier(1, &barrier);
+
+        ++m_pathTraceResources.accumulatedSampleCount;
+        m_pathTraceResources.resetAccumulation = false;
+    }
+
+    void DX12Backend::executeTonemapNode(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        ID3D12GraphicsCommandList4* cmd)
+    {
+        ensurePathTraceResources();
+
+        DX12ComputePipeline* pipeline =
+            m_pipelineManager.computePipeline(
+                computePipelineForNode(plan, node));
+        if (!pipeline ||
+            !m_pathTraceResources.accumulation ||
+            !m_pathTraceResources.tonemap)
+        {
+            return;
+        }
+
+        if (m_pathTraceResources.accumulationState !=
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+        {
+            transitionResource(
+                cmd,
+                m_pathTraceResources.accumulation.resource.Get(),
+                m_pathTraceResources.accumulationState,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            m_pathTraceResources.accumulationState =
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        }
+
+        if (m_pathTraceResources.tonemapState !=
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        {
+            transitionResource(
+                cmd,
+                m_pathTraceResources.tonemap.resource.Get(),
+                m_pathTraceResources.tonemapState,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            m_pathTraceResources.tonemapState =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+
+        TonemapConstants constants{};
+        constants.renderWidth = m_pathTraceResources.width;
+        constants.renderHeight = m_pathTraceResources.height;
+        constants.exposure = 1.0f;
+
+        std::memcpy(
+            m_pathTraceResources.tonemapConstants.mapped,
+            &constants,
+            sizeof(constants));
+
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            m_descriptorSystem.shaderResourceHeap()
+        };
+        cmd->SetDescriptorHeaps(1, heaps);
+        cmd->SetComputeRootSignature(pipeline->rootSignature.Get());
+        cmd->SetPipelineState(pipeline->pipelineState.Get());
+        cmd->SetComputeRootConstantBufferView(
+            0,
+            m_pathTraceResources.tonemapConstants.gpuAddress);
+        cmd->SetComputeRootDescriptorTable(
+            1,
+            m_pathTraceResources.tonemapUav.gpuStart);
+        cmd->SetComputeRootDescriptorTable(
+            2,
+            m_pathTraceResources.accumulationSrv.gpuStart);
+
+        const uint32_t groupCountX =
+            (m_pathTraceResources.width + 7u) / 8u;
+        const uint32_t groupCountY =
+            (m_pathTraceResources.height + 7u) / 8u;
+        cmd->Dispatch(groupCountX, groupCountY, 1);
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource =
+            m_pathTraceResources.tonemap.resource.Get();
+        cmd->ResourceBarrier(1, &barrier);
+    }
+
     void DX12Backend::executeTransferNode(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
         [[maybe_unused]] const FrameContext& ctx,
-        [[maybe_unused]] ID3D12GraphicsCommandList4* cmd)
+        ID3D12GraphicsCommandList4* cmd,
+        ID3D12Resource* swapchainImage)
     {
         if (node.payloadIndex >= plan.payloads.size())
         {
@@ -726,7 +901,26 @@ namespace ic
             return;
         }
 
-        // Transfer payload operations land here; resource barriers already run.
+        if (pass->name == "PathTracer.CopyToBackBuffer" &&
+            m_pathTraceResources.tonemap &&
+            swapchainImage)
+        {
+            if (m_pathTraceResources.tonemapState !=
+                D3D12_RESOURCE_STATE_COPY_SOURCE)
+            {
+                transitionResource(
+                    cmd,
+                    m_pathTraceResources.tonemap.resource.Get(),
+                    m_pathTraceResources.tonemapState,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+                m_pathTraceResources.tonemapState =
+                    D3D12_RESOURCE_STATE_COPY_SOURCE;
+            }
+
+            cmd->CopyResource(
+                swapchainImage,
+                m_pathTraceResources.tonemap.resource.Get());
+        }
     }
 
     GraphicsPipelineHandle DX12Backend::pipelineForNode(
@@ -774,14 +968,30 @@ namespace ic
             return {};
         }
 
-        const ComputePassData* pass =
-            std::get_if<ComputePassData>(&plan.payloads[node.payloadIndex]);
-        if (!pass || !pass->pipeline)
+        PipelineId pipelineId{};
+
+        if (const ComputePassData* computePass =
+            std::get_if<ComputePassData>(&plan.payloads[node.payloadIndex]))
+        {
+            pipelineId = computePass->pipeline;
+        }
+        else if (const PathTracePassData* pathTracePass =
+            std::get_if<PathTracePassData>(&plan.payloads[node.payloadIndex]))
+        {
+            pipelineId = pathTracePass->pipeline;
+        }
+        else if (const TonemapPassData* tonemapPass =
+            std::get_if<TonemapPassData>(&plan.payloads[node.payloadIndex]))
+        {
+            pipelineId = tonemapPass->pipeline;
+        }
+
+        if (!pipelineId)
         {
             return {};
         }
 
-        auto it = m_computePipelineHandles.find(pass->pipeline);
+        auto it = m_computePipelineHandles.find(pipelineId);
         if (it != m_computePipelineHandles.end())
         {
             return it->second;
@@ -789,18 +999,19 @@ namespace ic
 
         ComputePipelineDesc desc =
             m_pipelineLibrary->resolveCompute(
-                pass->pipeline,
+                pipelineId,
                 RendererBackendType::DX12);
 
         ComputePipelineHandle handle =
             m_pipelineManager.requestComputePipeline(desc);
-        m_computePipelineHandles.emplace(pass->pipeline, handle);
+        m_computePipelineHandles.emplace(pipelineId, handle);
         return handle;
     }
 
     void DX12Backend::destroySceneResources()
     {
         destroyDepthTarget();
+        destroyPathTraceResources();
         m_resourceAllocator.destroyBuffer(m_computeTestBuffer);
         m_computeTestBufferState = D3D12_RESOURCE_STATE_COMMON;
 
@@ -822,6 +1033,436 @@ namespace ic
 
         m_pipelineHandles.clear();
         m_computePipelineHandles.clear();
+    }
+
+    void DX12Backend::ensurePathTraceResources()
+    {
+        const uint32_t width = m_swapchain.width();
+        const uint32_t height = m_swapchain.height();
+        if (width == 0 || height == 0)
+        {
+            return;
+        }
+
+        if (m_pathTraceResources.accumulation &&
+            m_pathTraceResources.tonemap &&
+            m_pathTraceResources.width == width &&
+            m_pathTraceResources.height == height)
+        {
+            return;
+        }
+
+        destroyPathTraceResources();
+
+        m_pathTraceResources.width = width;
+        m_pathTraceResources.height = height;
+        m_pathTraceResources.accumulatedSampleCount = 0;
+        m_pathTraceResources.resetAccumulation = true;
+
+        m_pathTraceResources.accumulation =
+            m_resourceAllocator.createTexture({
+                .width = width,
+                .height = height,
+                .format = TextureFormat::RGBA32_Float,
+                .usage =
+                    TextureUsageFlags::Storage |
+                    TextureUsageFlags::Sampled,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "DX12 path trace accumulation"
+            });
+        m_pathTraceResources.accumulationState =
+            m_pathTraceResources.accumulation.initialState;
+
+        m_pathTraceResources.tonemap =
+            m_resourceAllocator.createTexture({
+                .width = width,
+                .height = height,
+                .format = swapchainTextureFormat(),
+                .usage =
+                    TextureUsageFlags::Storage |
+                    TextureUsageFlags::TransferSrc,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "DX12 path trace tonemap"
+            });
+        m_pathTraceResources.tonemapState =
+            m_pathTraceResources.tonemap.initialState;
+
+        m_pathTraceResources.pathTraceConstants =
+            m_resourceAllocator.createBuffer({
+                .size = alignConstantBufferSize(sizeof(PathTraceConstants)),
+                .usage = BufferUsageFlags::Constant,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = "DX12 path trace constants"
+            });
+
+        m_pathTraceResources.tonemapConstants =
+            m_resourceAllocator.createBuffer({
+                .size = alignConstantBufferSize(sizeof(TonemapConstants)),
+                .usage = BufferUsageFlags::Constant,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = "DX12 path trace tonemap constants"
+            });
+
+        updatePathTraceDescriptors();
+    }
+
+    void DX12Backend::ensurePathTraceSceneResources(
+        const FrameContext& ctx,
+        const SceneRenderView& scene)
+    {
+        if (!ctx.services || !ctx.services->assetManager)
+        {
+            if (!m_pathTraceResources.sceneSrvs.valid())
+            {
+                uploadPathTraceScene({});
+            }
+            return;
+        }
+
+        const bool retryPendingScene =
+            m_pathTraceResources.sceneTriangleCount == 0u &&
+            !scene.models.empty();
+        if (m_pathTraceResources.sceneVersion == scene.sceneVersion &&
+            !retryPendingScene &&
+            m_pathTraceResources.sceneSrvs.valid())
+        {
+            return;
+        }
+
+        PathTraceSceneData sceneData =
+            buildPathTraceSceneData(
+                scene,
+                *ctx.services->assetManager);
+        if (sceneData.triangles.empty() &&
+            m_pathTraceResources.sceneSrvs.valid())
+        {
+            return;
+        }
+
+        uploadPathTraceScene(sceneData);
+
+        m_pathTraceResources.sceneVersion = scene.sceneVersion;
+        m_pathTraceResources.accumulatedSampleCount = 0;
+        m_pathTraceResources.resetAccumulation = true;
+    }
+
+    void DX12Backend::uploadPathTraceScene(
+        const PathTraceSceneData& sceneData)
+    {
+        if (m_pathTraceResources.sceneVertices ||
+            m_pathTraceResources.sceneMaterials ||
+            m_pathTraceResources.sceneTriangles ||
+            m_pathTraceResources.sceneBvhNodes)
+        {
+            waitForGpu();
+        }
+
+        destroyPathTraceSceneResources();
+
+        m_pathTraceResources.sceneVertexCount =
+            static_cast<uint32_t>(sceneData.vertices.size());
+        m_pathTraceResources.sceneMaterialCount =
+            static_cast<uint32_t>(sceneData.materials.size());
+        m_pathTraceResources.sceneTriangleCount =
+            static_cast<uint32_t>(sceneData.triangles.size());
+        m_pathTraceResources.sceneBvhNodeCount =
+            static_cast<uint32_t>(sceneData.bvhNodes.size());
+
+        struct PendingSceneUpload
+        {
+            DX12Buffer* destination = nullptr;
+            DX12Buffer staging;
+            uint64_t byteSize = 0;
+        };
+
+        std::vector<PendingSceneUpload> pendingUploads;
+        pendingUploads.reserve(4);
+
+        auto createBuffer =
+            [&](uint64_t elementSize,
+                uint32_t elementCount,
+                const void* data,
+                const char* debugName)
+            {
+                const uint64_t byteSize =
+                    elementSize * std::max<uint32_t>(1u, elementCount);
+
+                DX12Buffer buffer =
+                    m_resourceAllocator.createBuffer({
+                        .size = byteSize,
+                        .usage = BufferUsageFlags::TransferDst,
+                        .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                        .mappedAtCreation = false,
+                        .debugName = debugName
+                    });
+
+                if (elementCount != 0u && data)
+                {
+                    DX12Buffer staging =
+                        m_resourceAllocator.createBuffer({
+                            .size = byteSize,
+                            .usage = BufferUsageFlags::TransferSrc,
+                            .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                            .mappedAtCreation = true,
+                            .debugName = "DX12 path trace scene staging"
+                        });
+
+                    std::memcpy(
+                        staging.mapped,
+                        data,
+                        static_cast<size_t>(elementSize * elementCount));
+
+                    pendingUploads.push_back({
+                        .destination = nullptr,
+                        .staging = std::move(staging),
+                        .byteSize = elementSize * elementCount
+                    });
+                }
+
+                return buffer;
+            };
+
+        m_pathTraceResources.sceneVertices =
+            createBuffer(
+                sizeof(PathTraceVertex),
+                m_pathTraceResources.sceneVertexCount,
+                sceneData.vertices.data(),
+                "DX12 path trace scene vertices");
+        m_pathTraceResources.sceneMaterials =
+            createBuffer(
+                sizeof(PathTraceMaterial),
+                m_pathTraceResources.sceneMaterialCount,
+                sceneData.materials.data(),
+                "DX12 path trace scene materials");
+        m_pathTraceResources.sceneTriangles =
+            createBuffer(
+                sizeof(PathTraceTriangle),
+                m_pathTraceResources.sceneTriangleCount,
+                sceneData.triangles.data(),
+                "DX12 path trace scene triangles");
+        m_pathTraceResources.sceneBvhNodes =
+            createBuffer(
+                sizeof(PathTraceBVHNode),
+                m_pathTraceResources.sceneBvhNodeCount,
+                sceneData.bvhNodes.data(),
+                "DX12 path trace scene BVH nodes");
+
+        uint32_t uploadIndex = 0;
+        auto bindPendingUpload =
+            [&](DX12Buffer& destination, uint32_t elementCount)
+            {
+                if (elementCount == 0u)
+                {
+                    return;
+                }
+
+                pendingUploads[uploadIndex++].destination = &destination;
+            };
+
+        bindPendingUpload(
+            m_pathTraceResources.sceneVertices,
+            m_pathTraceResources.sceneVertexCount);
+        bindPendingUpload(
+            m_pathTraceResources.sceneMaterials,
+            m_pathTraceResources.sceneMaterialCount);
+        bindPendingUpload(
+            m_pathTraceResources.sceneTriangles,
+            m_pathTraceResources.sceneTriangleCount);
+        bindPendingUpload(
+            m_pathTraceResources.sceneBvhNodes,
+            m_pathTraceResources.sceneBvhNodeCount);
+
+        if (!pendingUploads.empty())
+        {
+            Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+            throwIfFailed(
+                m_device.device()->CreateCommandAllocator(
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    IID_PPV_ARGS(&allocator)),
+                "Failed to create DX12 path trace upload allocator.");
+
+            Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd;
+            throwIfFailed(
+                m_device.device()->CreateCommandList(
+                    0,
+                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    allocator.Get(),
+                    nullptr,
+                    IID_PPV_ARGS(&cmd)),
+                "Failed to create DX12 path trace upload command list.");
+
+            for (PendingSceneUpload& upload : pendingUploads)
+            {
+                transitionResource(
+                    cmd.Get(),
+                    upload.destination->resource.Get(),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+
+                cmd->CopyBufferRegion(
+                    upload.destination->resource.Get(),
+                    0,
+                    upload.staging.resource.Get(),
+                    0,
+                    upload.byteSize);
+
+                transitionResource(
+                    cmd.Get(),
+                    upload.destination->resource.Get(),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
+
+            throwIfFailed(
+                cmd->Close(),
+                "Failed to close DX12 path trace upload command list.");
+
+            ID3D12CommandList* lists[] = { cmd.Get() };
+            m_device.graphicsQueue()->ExecuteCommandLists(1, lists);
+            waitForGpu();
+
+            for (PendingSceneUpload& upload : pendingUploads)
+            {
+                m_resourceAllocator.destroyBuffer(upload.staging);
+            }
+        }
+
+        m_pathTraceResources.sceneSrvs =
+            m_descriptorSystem.allocateResourceDescriptors(4);
+
+        auto writeSrv =
+            [&](const DX12Buffer& buffer,
+                uint32_t elementSize,
+                uint32_t elementCount,
+                uint32_t descriptorIndex)
+            {
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Shader4ComponentMapping =
+                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                srv.Format = DXGI_FORMAT_UNKNOWN;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+                srv.Buffer.NumElements =
+                    std::max<UINT>(1u, elementCount);
+                srv.Buffer.StructureByteStride = elementSize;
+
+                D3D12_CPU_DESCRIPTOR_HANDLE handle =
+                    m_pathTraceResources.sceneSrvs.cpuStart;
+                handle.ptr +=
+                    static_cast<SIZE_T>(descriptorIndex) *
+                    m_pathTraceResources.sceneSrvs.descriptorSize;
+
+                m_device.device()->CreateShaderResourceView(
+                    buffer.resource.Get(),
+                    &srv,
+                    handle);
+            };
+
+        writeSrv(
+            m_pathTraceResources.sceneVertices,
+            sizeof(PathTraceVertex),
+            m_pathTraceResources.sceneVertexCount,
+            0);
+        writeSrv(
+            m_pathTraceResources.sceneMaterials,
+            sizeof(PathTraceMaterial),
+            m_pathTraceResources.sceneMaterialCount,
+            1);
+        writeSrv(
+            m_pathTraceResources.sceneTriangles,
+            sizeof(PathTraceTriangle),
+            m_pathTraceResources.sceneTriangleCount,
+            2);
+        writeSrv(
+            m_pathTraceResources.sceneBvhNodes,
+            sizeof(PathTraceBVHNode),
+            m_pathTraceResources.sceneBvhNodeCount,
+            3);
+    }
+
+    void DX12Backend::destroyPathTraceSceneResources()
+    {
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.sceneVertices);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.sceneMaterials);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.sceneTriangles);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.sceneBvhNodes);
+
+        m_pathTraceResources.sceneSrvs = {};
+        m_pathTraceResources.sceneVertexCount = 0;
+        m_pathTraceResources.sceneMaterialCount = 0;
+        m_pathTraceResources.sceneTriangleCount = 0;
+        m_pathTraceResources.sceneBvhNodeCount = 0;
+    }
+
+    void DX12Backend::destroyPathTraceResources()
+    {
+        destroyPathTraceSceneResources();
+
+        m_resourceAllocator.destroyTexture(
+            m_pathTraceResources.accumulation);
+        m_resourceAllocator.destroyTexture(
+            m_pathTraceResources.tonemap);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.pathTraceConstants);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.tonemapConstants);
+
+        m_pathTraceResources = {};
+    }
+
+    void DX12Backend::updatePathTraceDescriptors()
+    {
+        if (!m_pathTraceResources.accumulation ||
+            !m_pathTraceResources.tonemap)
+        {
+            return;
+        }
+
+        m_pathTraceResources.accumulationUav =
+            m_descriptorSystem.allocateResourceDescriptors(1);
+        m_pathTraceResources.accumulationSrv =
+            m_descriptorSystem.allocateResourceDescriptors(1);
+        m_pathTraceResources.tonemapUav =
+            m_descriptorSystem.allocateResourceDescriptors(1);
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC accumulationUav{};
+        accumulationUav.Format =
+            m_pathTraceResources.accumulation.desc.Format;
+        accumulationUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+
+        m_device.device()->CreateUnorderedAccessView(
+            m_pathTraceResources.accumulation.resource.Get(),
+            nullptr,
+            &accumulationUav,
+            m_pathTraceResources.accumulationUav.cpuStart);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC accumulationSrv{};
+        accumulationSrv.Shader4ComponentMapping =
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        accumulationSrv.Format =
+            m_pathTraceResources.accumulation.desc.Format;
+        accumulationSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        accumulationSrv.Texture2D.MipLevels = 1;
+
+        m_device.device()->CreateShaderResourceView(
+            m_pathTraceResources.accumulation.resource.Get(),
+            &accumulationSrv,
+            m_pathTraceResources.accumulationSrv.cpuStart);
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC tonemapUav{};
+        tonemapUav.Format = m_pathTraceResources.tonemap.desc.Format;
+        tonemapUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+
+        m_device.device()->CreateUnorderedAccessView(
+            m_pathTraceResources.tonemap.resource.Get(),
+            nullptr,
+            &tonemapUav,
+            m_pathTraceResources.tonemapUav.cpuStart);
     }
 
     void DX12Backend::ensureComputeTestBuffer()
@@ -1220,6 +1861,172 @@ namespace ic
         cmd->ResourceBarrier(1, &barrier);
     }
 
+
+    bool DX12Backend::beginDebugGuiFrame()
+    {
+        if (!m_imguiEnabled || m_imguiFrameActive)
+        {
+            return false;
+        }
+
+        ImGui_ImplDX12_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        m_imguiFrameActive = true;
+        return true;
+    }
+
+    void DX12Backend::endDebugGuiFrame()
+    {
+        if (!m_imguiFrameActive)
+        {
+            return;
+        }
+
+        ImGui::Render();
+        m_imguiFrameActive = false;
+    }
+
+    void DX12Backend::initImGui(Window& window)
+    {
+        if (m_imguiEnabled)
+        {
+            return;
+        }
+
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        const std::filesystem::path imguiIniPath =
+            std::filesystem::path("out") / "runtime" / "imgui.ini";
+        std::filesystem::create_directories(imguiIniPath.parent_path());
+        m_imguiIniPath = imguiIniPath.string();
+        io.IniFilename = m_imguiIniPath.c_str();
+
+        ImGui::StyleColorsDark();
+
+        auto* glfwWindow =
+            static_cast<GLFWwindow*>(window.getNativeHandle());
+        if (!ImGui_ImplGlfw_InitForOther(glfwWindow, true))
+        {
+            throw std::runtime_error(
+                "Failed to initialize ImGui GLFW backend.");
+        }
+
+        ImGui_ImplDX12_InitInfo initInfo{};
+        initInfo.Device = m_device.device();
+        initInfo.CommandQueue = m_device.graphicsQueue();
+        initInfo.NumFramesInFlight =
+            static_cast<int>(std::max<size_t>(1, m_frameSync.size()));
+        initInfo.RTVFormat = m_swapchain.format();
+        initInfo.DSVFormat = DXGI_FORMAT_UNKNOWN;
+        initInfo.SrvDescriptorHeap =
+            m_descriptorSystem.shaderResourceHeap();
+        initInfo.UserData = this;
+        initInfo.SrvDescriptorAllocFn =
+            [](ImGui_ImplDX12_InitInfo* info,
+                D3D12_CPU_DESCRIPTOR_HANDLE* outCpu,
+                D3D12_GPU_DESCRIPTOR_HANDLE* outGpu)
+            {
+                auto* self = static_cast<DX12Backend*>(info->UserData);
+                DX12DescriptorAllocation allocation =
+                    self->m_descriptorSystem.allocateResourceDescriptors(1);
+                *outCpu = allocation.cpuStart;
+                *outGpu = allocation.gpuStart;
+            };
+        initInfo.SrvDescriptorFreeFn =
+            [](ImGui_ImplDX12_InitInfo*,
+                D3D12_CPU_DESCRIPTOR_HANDLE,
+                D3D12_GPU_DESCRIPTOR_HANDLE)
+            {
+            };
+
+        if (!ImGui_ImplDX12_Init(&initInfo))
+        {
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+            throw std::runtime_error(
+                "Failed to initialize ImGui DX12 backend.");
+        }
+
+        m_imguiEnabled = true;
+    }
+
+    void DX12Backend::shutdownImGui()
+    {
+        if (!m_imguiEnabled)
+        {
+            return;
+        }
+
+        ImGui_ImplDX12_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        m_imguiIniPath.clear();
+
+        m_imguiEnabled = false;
+        m_imguiFrameActive = false;
+    }
+
+    void DX12Backend::recordImGui(
+        const FrameContext& ctx,
+        ID3D12Resource* swapchainImage,
+        std::vector<ID3D12CommandList*>& commandLists)
+    {
+        if (!m_imguiEnabled)
+        {
+            return;
+        }
+
+        ImDrawData* drawData = ImGui::GetDrawData();
+        if (!drawData || drawData->TotalVtxCount == 0)
+        {
+            return;
+        }
+
+        auto lease =
+            m_commandSystem.acquireFrameCommandList(
+                static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size()),
+                0);
+
+        ID3D12GraphicsCommandList4* cmd =
+            lease.commandList();
+
+        transitionResource(
+            cmd,
+            swapchainImage,
+            D3D12_RESOURCE_STATE_PRESENT,
+            D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+            m_swapchain.currentRtv();
+        cmd->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            m_descriptorSystem.shaderResourceHeap()
+        };
+        cmd->SetDescriptorHeaps(1, heaps);
+
+        ImGui_ImplDX12_RenderDrawData(drawData, cmd);
+
+        transitionResource(
+            cmd,
+            swapchainImage,
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PRESENT);
+
+        throwIfFailed(
+            cmd->Close(),
+            "Failed to close DX12 ImGui command list.");
+
+        commandLists.push_back(
+            static_cast<ID3D12CommandList*>(cmd));
+    }
+
     D3D12_RESOURCE_STATES DX12Backend::usageToState(ResourceUsage usage) const
     {
         switch (usage)
@@ -1381,8 +2188,10 @@ namespace ic
     {
         waitForGpu();
         destroyDepthTarget();
+        destroyPathTraceResources();
         m_pipelineManager.shutdown();
         m_pipelineHandles.clear();
+        m_computePipelineHandles.clear();
         m_swapchain.resize();
         m_pipelineManager.init(m_device);
         m_resourceStates.clear();

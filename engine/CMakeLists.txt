@@ -14,6 +14,7 @@ add_library(ImageContinuumEngine ${LIB_TYPE})
 # Add source files
 target_sources(ImageContinuumEngine PRIVATE
     "include/ic/core/app_base.h" 
+    "include/ic/core/app_config.h"
     "include/ic/core/event_queue.h" 
     "include/ic/core/event_frame_buffer.h" 
     "include/ic/core/frame_context.h"
@@ -38,6 +39,8 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/render_types.h"
     "include/ic/renderer/render_pipeline.h"
     "include/ic/renderer/pipeline_library.h"
+    "include/ic/renderer/path_tracing/path_tracer_types.h"
+    "include/ic/renderer/path_tracing/path_trace_scene_builder.h"
     "include/ic/renderer/render_world.h"
     "include/ic/renderer/renderer_gpu_assets.h"
      
@@ -73,6 +76,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/scene/scene_transform_system.h"
 
     "src/ic/core/app_base.cpp" 
+    "src/ic/core/app_config.cpp"
     "src/ic/core/debug_gui_layer.cpp"
     "src/ic/core/layer_stack.cpp" 
     "src/ic/core/event_queue.cpp"
@@ -101,6 +105,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/renderer.h"
     "src/ic/renderer/renderer.cpp" 
     "src/ic/renderer/pipeline_library.cpp"
+    "src/ic/renderer/path_tracing/path_trace_scene_builder.cpp"
     "src/ic/renderer/renderer_gpu_assets.cpp"
     "include/ic/renderer/frame_graph/frame_graph_arena.h"
     "include/ic/renderer/renderer_types.h"  
@@ -176,6 +181,7 @@ target_sources(ImageContinuumEngine PRIVATE
 target_compile_definitions(ImageContinuumEngine
     PRIVATE
         $<$<CONFIG:Debug>:IC_DEBUG>
+        $<$<BOOL:${IC_DEVELOPER_BUILD}>:IC_DEVELOPER_BUILD>
 )
 
 # Define Visibility and Include Paths

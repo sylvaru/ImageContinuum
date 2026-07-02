@@ -7,6 +7,11 @@
 
 #include <spdlog/spdlog.h>
 
+GameLayer::GameLayer(std::filesystem::path scenePath)
+    : m_scenePath(std::move(scenePath))
+{
+}
+
 void GameLayer::onAttach(ic::AppServices& services)
 {
     if (!services.sceneManager)
@@ -20,10 +25,12 @@ void GameLayer::onAttach(ic::AppServices& services)
     options.makeActive = true;
 
     m_scene = services.sceneManager->loadSceneAsync(
-        "demo/res/cornell_scene.toml",
+        m_scenePath,
         options);
 
-    spdlog::info("[Demo] Queued scene load");
+    spdlog::info(
+        "[Demo] Queued scene load: {}",
+        m_scenePath.string());
 }
 
 void GameLayer::onUpdate(

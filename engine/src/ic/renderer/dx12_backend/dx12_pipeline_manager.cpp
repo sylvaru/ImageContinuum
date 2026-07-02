@@ -303,6 +303,81 @@ namespace ic
             return rootSignature;
         }
 
+        if (layout == PipelineBindingLayoutKind::PathTrace ||
+            layout == PipelineBindingLayoutKind::PathTraceTonemap)
+        {
+            D3D12_ROOT_PARAMETER rootParameters[3]{};
+
+            rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rootParameters[0].Descriptor.ShaderRegister = 0;
+            rootParameters[0].Descriptor.RegisterSpace = 0;
+            rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_DESCRIPTOR_RANGE uavRange{};
+            uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            uavRange.NumDescriptors = 1;
+            uavRange.BaseShaderRegister = 1;
+            uavRange.RegisterSpace = 0;
+            uavRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[1].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[1].DescriptorTable.pDescriptorRanges = &uavRange;
+            rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_DESCRIPTOR_RANGE srvRange{};
+            srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            srvRange.NumDescriptors =
+                layout == PipelineBindingLayoutKind::PathTrace
+                    ? 4u
+                    : 1u;
+            srvRange.BaseShaderRegister =
+                layout == PipelineBindingLayoutKind::PathTrace
+                    ? 2u
+                    : 2u;
+            srvRange.RegisterSpace = 0;
+            srvRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[2].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[2].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[2].DescriptorTable.pDescriptorRanges = &srvRange;
+            rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+            rootDesc.NumParameters = 3u;
+            rootDesc.pParameters = rootParameters;
+            rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+            Microsoft::WRL::ComPtr<ID3DBlob> signature;
+            Microsoft::WRL::ComPtr<ID3DBlob> error;
+            HRESULT hr = D3D12SerializeRootSignature(
+                &rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &signature,
+                &error);
+
+            if (FAILED(hr))
+            {
+                const char* message = error
+                    ? static_cast<const char*>(error->GetBufferPointer())
+                    : "Failed to serialize DX12 path tracing root signature.";
+                throw std::runtime_error(message);
+            }
+
+            Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+            throwIfFailed(
+                m_device->CreateRootSignature(
+                    0,
+                    signature->GetBufferPointer(),
+                    signature->GetBufferSize(),
+                    IID_PPV_ARGS(&rootSignature)),
+                "Failed to create DX12 path tracing root signature.");
+
+            return rootSignature;
+        }
+
         if (layout != PipelineBindingLayoutKind::ForwardBindless)
         {
             throw std::runtime_error(
@@ -465,6 +540,8 @@ namespace ic
             return DXGI_FORMAT_R8G8B8A8_UNORM;
         case TextureFormat::RGBA8_SRGB:
             return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        case TextureFormat::RGBA32_Float:
+            return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case TextureFormat::BGRA8_UNorm:
             return DXGI_FORMAT_B8G8R8A8_UNORM;
         case TextureFormat::BGRA8_SRGB:

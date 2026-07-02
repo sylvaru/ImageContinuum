@@ -143,7 +143,7 @@ namespace ic
     }
 
 	GraphResourceId
-		FrameGraphBuilder::createTexture()
+		FrameGraphBuilder::createTexture(const TextureDesc& desc)
 	{
 		GraphResourceId id =
 			static_cast<GraphResourceId>(
@@ -153,6 +153,9 @@ namespace ic
 			.id = id,
 			.type = GraphResourceType::Texture,
 			.ownership = ResourceOwnership::Transient,
+            .initialUsage = ResourceUsage::StorageTexture,
+            .initialAccess = AccessType::Write,
+            .textureDesc = desc,
 			.firstAccess = 0,
 			.accessCount = 0
 			});
@@ -161,7 +164,7 @@ namespace ic
 	}
 
 	GraphResourceId
-		FrameGraphBuilder::createBuffer()
+		FrameGraphBuilder::createBuffer(const BufferDesc& desc)
 	{
 		GraphResourceId id =
 			static_cast<GraphResourceId>(
@@ -171,6 +174,9 @@ namespace ic
 			.id = id,
 			.type = GraphResourceType::Buffer,
 			.ownership = ResourceOwnership::Transient,
+            .initialUsage = ResourceUsage::StorageBuffer,
+            .initialAccess = AccessType::Write,
+            .bufferDesc = desc,
 			.firstAccess = 0,
 			.accessCount = 0
 			});
@@ -203,7 +209,7 @@ namespace ic
 			GraphResourceId resource,
 			ResourceUsage usage)
 	{
-		m_nodes[node].accesses.push_back({
+		m_accesses.push_back({
 			.node = node,
 			.resource = resource,
 			.access = AccessType::Read,
@@ -216,7 +222,7 @@ namespace ic
 			GraphResourceId resource,
 			ResourceUsage usage)
 	{
-		m_nodes[node].accesses.push_back({
+		m_accesses.push_back({
 			.node = node,
 			.resource = resource,
 			.access = AccessType::Write,
@@ -229,6 +235,7 @@ namespace ic
 		m_nodes.clear();
 		m_resources.clear();
 		m_payloads.clear();
+        m_accesses.clear();
 	}
 
     void FrameGraphBuilder::setGraphicsPassPipeline(

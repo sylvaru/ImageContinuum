@@ -3,6 +3,7 @@
 #include "ic/core/asset_manager.h"
 #include "ic/renderer/pipeline_library.h"
 #include "ic/renderer/renderer_specification.h"
+#include "ic/renderer/path_tracing/path_trace_scene_builder.h"
 #include "ic/interface/window.h"
 #include "ic/core/frame_context.h"
 #include "ic/scene/scene_render_view.h"
@@ -16,11 +17,131 @@
 #include <backends/imgui_impl_vulkan.h>
 
 #include <algorithm>
-#include <future>
+#include <cmath>
+#include <cstring>
 #include <unordered_map>
 
 namespace ic
 {
+    namespace
+    {
+        constexpr uint32_t DefaultPathTraceMaxBounces = 4;
+        constexpr uint32_t DefaultPathTraceSamplesPerPixel = 2;
+
+        struct PathTraceConstants
+        {
+            uint32_t renderWidth = 0;
+            uint32_t renderHeight = 0;
+            uint32_t frameIndex = 0;
+            uint32_t accumulatedSampleCount = 0;
+
+            float exposure = 1.0f;
+            uint32_t resetAccumulation = 1;
+            uint32_t maxBounces = 4;
+            uint32_t samplesPerPixel = 1;
+
+            uint32_t sceneVertexCount = 0;
+            uint32_t sceneMaterialCount = 0;
+            uint32_t sceneTriangleCount = 0;
+            uint32_t sceneBvhNodeCount = 0;
+
+            uint32_t useSceneGeometry = 0;
+            uint32_t padding0 = 0;
+            uint32_t padding1 = 0;
+            uint32_t padding2 = 0;
+
+            glm::vec4 cameraPositionAndTanHalfFov = glm::vec4(0.0f);
+            glm::vec4 cameraForwardAndAspect = glm::vec4(0.0f);
+            glm::vec4 cameraRightAndNear = glm::vec4(0.0f);
+            glm::vec4 cameraUpAndFar = glm::vec4(0.0f);
+        };
+
+        struct TonemapConstants
+        {
+            uint32_t renderWidth = 0;
+            uint32_t renderHeight = 0;
+            float exposure = 1.0f;
+            uint32_t padding0 = 0;
+        };
+
+        static_assert(sizeof(PathTraceConstants) == 128);
+        static_assert(sizeof(TonemapConstants) == 16);
+
+        bool matricesDiffer(const glm::mat4& a, const glm::mat4& b)
+        {
+            constexpr float CameraMatrixEpsilon = 1.0e-5f;
+            for (glm::length_t column = 0; column < 4; ++column)
+            {
+                for (glm::length_t row = 0; row < 4; ++row)
+                {
+                    if (std::fabs(a[column][row] - b[column][row]) >
+                        CameraMatrixEpsilon)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        void fillPathTraceCameraConstants(
+            const SceneCameraView& camera,
+            uint32_t width,
+            uint32_t height,
+            PathTraceConstants& constants)
+        {
+            const float fallbackAspect =
+                height == 0u
+                    ? 1.0f
+                    : static_cast<float>(width) / static_cast<float>(height);
+
+            if (camera.valid != 0u)
+            {
+                const glm::mat4 inverseView = glm::inverse(camera.view);
+                const glm::vec3 right =
+                    glm::normalize(glm::vec3(inverseView[0]));
+                const glm::vec3 up =
+                    glm::normalize(glm::vec3(inverseView[1]));
+                const glm::vec3 forward =
+                    glm::normalize(-glm::vec3(inverseView[2]));
+                const float aspect =
+                    camera.aspectRatio > 0.0f
+                        ? camera.aspectRatio
+                        : fallbackAspect;
+                const float tanHalfFov =
+                    std::tan(camera.verticalFovRadians * 0.5f);
+
+                constants.cameraPositionAndTanHalfFov =
+                    glm::vec4(camera.position, tanHalfFov);
+                constants.cameraForwardAndAspect =
+                    glm::vec4(forward, aspect);
+                constants.cameraRightAndNear =
+                    glm::vec4(right, camera.nearPlane);
+                constants.cameraUpAndFar =
+                    glm::vec4(up, camera.farPlane);
+                return;
+            }
+
+            const glm::vec3 origin(0.0f, 1.05f, -3.25f);
+            const glm::vec3 target(0.0f, 0.95f, 0.95f);
+            const glm::vec3 forward = glm::normalize(target - origin);
+            const glm::vec3 right =
+                glm::normalize(
+                    glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
+            const glm::vec3 up = glm::normalize(glm::cross(right, forward));
+
+            constants.cameraPositionAndTanHalfFov =
+                glm::vec4(origin, std::tan(glm::radians(39.0f) * 0.5f));
+            constants.cameraForwardAndAspect =
+                glm::vec4(forward, fallbackAspect);
+            constants.cameraRightAndNear =
+                glm::vec4(right, 0.1f);
+            constants.cameraUpAndFar =
+                glm::vec4(up, 100.0f);
+        }
+    }
+
 	void VulkanBackend::initialize(
 		const RendererSpecification& spec,
         const PipelineLibrary& pipelineLibrary,
@@ -76,7 +197,7 @@ namespace ic
         m_sceneFrameResources.resize(framesInFlight);
         m_pipelineLibrary = &pipelineLibrary;
 
-        if (spec.enableImGui)
+        if (spec.useDebugGui)
         {
             initImGui(window);
         }
@@ -246,6 +367,11 @@ namespace ic
 
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        const std::filesystem::path imguiIniPath =
+            std::filesystem::path("out") / "runtime" / "imgui.ini";
+        std::filesystem::create_directories(imguiIniPath.parent_path());
+        m_imguiIniPath = imguiIniPath.string();
+        io.IniFilename = m_imguiIniPath.c_str();
 
         ImGui::StyleColorsDark();
 
@@ -302,6 +428,7 @@ namespace ic
         ImGui_ImplVulkan_Shutdown();
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
+        m_imguiIniPath.clear();
 
         m_imguiEnabled = false;
         m_imguiFrameActive = false;
@@ -494,24 +621,15 @@ namespace ic
             return;
         }
 
-        for (const std::pmr::vector<GraphNodeId>& level : plan.executionLevels)
+        for (const ExecutionLevel& level : plan.executionLevels)
         {
-            std::vector<std::future<VkCommandBuffer>> futures;
-            futures.reserve(level.size());
-
-            for (uint32_t i = 0; i < level.size(); ++i)
+            for (uint32_t i = 0; i < level.nodeCount; ++i)
             {
-                futures.push_back(
-                    std::async(
-                        std::launch::async,
-                        recordNode,
-                        level[i],
-                        i % m_workerSlots));
-            }
+                const GraphNodeId nodeId =
+                    plan.executionLevelNodes[level.firstNode + i];
 
-            for (auto& future : futures)
-            {
-                commandBuffers.push_back(future.get());
+                commandBuffers.push_back(
+                    recordNode(nodeId, i % m_workerSlots));
             }
         }
     }
@@ -658,11 +776,11 @@ namespace ic
             break;
 
         case GraphNodeType::Compute:
-            executeComputeNode(plan, node, ctx, cmd);
+            executeComputeNode(plan, node, ctx, scene, cmd);
             break;
 
         case GraphNodeType::Transfer:
-            executeTransferNode(plan, node, ctx, cmd);
+            executeTransferNode(plan, node, ctx, cmd, swapchainImage);
             break;
 
         case GraphNodeType::Present:
@@ -672,7 +790,7 @@ namespace ic
 
     void VulkanBackend::executeGraphicsNode(
         const CompiledGraphPlan& plan,
-        [[maybe_unused]] const ExecutionNode& node,
+        const ExecutionNode& node,
         const FrameContext& ctx,
         const SceneRenderView& scene,
         VkCommandBuffer cmd,
@@ -869,10 +987,23 @@ namespace ic
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
         [[maybe_unused]] const FrameContext& ctx,
+        [[maybe_unused]] const SceneRenderView& scene,
         [[maybe_unused]] VkCommandBuffer cmd)
     {
         if (node.payloadIndex >= plan.payloads.size())
         {
+            return;
+        }
+
+        if (std::get_if<PathTracePassData>(&plan.payloads[node.payloadIndex]))
+        {
+            executePathTraceNode(plan, node, ctx, scene, cmd);
+            return;
+        }
+
+        if (std::get_if<TonemapPassData>(&plan.payloads[node.payloadIndex]))
+        {
+            executeTonemapNode(plan, node, cmd);
             return;
         }
 
@@ -942,11 +1073,246 @@ namespace ic
         }
     }
 
+    void VulkanBackend::executePathTraceNode(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        VkCommandBuffer cmd)
+    {
+        VulkanComputePipeline* pipeline =
+            m_pipelineManager.computePipeline(
+                computePipelineForNode(plan, node));
+        if (!pipeline)
+        {
+            return;
+        }
+
+        ensurePathTraceResources();
+        ensurePathTraceSceneResources(ctx, scene);
+        updatePathTraceDescriptors(pipeline, nullptr);
+
+        if (!m_pathTraceResources.accumulation ||
+            m_pathTraceResources.pathTraceDescriptorSet == VK_NULL_HANDLE)
+        {
+            return;
+        }
+
+        const bool hasCamera = scene.camera.valid != 0u;
+        const bool cameraChanged =
+            hasCamera &&
+            (!m_pathTraceResources.hasPreviousCamera ||
+                matricesDiffer(scene.camera.view, m_pathTraceResources.previousView) ||
+                matricesDiffer(
+                    scene.camera.projection,
+                    m_pathTraceResources.previousProjection));
+
+        if (cameraChanged)
+        {
+            m_pathTraceResources.accumulatedSampleCount = 0;
+            m_pathTraceResources.resetAccumulation = true;
+            m_pathTraceResources.previousView = scene.camera.view;
+            m_pathTraceResources.previousProjection = scene.camera.projection;
+            m_pathTraceResources.hasPreviousCamera = true;
+        }
+        else if (!hasCamera)
+        {
+            m_pathTraceResources.hasPreviousCamera = false;
+        }
+
+        if (m_pathTraceResources.accumulationLayout !=
+            VK_IMAGE_LAYOUT_GENERAL)
+        {
+            transitionImage(
+                cmd,
+                m_pathTraceResources.accumulation.image,
+                m_pathTraceResources.accumulationLayout,
+                VK_IMAGE_LAYOUT_GENERAL,
+                m_pathTraceResources.accumulationLayout ==
+                    VK_IMAGE_LAYOUT_UNDEFINED
+                        ? 0
+                        : VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                m_pathTraceResources.accumulationLayout ==
+                    VK_IMAGE_LAYOUT_UNDEFINED
+                        ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                        : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            m_pathTraceResources.accumulationLayout =
+                VK_IMAGE_LAYOUT_GENERAL;
+        }
+
+        PathTraceConstants constants{};
+        constants.renderWidth = m_pathTraceResources.width;
+        constants.renderHeight = m_pathTraceResources.height;
+        constants.frameIndex = static_cast<uint32_t>(ctx.frameIndex);
+        constants.accumulatedSampleCount =
+            m_pathTraceResources.accumulatedSampleCount;
+        constants.exposure = 1.0f;
+        constants.resetAccumulation =
+            m_pathTraceResources.resetAccumulation ? 1u : 0u;
+        constants.maxBounces = DefaultPathTraceMaxBounces;
+        constants.samplesPerPixel = DefaultPathTraceSamplesPerPixel;
+        constants.sceneVertexCount =
+            m_pathTraceResources.sceneVertexCount;
+        constants.sceneMaterialCount =
+            m_pathTraceResources.sceneMaterialCount;
+        constants.sceneTriangleCount =
+            m_pathTraceResources.sceneTriangleCount;
+        constants.sceneBvhNodeCount =
+            m_pathTraceResources.sceneBvhNodeCount;
+        constants.useSceneGeometry =
+            m_pathTraceResources.sceneTriangleCount != 0u &&
+            m_pathTraceResources.sceneBvhNodeCount != 0u
+                ? 1u
+                : 0u;
+        fillPathTraceCameraConstants(
+            scene.camera,
+            m_pathTraceResources.width,
+            m_pathTraceResources.height,
+            constants);
+
+        std::memcpy(
+            m_pathTraceResources.pathTraceConstants.mapped,
+            &constants,
+            sizeof(constants));
+        m_resourceAllocator.flush(
+            m_pathTraceResources.pathTraceConstants,
+            0,
+            sizeof(constants));
+
+        vkCmdBindPipeline(
+            cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline->pipeline);
+        vkCmdBindDescriptorSets(
+            cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline->pipelineLayout,
+            0,
+            1,
+            &m_pathTraceResources.pathTraceDescriptorSet,
+            0,
+            nullptr);
+
+        const uint32_t groupCountX =
+            (m_pathTraceResources.width + 7u) / 8u;
+        const uint32_t groupCountY =
+            (m_pathTraceResources.height + 7u) / 8u;
+        vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
+
+        ++m_pathTraceResources.accumulatedSampleCount;
+        m_pathTraceResources.resetAccumulation = false;
+    }
+
+    void VulkanBackend::executeTonemapNode(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        VkCommandBuffer cmd)
+    {
+        VulkanComputePipeline* pipeline =
+            m_pipelineManager.computePipeline(
+                computePipelineForNode(plan, node));
+        if (!pipeline)
+        {
+            return;
+        }
+
+        ensurePathTraceResources();
+        updatePathTraceDescriptors(nullptr, pipeline);
+
+        if (!m_pathTraceResources.accumulation ||
+            !m_pathTraceResources.tonemap ||
+            m_pathTraceResources.tonemapDescriptorSet == VK_NULL_HANDLE)
+        {
+            return;
+        }
+
+        if (m_pathTraceResources.accumulationLayout !=
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
+        {
+            transitionImage(
+                cmd,
+                m_pathTraceResources.accumulation.image,
+                m_pathTraceResources.accumulationLayout,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                m_pathTraceResources.accumulationLayout ==
+                    VK_IMAGE_LAYOUT_UNDEFINED
+                        ? 0
+                        : VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT,
+                m_pathTraceResources.accumulationLayout ==
+                    VK_IMAGE_LAYOUT_UNDEFINED
+                        ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                        : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            m_pathTraceResources.accumulationLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        if (m_pathTraceResources.tonemapLayout !=
+            VK_IMAGE_LAYOUT_GENERAL)
+        {
+            transitionImage(
+                cmd,
+                m_pathTraceResources.tonemap.image,
+                m_pathTraceResources.tonemapLayout,
+                VK_IMAGE_LAYOUT_GENERAL,
+                m_pathTraceResources.tonemapLayout ==
+                    VK_IMAGE_LAYOUT_UNDEFINED
+                        ? 0
+                        : VK_ACCESS_TRANSFER_READ_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT,
+                m_pathTraceResources.tonemapLayout ==
+                    VK_IMAGE_LAYOUT_UNDEFINED
+                        ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                        : VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            m_pathTraceResources.tonemapLayout =
+                VK_IMAGE_LAYOUT_GENERAL;
+        }
+
+        TonemapConstants constants{};
+        constants.renderWidth = m_pathTraceResources.width;
+        constants.renderHeight = m_pathTraceResources.height;
+        constants.exposure = 1.0f;
+
+        std::memcpy(
+            m_pathTraceResources.tonemapConstants.mapped,
+            &constants,
+            sizeof(constants));
+        m_resourceAllocator.flush(
+            m_pathTraceResources.tonemapConstants,
+            0,
+            sizeof(constants));
+
+        vkCmdBindPipeline(
+            cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline->pipeline);
+        vkCmdBindDescriptorSets(
+            cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline->pipelineLayout,
+            0,
+            1,
+            &m_pathTraceResources.tonemapDescriptorSet,
+            0,
+            nullptr);
+
+        const uint32_t groupCountX =
+            (m_pathTraceResources.width + 7u) / 8u;
+        const uint32_t groupCountY =
+            (m_pathTraceResources.height + 7u) / 8u;
+        vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
+    }
+
     void VulkanBackend::executeTransferNode(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
         [[maybe_unused]] const FrameContext& ctx,
-        [[maybe_unused]] VkCommandBuffer cmd)
+        VkCommandBuffer cmd,
+        VkImage swapchainImage)
     {
         if (node.payloadIndex >= plan.payloads.size())
         {
@@ -958,6 +1324,47 @@ namespace ic
         if (!pass)
         {
             return;
+        }
+
+        if (pass->name == "PathTracer.CopyToBackBuffer" &&
+            m_pathTraceResources.tonemap &&
+            swapchainImage != VK_NULL_HANDLE)
+        {
+            if (m_pathTraceResources.tonemapLayout !=
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
+            {
+                transitionImage(
+                    cmd,
+                    m_pathTraceResources.tonemap.image,
+                    m_pathTraceResources.tonemapLayout,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+                m_pathTraceResources.tonemapLayout =
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            }
+
+            VkImageCopy copy{};
+            copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copy.srcSubresource.layerCount = 1;
+            copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copy.dstSubresource.layerCount = 1;
+            copy.extent = {
+                m_pathTraceResources.width,
+                m_pathTraceResources.height,
+                1
+            };
+
+            vkCmdCopyImage(
+                cmd,
+                m_pathTraceResources.tonemap.image,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                swapchainImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                &copy);
         }
     }
 
@@ -1006,14 +1413,30 @@ namespace ic
             return {};
         }
 
-        const ComputePassData* pass =
-            std::get_if<ComputePassData>(&plan.payloads[node.payloadIndex]);
-        if (!pass || !pass->pipeline)
+        PipelineId pipelineId{};
+
+        if (const ComputePassData* computePass =
+            std::get_if<ComputePassData>(&plan.payloads[node.payloadIndex]))
+        {
+            pipelineId = computePass->pipeline;
+        }
+        else if (const PathTracePassData* pathTracePass =
+            std::get_if<PathTracePassData>(&plan.payloads[node.payloadIndex]))
+        {
+            pipelineId = pathTracePass->pipeline;
+        }
+        else if (const TonemapPassData* tonemapPass =
+            std::get_if<TonemapPassData>(&plan.payloads[node.payloadIndex]))
+        {
+            pipelineId = tonemapPass->pipeline;
+        }
+
+        if (!pipelineId)
         {
             return {};
         }
 
-        auto it = m_computePipelineHandles.find(pass->pipeline);
+        auto it = m_computePipelineHandles.find(pipelineId);
         if (it != m_computePipelineHandles.end())
         {
             return it->second;
@@ -1021,18 +1444,19 @@ namespace ic
 
         ComputePipelineDesc desc =
             m_pipelineLibrary->resolveCompute(
-                pass->pipeline,
+                pipelineId,
                 RendererBackendType::Vulkan);
 
         ComputePipelineHandle handle =
             m_pipelineManager.requestComputePipeline(desc);
-        m_computePipelineHandles.emplace(pass->pipeline, handle);
+        m_computePipelineHandles.emplace(pipelineId, handle);
         return handle;
     }
 
     void VulkanBackend::destroySceneResources()
     {
         destroyDepthTarget();
+        destroyPathTraceResources();
 
         if (m_computeTestDescriptorPool != VK_NULL_HANDLE)
         {
@@ -1072,6 +1496,635 @@ namespace ic
 
         m_pipelineHandles.clear();
         m_computePipelineHandles.clear();
+    }
+
+    void VulkanBackend::ensurePathTraceResources()
+    {
+        const VkExtent2D extent = m_swapchain.extent();
+        if (extent.width == 0 || extent.height == 0)
+        {
+            return;
+        }
+
+        if (m_pathTraceResources.accumulation &&
+            m_pathTraceResources.tonemap &&
+            m_pathTraceResources.width == extent.width &&
+            m_pathTraceResources.height == extent.height)
+        {
+            return;
+        }
+
+        destroyPathTraceResources();
+
+        m_pathTraceResources.width = extent.width;
+        m_pathTraceResources.height = extent.height;
+        m_pathTraceResources.accumulatedSampleCount = 0;
+        m_pathTraceResources.resetAccumulation = true;
+
+        m_pathTraceResources.accumulation =
+            m_resourceAllocator.createTexture({
+                .width = extent.width,
+                .height = extent.height,
+                .format = TextureFormat::RGBA32_Float,
+                .usage =
+                    TextureUsageFlags::Storage |
+                    TextureUsageFlags::Sampled,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "Vulkan path trace accumulation"
+            });
+        m_pathTraceResources.accumulationLayout =
+            VK_IMAGE_LAYOUT_UNDEFINED;
+        m_pathTraceResources.accumulationView =
+            createTextureView(m_pathTraceResources.accumulation);
+
+        m_pathTraceResources.tonemap =
+            m_resourceAllocator.createTexture({
+                .width = extent.width,
+                .height = extent.height,
+                .format = TextureFormat::RGBA8_UNorm,
+                .usage =
+                    TextureUsageFlags::Storage |
+                    TextureUsageFlags::TransferSrc,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "Vulkan path trace tonemap"
+            });
+        m_pathTraceResources.tonemapLayout =
+            VK_IMAGE_LAYOUT_UNDEFINED;
+        m_pathTraceResources.tonemapView =
+            createTextureView(m_pathTraceResources.tonemap);
+
+        m_pathTraceResources.pathTraceConstants =
+            m_resourceAllocator.createBuffer({
+                .size = sizeof(PathTraceConstants),
+                .usage = BufferUsageFlags::Constant,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = "Vulkan path trace constants"
+            });
+
+        m_pathTraceResources.tonemapConstants =
+            m_resourceAllocator.createBuffer({
+                .size = sizeof(TonemapConstants),
+                .usage = BufferUsageFlags::Constant,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = "Vulkan path trace tonemap constants"
+            });
+
+        VkDescriptorPoolSize poolSizes[4]{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[0].descriptorCount = 2;
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        poolSizes[1].descriptorCount = 2;
+        poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        poolSizes[2].descriptorCount = 1;
+        poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        poolSizes[3].descriptorCount = 4;
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.maxSets = 2;
+        poolInfo.poolSizeCount =
+            static_cast<uint32_t>(std::size(poolSizes));
+        poolInfo.pPoolSizes = poolSizes;
+
+        if (vkCreateDescriptorPool(
+                m_device.device(),
+                &poolInfo,
+                nullptr,
+                &m_pathTraceResources.descriptorPool) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to create Vulkan path tracing descriptor pool.");
+        }
+
+        m_pathTraceResources.pathTraceDescriptorsDirty = true;
+        m_pathTraceResources.tonemapDescriptorsDirty = true;
+    }
+
+    void VulkanBackend::ensurePathTraceSceneResources(
+        const FrameContext& ctx,
+        const SceneRenderView& scene)
+    {
+        if (!ctx.services || !ctx.services->assetManager)
+        {
+            if (!m_pathTraceResources.sceneVertices)
+            {
+                uploadPathTraceScene({});
+            }
+            return;
+        }
+
+        const bool retryPendingScene =
+            m_pathTraceResources.sceneTriangleCount == 0u &&
+            !scene.models.empty();
+        const bool retryThisFrame =
+            retryPendingScene &&
+            (m_pathTraceResources.lastSceneBuildFrame == UINT64_MAX ||
+                ctx.frameIndex - m_pathTraceResources.lastSceneBuildFrame >=
+                    30u);
+        if (m_pathTraceResources.sceneVersion == scene.sceneVersion &&
+            !retryThisFrame &&
+            m_pathTraceResources.sceneVertices)
+        {
+            return;
+        }
+
+        m_pathTraceResources.lastSceneBuildFrame = ctx.frameIndex;
+
+        PathTraceSceneData sceneData =
+            buildPathTraceSceneData(
+                scene,
+                *ctx.services->assetManager);
+        if (sceneData.triangles.empty() &&
+            m_pathTraceResources.sceneVertices)
+        {
+            return;
+        }
+
+        uploadPathTraceScene(sceneData);
+
+        m_pathTraceResources.sceneVersion = scene.sceneVersion;
+        m_pathTraceResources.accumulatedSampleCount = 0;
+        m_pathTraceResources.resetAccumulation = true;
+    }
+
+    void VulkanBackend::uploadPathTraceScene(
+        const PathTraceSceneData& sceneData)
+    {
+        if (m_device.device() != VK_NULL_HANDLE &&
+            (m_pathTraceResources.sceneVertices ||
+                m_pathTraceResources.pathTraceDescriptorSet != VK_NULL_HANDLE))
+        {
+            vkDeviceWaitIdle(m_device.device());
+        }
+
+        destroyPathTraceSceneResources();
+
+        m_pathTraceResources.sceneVertexCount =
+            static_cast<uint32_t>(sceneData.vertices.size());
+        m_pathTraceResources.sceneMaterialCount =
+            static_cast<uint32_t>(sceneData.materials.size());
+        m_pathTraceResources.sceneTriangleCount =
+            static_cast<uint32_t>(sceneData.triangles.size());
+        m_pathTraceResources.sceneBvhNodeCount =
+            static_cast<uint32_t>(sceneData.bvhNodes.size());
+
+        struct PendingSceneUpload
+        {
+            VulkanBuffer* destination = nullptr;
+            VulkanBuffer staging;
+            VkDeviceSize byteSize = 0;
+        };
+
+        std::vector<PendingSceneUpload> pendingUploads;
+        pendingUploads.reserve(4);
+
+        auto createBuffer =
+            [&](VkDeviceSize elementSize,
+                uint32_t elementCount,
+                const void* data,
+                const char* debugName)
+            {
+                const VkDeviceSize byteSize =
+                    elementSize * std::max<uint32_t>(1u, elementCount);
+
+                VulkanBuffer buffer =
+                    m_resourceAllocator.createBuffer({
+                        .size = byteSize,
+                        .usage =
+                            BufferUsageFlags::Storage |
+                            BufferUsageFlags::TransferDst,
+                        .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                        .mappedAtCreation = false,
+                        .debugName = debugName
+                    });
+
+                if (elementCount != 0u && data)
+                {
+                    VulkanBuffer staging =
+                        m_resourceAllocator.createBuffer({
+                            .size = byteSize,
+                            .usage = BufferUsageFlags::TransferSrc,
+                            .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                            .mappedAtCreation = true,
+                            .debugName = "Vulkan path trace scene staging"
+                        });
+
+                    std::memcpy(
+                        staging.mapped,
+                        data,
+                        static_cast<size_t>(elementSize * elementCount));
+                    m_resourceAllocator.flush(
+                        staging,
+                        0,
+                        elementSize * elementCount);
+
+                    pendingUploads.push_back({
+                        .destination = nullptr,
+                        .staging = std::move(staging),
+                        .byteSize = elementSize * elementCount
+                    });
+                }
+
+                return buffer;
+            };
+
+        m_pathTraceResources.sceneVertices =
+            createBuffer(
+                sizeof(PathTraceVertex),
+                m_pathTraceResources.sceneVertexCount,
+                sceneData.vertices.data(),
+                "Vulkan path trace scene vertices");
+        m_pathTraceResources.sceneMaterials =
+            createBuffer(
+                sizeof(PathTraceMaterial),
+                m_pathTraceResources.sceneMaterialCount,
+                sceneData.materials.data(),
+                "Vulkan path trace scene materials");
+        m_pathTraceResources.sceneTriangles =
+            createBuffer(
+                sizeof(PathTraceTriangle),
+                m_pathTraceResources.sceneTriangleCount,
+                sceneData.triangles.data(),
+                "Vulkan path trace scene triangles");
+        m_pathTraceResources.sceneBvhNodes =
+            createBuffer(
+                sizeof(PathTraceBVHNode),
+                m_pathTraceResources.sceneBvhNodeCount,
+                sceneData.bvhNodes.data(),
+                "Vulkan path trace scene BVH nodes");
+
+        uint32_t uploadIndex = 0;
+        auto bindPendingUpload =
+            [&](VulkanBuffer& destination, uint32_t elementCount)
+            {
+                if (elementCount == 0u)
+                {
+                    return;
+                }
+
+                pendingUploads[uploadIndex++].destination = &destination;
+            };
+
+        bindPendingUpload(
+            m_pathTraceResources.sceneVertices,
+            m_pathTraceResources.sceneVertexCount);
+        bindPendingUpload(
+            m_pathTraceResources.sceneMaterials,
+            m_pathTraceResources.sceneMaterialCount);
+        bindPendingUpload(
+            m_pathTraceResources.sceneTriangles,
+            m_pathTraceResources.sceneTriangleCount);
+        bindPendingUpload(
+            m_pathTraceResources.sceneBvhNodes,
+            m_pathTraceResources.sceneBvhNodeCount);
+
+        if (!pendingUploads.empty())
+        {
+            m_commandSystem.immediateSubmit(
+                m_device.graphicsQueue(),
+                [&](VkCommandBuffer cmd)
+                {
+                    for (const PendingSceneUpload& upload : pendingUploads)
+                    {
+                        VkBufferCopy copy{};
+                        copy.size = upload.byteSize;
+
+                        vkCmdCopyBuffer(
+                            cmd,
+                            upload.staging.buffer,
+                            upload.destination->buffer,
+                            1,
+                            &copy);
+
+                        VkBufferMemoryBarrier barrier{};
+                        barrier.sType =
+                            VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                        barrier.srcAccessMask =
+                            VK_ACCESS_TRANSFER_WRITE_BIT;
+                        barrier.dstAccessMask =
+                            VK_ACCESS_SHADER_READ_BIT;
+                        barrier.srcQueueFamilyIndex =
+                            VK_QUEUE_FAMILY_IGNORED;
+                        barrier.dstQueueFamilyIndex =
+                            VK_QUEUE_FAMILY_IGNORED;
+                        barrier.buffer = upload.destination->buffer;
+                        barrier.offset = 0;
+                        barrier.size = upload.byteSize;
+
+                        vkCmdPipelineBarrier(
+                            cmd,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            0,
+                            0,
+                            nullptr,
+                            1,
+                            &barrier,
+                            0,
+                            nullptr);
+                    }
+                });
+
+            for (PendingSceneUpload& upload : pendingUploads)
+            {
+                m_resourceAllocator.destroyBuffer(upload.staging);
+            }
+        }
+
+        m_pathTraceResources.pathTraceDescriptorsDirty = true;
+    }
+
+    void VulkanBackend::destroyPathTraceSceneResources()
+    {
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.sceneVertices);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.sceneMaterials);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.sceneTriangles);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.sceneBvhNodes);
+
+        m_pathTraceResources.sceneVertexCount = 0;
+        m_pathTraceResources.sceneMaterialCount = 0;
+        m_pathTraceResources.sceneTriangleCount = 0;
+        m_pathTraceResources.sceneBvhNodeCount = 0;
+    }
+
+    void VulkanBackend::destroyPathTraceResources()
+    {
+        VkDevice device = m_device.device();
+
+        if (device != VK_NULL_HANDLE)
+        {
+            if (m_pathTraceResources.accumulationView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_pathTraceResources.accumulationView,
+                    nullptr);
+            }
+
+            if (m_pathTraceResources.tonemapView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_pathTraceResources.tonemapView,
+                    nullptr);
+            }
+
+            if (m_pathTraceResources.descriptorPool != VK_NULL_HANDLE)
+            {
+                vkDestroyDescriptorPool(
+                    device,
+                    m_pathTraceResources.descriptorPool,
+                    nullptr);
+            }
+        }
+
+        destroyPathTraceSceneResources();
+
+        m_resourceAllocator.destroyTexture(
+            m_pathTraceResources.accumulation);
+        m_resourceAllocator.destroyTexture(
+            m_pathTraceResources.tonemap);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.pathTraceConstants);
+        m_resourceAllocator.destroyBuffer(
+            m_pathTraceResources.tonemapConstants);
+
+        m_pathTraceResources = {};
+    }
+
+    VkImageView VulkanBackend::createTextureView(
+        const VulkanTexture& texture) const
+    {
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = texture.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = texture.format;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        VkImageView view = VK_NULL_HANDLE;
+        if (vkCreateImageView(
+                m_device.device(),
+                &viewInfo,
+                nullptr,
+                &view) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to create Vulkan path tracing texture view.");
+        }
+
+        return view;
+    }
+
+    void VulkanBackend::updatePathTraceDescriptors(
+        const VulkanComputePipeline* pathTracePipeline,
+        const VulkanComputePipeline* tonemapPipeline)
+    {
+        if (m_pathTraceResources.descriptorPool == VK_NULL_HANDLE)
+        {
+            return;
+        }
+
+        if (pathTracePipeline)
+        {
+            bool updateDescriptors =
+                m_pathTraceResources.pathTraceDescriptorsDirty;
+
+            if (m_pathTraceResources.pathTraceDescriptorSet ==
+                VK_NULL_HANDLE)
+            {
+                VkDescriptorSetAllocateInfo allocateInfo{};
+                allocateInfo.sType =
+                    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                allocateInfo.descriptorPool =
+                    m_pathTraceResources.descriptorPool;
+                allocateInfo.descriptorSetCount = 1;
+                allocateInfo.pSetLayouts =
+                    &pathTracePipeline->descriptorSetLayout;
+
+                if (vkAllocateDescriptorSets(
+                        m_device.device(),
+                        &allocateInfo,
+                        &m_pathTraceResources.pathTraceDescriptorSet) !=
+                    VK_SUCCESS)
+                {
+                    throw std::runtime_error(
+                        "Failed to allocate Vulkan path trace descriptor set.");
+                }
+
+                updateDescriptors = true;
+            }
+
+            if (!updateDescriptors)
+            {
+                return;
+            }
+
+            VkDescriptorBufferInfo constantsInfo{};
+            constantsInfo.buffer =
+                m_pathTraceResources.pathTraceConstants.buffer;
+            constantsInfo.range = sizeof(PathTraceConstants);
+
+            VkDescriptorBufferInfo vertexInfo{};
+            vertexInfo.buffer = m_pathTraceResources.sceneVertices.buffer;
+            vertexInfo.range = m_pathTraceResources.sceneVertices.size;
+
+            VkDescriptorBufferInfo materialInfo{};
+            materialInfo.buffer = m_pathTraceResources.sceneMaterials.buffer;
+            materialInfo.range = m_pathTraceResources.sceneMaterials.size;
+
+            VkDescriptorBufferInfo triangleInfo{};
+            triangleInfo.buffer = m_pathTraceResources.sceneTriangles.buffer;
+            triangleInfo.range = m_pathTraceResources.sceneTriangles.size;
+
+            VkDescriptorBufferInfo bvhInfo{};
+            bvhInfo.buffer = m_pathTraceResources.sceneBvhNodes.buffer;
+            bvhInfo.range = m_pathTraceResources.sceneBvhNodes.size;
+
+            VkDescriptorImageInfo accumulationInfo{};
+            accumulationInfo.imageView =
+                m_pathTraceResources.accumulationView;
+            accumulationInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkWriteDescriptorSet writes[6]{};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet =
+                m_pathTraceResources.pathTraceDescriptorSet;
+            writes[0].dstBinding = 0;
+            writes[0].descriptorCount = 1;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].pBufferInfo = &constantsInfo;
+
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet =
+                m_pathTraceResources.pathTraceDescriptorSet;
+            writes[1].dstBinding = 1;
+            writes[1].descriptorCount = 1;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[1].pImageInfo = &accumulationInfo;
+
+            VkDescriptorBufferInfo* sceneInfos[4] =
+            {
+                &vertexInfo,
+                &materialInfo,
+                &triangleInfo,
+                &bvhInfo
+            };
+
+            for (uint32_t i = 0; i < 4; ++i)
+            {
+                writes[2 + i].sType =
+                    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[2 + i].dstSet =
+                    m_pathTraceResources.pathTraceDescriptorSet;
+                writes[2 + i].dstBinding = 2 + i;
+                writes[2 + i].descriptorCount = 1;
+                writes[2 + i].descriptorType =
+                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                writes[2 + i].pBufferInfo = sceneInfos[i];
+            }
+
+            vkUpdateDescriptorSets(
+                m_device.device(),
+                static_cast<uint32_t>(std::size(writes)),
+                writes,
+                0,
+                nullptr);
+
+            m_pathTraceResources.pathTraceDescriptorsDirty = false;
+        }
+
+        if (tonemapPipeline)
+        {
+            bool updateDescriptors =
+                m_pathTraceResources.tonemapDescriptorsDirty;
+
+            if (m_pathTraceResources.tonemapDescriptorSet == VK_NULL_HANDLE)
+            {
+                VkDescriptorSetAllocateInfo allocateInfo{};
+                allocateInfo.sType =
+                    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                allocateInfo.descriptorPool =
+                    m_pathTraceResources.descriptorPool;
+                allocateInfo.descriptorSetCount = 1;
+                allocateInfo.pSetLayouts =
+                    &tonemapPipeline->descriptorSetLayout;
+
+                if (vkAllocateDescriptorSets(
+                        m_device.device(),
+                        &allocateInfo,
+                        &m_pathTraceResources.tonemapDescriptorSet) !=
+                    VK_SUCCESS)
+                {
+                    throw std::runtime_error(
+                        "Failed to allocate Vulkan path trace tonemap descriptor set.");
+                }
+
+                updateDescriptors = true;
+            }
+
+            if (!updateDescriptors)
+            {
+                return;
+            }
+
+            VkDescriptorBufferInfo constantsInfo{};
+            constantsInfo.buffer =
+                m_pathTraceResources.tonemapConstants.buffer;
+            constantsInfo.range = sizeof(TonemapConstants);
+
+            VkDescriptorImageInfo tonemapInfo{};
+            tonemapInfo.imageView = m_pathTraceResources.tonemapView;
+            tonemapInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo accumulationInfo{};
+            accumulationInfo.imageView =
+                m_pathTraceResources.accumulationView;
+            accumulationInfo.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkWriteDescriptorSet writes[3]{};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet =
+                m_pathTraceResources.tonemapDescriptorSet;
+            writes[0].dstBinding = 0;
+            writes[0].descriptorCount = 1;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            writes[0].pBufferInfo = &constantsInfo;
+
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet =
+                m_pathTraceResources.tonemapDescriptorSet;
+            writes[1].dstBinding = 1;
+            writes[1].descriptorCount = 1;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[1].pImageInfo = &tonemapInfo;
+
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet =
+                m_pathTraceResources.tonemapDescriptorSet;
+            writes[2].dstBinding = 2;
+            writes[2].descriptorCount = 1;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            writes[2].pImageInfo = &accumulationInfo;
+
+            vkUpdateDescriptorSets(
+                m_device.device(),
+                static_cast<uint32_t>(std::size(writes)),
+                writes,
+                0,
+                nullptr);
+
+            m_pathTraceResources.tonemapDescriptorsDirty = false;
+        }
     }
 
     void VulkanBackend::ensureComputeTestResources(
