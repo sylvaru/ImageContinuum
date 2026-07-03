@@ -1,7 +1,9 @@
 // ic/core/debug_gui_layer.cpp
 #include "ic/common/ic_pch.h"
 #include "ic/core/debug_gui_layer.h"
+#include "ic/core/app_base.h"
 #include "ic/core/frame_context.h"
+#include "ic/renderer/renderer.h"
 
 #include <imgui.h>
 
@@ -29,6 +31,8 @@ namespace ic
             m_sampleElapsed = 0.0f;
             m_sampleFrames = 0;
         }
+
+        m_renderer = ctx.services ? ctx.services->renderer : nullptr;
     }
 
     void DebugGuiLayer::onRender([[maybe_unused]] float alpha)
@@ -38,12 +42,21 @@ namespace ic
             ImGuiWindowFlags_NoCollapse;
 
         ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(180.0f, 76.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(220.0f, 100.0f), ImGuiCond_FirstUseEver);
 
         if (ImGui::Begin("Debug", nullptr, flags))
         {
             ImGui::Text("FPS: %.1f", m_displayFps);
             ImGui::Text("Frame: %.3f ms", m_displayFrameTimeMs);
+
+            if (m_renderer)
+            {
+                bool vsync = m_renderer->vsyncEnabled();
+                if (ImGui::Checkbox("VSync", &vsync))
+                {
+                    m_renderer->setVsyncEnabled(vsync);
+                }
+            }
         }
 
         ImGui::End();

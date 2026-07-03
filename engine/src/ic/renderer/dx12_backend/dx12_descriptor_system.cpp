@@ -2,6 +2,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 namespace
@@ -59,6 +60,7 @@ namespace ic
         m_allocated = 0;
         m_descriptorSize = 0;
         m_shaderVisible = false;
+        m_freeRanges.clear();
     }
 
     DX12DescriptorAllocation DX12DescriptorHeap::allocate(uint32_t count)
@@ -70,17 +72,59 @@ namespace ic
 
         std::scoped_lock lock(m_mutex);
 
-        if (!m_heap || m_allocated + count > m_capacity)
+        if (!m_heap)
         {
             throw std::runtime_error(
                 "DX12 descriptor heap exhausted.");
         }
 
         DX12DescriptorAllocation allocation{};
-        allocation.baseIndex = m_allocated;
         allocation.count = count;
         allocation.descriptorSize = m_descriptorSize;
         allocation.shaderVisible = m_shaderVisible;
+
+        for (size_t i = 0; i < m_freeRanges.size(); ++i)
+        {
+            FreeRange& range = m_freeRanges[i];
+            if (range.count < count)
+            {
+                continue;
+            }
+
+            allocation.baseIndex = range.baseIndex;
+            range.baseIndex += count;
+            range.count -= count;
+
+            if (range.count == 0)
+            {
+                m_freeRanges.erase(m_freeRanges.begin() + i);
+            }
+
+            allocation.cpuStart =
+                m_heap->GetCPUDescriptorHandleForHeapStart();
+            allocation.cpuStart.ptr +=
+                static_cast<SIZE_T>(allocation.baseIndex) *
+                m_descriptorSize;
+
+            if (m_shaderVisible)
+            {
+                allocation.gpuStart =
+                    m_heap->GetGPUDescriptorHandleForHeapStart();
+                allocation.gpuStart.ptr +=
+                    static_cast<UINT64>(allocation.baseIndex) *
+                    m_descriptorSize;
+            }
+
+            return allocation;
+        }
+
+        if (m_allocated + count > m_capacity)
+        {
+            throw std::runtime_error(
+                "DX12 descriptor heap exhausted.");
+        }
+
+        allocation.baseIndex = m_allocated;
 
         allocation.cpuStart =
             m_heap->GetCPUDescriptorHandleForHeapStart();
@@ -99,6 +143,71 @@ namespace ic
 
         m_allocated += count;
         return allocation;
+    }
+
+    void DX12DescriptorHeap::release(DX12DescriptorAllocation allocation)
+    {
+        if (!allocation.valid())
+        {
+            return;
+        }
+
+        std::scoped_lock lock(m_mutex);
+
+        if (!m_heap ||
+            allocation.baseIndex >= m_capacity ||
+            allocation.baseIndex + allocation.count > m_capacity)
+        {
+            return;
+        }
+
+        m_freeRanges.push_back({
+            .baseIndex = allocation.baseIndex,
+            .count = allocation.count
+        });
+
+        std::sort(
+            m_freeRanges.begin(),
+            m_freeRanges.end(),
+            [](const FreeRange& lhs, const FreeRange& rhs)
+            {
+                return lhs.baseIndex < rhs.baseIndex;
+            });
+
+        size_t write = 0;
+        for (size_t read = 0; read < m_freeRanges.size(); ++read)
+        {
+            FreeRange range = m_freeRanges[read];
+            if (range.count == 0)
+            {
+                continue;
+            }
+
+            if (write == 0)
+            {
+                m_freeRanges[write++] = range;
+                continue;
+            }
+
+            FreeRange& previous = m_freeRanges[write - 1];
+            const uint32_t previousEnd =
+                previous.baseIndex + previous.count;
+
+            if (range.baseIndex <= previousEnd)
+            {
+                const uint32_t rangeEnd =
+                    range.baseIndex + range.count;
+                previous.count =
+                    std::max(previousEnd, rangeEnd) -
+                    previous.baseIndex;
+            }
+            else
+            {
+                m_freeRanges[write++] = range;
+            }
+        }
+
+        m_freeRanges.resize(write);
     }
 
     void DX12DescriptorSystem::init(
@@ -175,6 +284,28 @@ namespace ic
     DX12DescriptorAllocation DX12DescriptorSystem::allocateSamplers(uint32_t count)
     {
         return m_samplerHeap.allocate(count);
+    }
+
+    void DX12DescriptorSystem::releaseRTV(DX12DescriptorAllocation allocation)
+    {
+        m_rtvHeap.release(allocation);
+    }
+
+    void DX12DescriptorSystem::releaseDSV(DX12DescriptorAllocation allocation)
+    {
+        m_dsvHeap.release(allocation);
+    }
+
+    void DX12DescriptorSystem::releaseResourceDescriptors(
+        DX12DescriptorAllocation allocation)
+    {
+        m_cbvSrvUavHeap.release(allocation);
+    }
+
+    void DX12DescriptorSystem::releaseSamplers(
+        DX12DescriptorAllocation allocation)
+    {
+        m_samplerHeap.release(allocation);
     }
 
     ID3D12DescriptorHeap* DX12DescriptorSystem::shaderResourceHeap() const

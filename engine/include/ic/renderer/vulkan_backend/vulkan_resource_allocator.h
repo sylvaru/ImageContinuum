@@ -10,6 +10,8 @@
 
 namespace ic
 {
+    struct ImageAsset;
+
     struct VulkanBuffer
     {
         VkBuffer buffer = VK_NULL_HANDLE;
@@ -107,6 +109,11 @@ namespace ic
 
         VulkanBuffer createBuffer(const BufferDesc& desc);
         VulkanTexture createTexture(const TextureDesc& desc);
+        VulkanTexture createTexture(
+            const ImageAsset& image,
+            TextureUsageFlags usage =
+                TextureUsageFlags::Sampled | TextureUsageFlags::TransferDst,
+            const char* debugName = nullptr);
 
         void destroyBuffer(VulkanBuffer& buffer);
         void destroyTexture(VulkanTexture& texture);

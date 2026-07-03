@@ -100,7 +100,6 @@ namespace ic
         bool loadTextures = true;
         bool generateTangentsIfMissing = false;
         bool mergeMeshes = false;
-        bool srgbBaseColorTextures = true;
     };
 
     struct BinaryLoadOptions
@@ -196,6 +195,56 @@ namespace ic
         std::vector<MeshPrimitiveAsset> primitives;
     };
 
+    enum class TextureTransferFunction : uint8_t
+    {
+        Unknown = 0,
+        Linear,
+        SRGB
+    };
+
+    enum class TextureWrapMode : uint8_t
+    {
+        Repeat = 0,
+        MirroredRepeat,
+        ClampToEdge
+    };
+
+    enum class TextureFilterMode : uint8_t
+    {
+        Default = 0,
+        Nearest,
+        Linear,
+        NearestMipmapNearest,
+        LinearMipmapNearest,
+        NearestMipmapLinear,
+        LinearMipmapLinear
+    };
+
+    struct SamplerAsset
+    {
+        std::string name;
+        TextureFilterMode minFilter = TextureFilterMode::Default;
+        TextureFilterMode magFilter = TextureFilterMode::Default;
+        TextureWrapMode wrapU = TextureWrapMode::Repeat;
+        TextureWrapMode wrapV = TextureWrapMode::Repeat;
+    };
+
+    struct TextureAsset
+    {
+        std::string name;
+        int32_t imageIndex = -1;
+        int32_t samplerIndex = -1;
+    };
+
+    struct MaterialTextureSlot
+    {
+        int32_t textureIndex = -1;
+        uint32_t texCoord = 0;
+        float scale = 1.0f;
+        float strength = 1.0f;
+        TextureTransferFunction transfer = TextureTransferFunction::Unknown;
+    };
+
     struct MaterialAsset
     {
         std::string name;
@@ -204,25 +253,38 @@ namespace ic
         float roughnessFactor = 1.0f;
         float alphaCutoff = 0.5f;
         glm::vec3 emissiveFactor = glm::vec3(0.0f);
-        int32_t baseColorImage = -1;
-        int32_t normalImage = -1;
-        int32_t metallicRoughnessImage = -1;
-        int32_t emissiveImage = -1;
+        float emissiveStrength = 1.0f;
+        MaterialTextureSlot baseColorTexture;
+        MaterialTextureSlot normalTexture;
+        MaterialTextureSlot metallicRoughnessTexture;
+        MaterialTextureSlot occlusionTexture;
+        MaterialTextureSlot emissiveTexture;
         bool doubleSided = false;
         bool alphaBlend = false;
         bool alphaMask = false;
+        bool unlit = false;
     };
 
     struct NodeAsset
     {
         std::string name;
         int32_t parent = -1;
+        std::vector<uint32_t> children;
         int32_t meshIndex = -1;
+        int32_t cameraIndex = -1;
+        int32_t lightIndex = -1;
+        int32_t skinIndex = -1;
         glm::vec3 translation = glm::vec3(0.0f);
         glm::quat rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
         glm::vec3 scale = glm::vec3(1.0f);
         glm::mat4 localMatrix = glm::mat4(1.0f);
         glm::mat4 worldMatrix = glm::mat4(1.0f);
+    };
+
+    struct SceneAsset
+    {
+        std::string name;
+        std::vector<uint32_t> rootNodes;
     };
 
     struct ModelAsset
@@ -233,7 +295,11 @@ namespace ic
         std::vector<MeshAsset> meshes;
         std::vector<MaterialAsset> materials;
         std::vector<ImageAsset> images;
+        std::vector<TextureAsset> textures;
+        std::vector<SamplerAsset> samplers;
         std::vector<NodeAsset> nodes;
+        std::vector<SceneAsset> scenes;
+        int32_t defaultScene = -1;
         AssetBounds bounds = {};
     };
 
@@ -274,6 +340,10 @@ namespace ic
         [[nodiscard]] const ModelAsset* model(AssetHandle handle) const;
         [[nodiscard]] const BinaryAsset* binary(AssetHandle handle) const;
         [[nodiscard]] const AssetData* data(AssetHandle handle) const;
+        [[nodiscard]] std::shared_ptr<const ImageAsset> imageShared(AssetHandle handle) const;
+        [[nodiscard]] std::shared_ptr<const ModelAsset> modelShared(AssetHandle handle) const;
+        [[nodiscard]] std::shared_ptr<const BinaryAsset> binaryShared(AssetHandle handle) const;
+        [[nodiscard]] std::shared_ptr<const AssetData> dataShared(AssetHandle handle) const;
 
     private:
         struct AssetKey

@@ -64,6 +64,22 @@ namespace ic
             return m_state == SwapchainState::Valid;
         }
 
+        bool vsyncEnabled() const
+        {
+            return m_vsync;
+        }
+
+        bool setVsyncEnabled(bool enabled)
+        {
+            if (m_vsync == enabled)
+            {
+                return false;
+            }
+
+            m_vsync = enabled;
+            return true;
+        }
+
         VkFormat format() const { return m_format; }
         VkExtent2D extent() const { return m_extent; }
 
@@ -98,6 +114,7 @@ namespace ic
         VkFormat m_format{};
         VkExtent2D m_extent{};
         SwapchainState m_state = SwapchainState::Valid;
+        bool m_vsync = true;
 
         uint32_t m_currentImage = 0;
     };

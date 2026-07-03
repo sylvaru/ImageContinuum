@@ -76,6 +76,16 @@ namespace ic
             return m_state == DX12SwapchainState::Valid;
         }
 
+        bool vsyncEnabled() const
+        {
+            return m_vsync;
+        }
+
+        void setVsyncEnabled(bool enabled)
+        {
+            m_vsync = enabled;
+        }
+
     private:
         void createSwapchain();
         void createRenderTargets();
@@ -94,7 +104,7 @@ namespace ic
         uint32_t m_currentBackBufferIndex = 0;
         uint32_t m_width = 0;
         uint32_t m_height = 0;
-        bool m_vsync = false;
+        bool m_vsync = true;
 
         DXGI_FORMAT m_format = DXGI_FORMAT_R8G8B8A8_UNORM;
         DX12SwapchainState m_state = DX12SwapchainState::OutOfDate;

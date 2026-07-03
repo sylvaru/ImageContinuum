@@ -10,6 +10,8 @@
 
 namespace ic
 {
+    struct ImageAsset;
+
     struct DX12Buffer
     {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -94,6 +96,11 @@ namespace ic
 
         DX12Buffer createBuffer(const BufferDesc& desc);
         DX12Texture createTexture(const TextureDesc& desc);
+        DX12Texture createTexture(
+            const ImageAsset& image,
+            TextureUsageFlags usage =
+                TextureUsageFlags::Sampled | TextureUsageFlags::TransferDst,
+            const char* debugName = nullptr);
 
         void destroyBuffer(DX12Buffer& buffer);
         void destroyTexture(DX12Texture& texture);

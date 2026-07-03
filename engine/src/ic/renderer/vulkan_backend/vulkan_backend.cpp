@@ -140,6 +140,19 @@ namespace ic
             constants.cameraUpAndFar =
                 glm::vec4(up, 100.0f);
         }
+
+        bool planUsesPathTracing(const CompiledGraphPlan& plan)
+        {
+            for (const auto& payload : plan.payloads)
+            {
+                if (std::get_if<PathTracePassData>(&payload))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
     }
 
 	void VulkanBackend::initialize(
@@ -233,6 +246,12 @@ namespace ic
         const FrameContext& ctx,
         const SceneRenderView& scene)
     {
+        if (planUsesPathTracing(plan) &&
+            m_device.device() != VK_NULL_HANDLE)
+        {
+            vkDeviceWaitIdle(m_device.device());
+        }
+
         const uint32_t frameSlot =
             static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size());
 
@@ -355,6 +374,19 @@ namespace ic
         m_imguiFrameActive = false;
     }
 
+    bool VulkanBackend::vsyncEnabled() const
+    {
+        return m_swapchain.vsyncEnabled();
+    }
+
+    void VulkanBackend::setVsyncEnabled(bool enabled)
+    {
+        if (m_swapchain.setVsyncEnabled(enabled))
+        {
+            onSwapchainRecreated();
+        }
+    }
+
     void VulkanBackend::initImGui(Window& window)
     {
         if (m_imguiEnabled)
@@ -367,11 +399,7 @@ namespace ic
 
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        const std::filesystem::path imguiIniPath =
-            std::filesystem::path("out") / "runtime" / "imgui.ini";
-        std::filesystem::create_directories(imguiIniPath.parent_path());
-        m_imguiIniPath = imguiIniPath.string();
-        io.IniFilename = m_imguiIniPath.c_str();
+        io.IniFilename = nullptr;
 
         ImGui::StyleColorsDark();
 
@@ -587,8 +615,7 @@ namespace ic
 
                 applyBarriers(
                     cmd,
-                    plan.barriers,
-                    plan.resources,
+                    plan,
                     node,
                     swapchainImage,
                     swapchainInitialLayout);
@@ -636,22 +663,48 @@ namespace ic
 
     void VulkanBackend::applyBarriers(
         VkCommandBuffer cmd,
-        std::span<const ResourceBarrier> barriers,
-        std::span<const GraphResource> resources,
+        const CompiledGraphPlan& plan,
         const ExecutionNode& node,
         VkImage swapchainImage,
         VkImageLayout swapchainInitialLayout)
     {
-        for (const ResourceBarrier& barrier : barriers)
+        if (node.nodeId >= plan.nodeSchedules.size())
         {
-            if (barrier.toNode != node.nodeId)
-                continue;
+            for (const ResourceBarrier& barrier : plan.barriers)
+            {
+                if (barrier.toNode != node.nodeId)
+                {
+                    continue;
+                }
 
+                recordBarrier(
+                    cmd,
+                    barrier,
+                    plan.resources,
+                    swapchainImage,
+                    swapchainInitialLayout);
+            }
+
+            return;
+        }
+
+        const NodeSchedule& schedule =
+            plan.nodeSchedules[node.nodeId];
+
+        for (uint32_t i = 0; i < schedule.incomingBarrierCount; ++i)
+        {
+            const uint32_t barrierIndex =
+                plan.incomingBarrierIndices[
+                    schedule.firstIncomingBarrier + i];
+            if (barrierIndex >= plan.barriers.size())
+            {
+                continue;
+            }
 
             recordBarrier(
                 cmd,
-                barrier,
-                resources,
+                plan.barriers[barrierIndex],
+                plan.resources,
                 swapchainImage,
                 swapchainInitialLayout);
         }
@@ -880,103 +933,104 @@ namespace ic
 
         vkCmdBeginRendering(cmd, &renderingInfo);
 
-        std::vector<DrawItem> draws;
-        if (prepareSceneResources(ctx, scene, pipelineHandle, draws) &&
-            !draws.empty())
+        if (prepareSceneResources(ctx, scene, pipelineHandle) &&
+            !m_preparedScene.draws.empty())
         {
-                const VkExtent2D extent = m_swapchain.extent();
+            const std::vector<DrawItem>& draws =
+                m_preparedScene.draws;
+            const VkExtent2D extent = m_swapchain.extent();
 
-                VkViewport viewport{};
-                viewport.x = 0.0f;
-                viewport.y = 0.0f;
-                viewport.width = static_cast<float>(extent.width);
-                viewport.height = static_cast<float>(extent.height);
-                viewport.minDepth = 0.0f;
-                viewport.maxDepth = 1.0f;
+            VkViewport viewport{};
+            viewport.x = 0.0f;
+            viewport.y = 0.0f;
+            viewport.width = static_cast<float>(extent.width);
+            viewport.height = static_cast<float>(extent.height);
+            viewport.minDepth = 0.0f;
+            viewport.maxDepth = 1.0f;
 
-                VkRect2D scissor{};
-                scissor.offset = { 0, 0 };
-                scissor.extent = extent;
+            VkRect2D scissor{};
+            scissor.offset = { 0, 0 };
+            scissor.extent = extent;
 
-                vkCmdSetViewport(cmd, 0, 1, &viewport);
-                vkCmdSetScissor(cmd, 0, 1, &scissor);
+            vkCmdSetViewport(cmd, 0, 1, &viewport);
+            vkCmdSetScissor(cmd, 0, 1, &scissor);
 
-                const uint32_t frameSlot =
-                    static_cast<uint32_t>(
-                        ctx.frameIndex % m_sceneFrameResources.size());
-                FrameSceneResources& frameResources =
-                    m_sceneFrameResources[frameSlot];
+            const uint32_t frameSlot =
+                static_cast<uint32_t>(
+                    ctx.frameIndex % m_sceneFrameResources.size());
+            FrameSceneResources& frameResources =
+                m_sceneFrameResources[frameSlot];
 
-                vkCmdBindPipeline(
-                    cmd,
-                    VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    pipeline->pipeline);
+            vkCmdBindPipeline(
+                cmd,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                pipeline->pipeline);
 
-                vkCmdBindDescriptorSets(
-                    cmd,
-                    VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    pipeline->pipelineLayout,
-                    0,
-                    1,
-                    &frameResources.descriptorSet,
-                    0,
-                    nullptr);
+            vkCmdBindDescriptorSets(
+                cmd,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                pipeline->pipelineLayout,
+                0,
+                1,
+                &frameResources.descriptorSet,
+                0,
+                nullptr);
 
-                UploadedModel* boundModel = nullptr;
-                for (const DrawItem& draw : draws)
+            UploadedModel* boundModel = nullptr;
+            for (const DrawItem& draw : draws)
+            {
+                if (!draw.model ||
+                    draw.meshIndex >= draw.model->meshes.size())
                 {
-                    if (!draw.model ||
-                        draw.meshIndex >= draw.model->meshes.size())
-                    {
-                        continue;
-                    }
-
-                    const GpuMesh& mesh =
-                        draw.model->meshes[draw.meshIndex];
-                    if (mesh.indexCount == 0)
-                    {
-                        continue;
-                    }
-
-                    if (boundModel != draw.model)
-                    {
-                        VkDeviceSize offset = 0;
-                        vkCmdBindVertexBuffers(
-                            cmd,
-                            0,
-                            1,
-                            &draw.model->vertexBuffer.buffer,
-                            &offset);
-                        vkCmdBindIndexBuffer(
-                            cmd,
-                            draw.model->indexBuffer.buffer,
-                            0,
-                            VK_INDEX_TYPE_UINT32);
-                        boundModel = draw.model;
-                    }
-
-                    DrawConstants constants{};
-                    constants.objectIndex = draw.objectIndex;
-                    constants.meshIndex = draw.meshIndex;
-                    constants.materialIndex = draw.materialIndex;
-
-                    vkCmdPushConstants(
-                        cmd,
-                        pipeline->pipelineLayout,
-                        VK_SHADER_STAGE_VERTEX_BIT |
-                            VK_SHADER_STAGE_FRAGMENT_BIT,
-                        0,
-                        sizeof(constants),
-                        &constants);
-
-                    vkCmdDrawIndexed(
-                        cmd,
-                        mesh.indexCount,
-                        1,
-                        mesh.firstIndex,
-                        0,
-                        0);
+                    continue;
                 }
+
+                const GpuMesh& mesh =
+                    draw.model->meshes[draw.meshIndex];
+                if (mesh.indexCount == 0)
+                {
+                    continue;
+                }
+
+                if (boundModel != draw.model)
+                {
+                    VkDeviceSize offset = 0;
+                    vkCmdBindVertexBuffers(
+                        cmd,
+                        0,
+                        1,
+                        &draw.model->vertexBuffer.buffer,
+                        &offset);
+                    vkCmdBindIndexBuffer(
+                        cmd,
+                        draw.model->indexBuffer.buffer,
+                        0,
+                        VK_INDEX_TYPE_UINT32);
+                    boundModel = draw.model;
+                }
+
+                DrawConstants constants{};
+                constants.objectIndex = draw.objectIndex;
+                constants.meshIndex = draw.meshIndex;
+                constants.materialIndex = draw.materialIndex;
+
+                vkCmdPushConstants(
+                    cmd,
+                    pipeline->pipelineLayout,
+                    VK_SHADER_STAGE_VERTEX_BIT |
+                        VK_SHADER_STAGE_FRAGMENT_BIT,
+                    0,
+                    sizeof(constants),
+                    &constants);
+
+                vkCmdDrawIndexed(
+                    cmd,
+                    mesh.indexCount,
+                    1,
+                    mesh.firstIndex,
+                    0,
+                    0);
+            }
         }
 
         vkCmdEndRendering(cmd);
@@ -1003,7 +1057,7 @@ namespace ic
 
         if (std::get_if<TonemapPassData>(&plan.payloads[node.payloadIndex]))
         {
-            executeTonemapNode(plan, node, cmd);
+            executeTonemapNode(plan, node, ctx, cmd);
             return;
         }
 
@@ -1093,7 +1147,18 @@ namespace ic
         updatePathTraceDescriptors(pipeline, nullptr);
 
         if (!m_pathTraceResources.accumulation ||
-            m_pathTraceResources.pathTraceDescriptorSet == VK_NULL_HANDLE)
+            m_pathTraceResources.pathTraceDescriptorSets.empty())
+        {
+            return;
+        }
+
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(
+                ctx.frameIndex %
+                m_pathTraceResources.pathTraceConstants.size());
+        const VkDescriptorSet descriptorSet =
+            m_pathTraceResources.pathTraceDescriptorSets[frameSlot];
+        if (descriptorSet == VK_NULL_HANDLE)
         {
             return;
         }
@@ -1172,12 +1237,15 @@ namespace ic
             m_pathTraceResources.height,
             constants);
 
+        VulkanBuffer& pathTraceConstants =
+            m_pathTraceResources.pathTraceConstants[frameSlot];
+
         std::memcpy(
-            m_pathTraceResources.pathTraceConstants.mapped,
+            pathTraceConstants.mapped,
             &constants,
             sizeof(constants));
         m_resourceAllocator.flush(
-            m_pathTraceResources.pathTraceConstants,
+            pathTraceConstants,
             0,
             sizeof(constants));
 
@@ -1191,7 +1259,7 @@ namespace ic
             pipeline->pipelineLayout,
             0,
             1,
-            &m_pathTraceResources.pathTraceDescriptorSet,
+            &descriptorSet,
             0,
             nullptr);
 
@@ -1208,6 +1276,7 @@ namespace ic
     void VulkanBackend::executeTonemapNode(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
+        const FrameContext& ctx,
         VkCommandBuffer cmd)
     {
         VulkanComputePipeline* pipeline =
@@ -1223,7 +1292,18 @@ namespace ic
 
         if (!m_pathTraceResources.accumulation ||
             !m_pathTraceResources.tonemap ||
-            m_pathTraceResources.tonemapDescriptorSet == VK_NULL_HANDLE)
+            m_pathTraceResources.tonemapDescriptorSets.empty())
+        {
+            return;
+        }
+
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(
+                ctx.frameIndex %
+                m_pathTraceResources.tonemapConstants.size());
+        const VkDescriptorSet descriptorSet =
+            m_pathTraceResources.tonemapDescriptorSets[frameSlot];
+        if (descriptorSet == VK_NULL_HANDLE)
         {
             return;
         }
@@ -1277,12 +1357,15 @@ namespace ic
         constants.renderHeight = m_pathTraceResources.height;
         constants.exposure = 1.0f;
 
+        VulkanBuffer& tonemapConstants =
+            m_pathTraceResources.tonemapConstants[frameSlot];
+
         std::memcpy(
-            m_pathTraceResources.tonemapConstants.mapped,
+            tonemapConstants.mapped,
             &constants,
             sizeof(constants));
         m_resourceAllocator.flush(
-            m_pathTraceResources.tonemapConstants,
+            tonemapConstants,
             0,
             sizeof(constants));
 
@@ -1296,7 +1379,7 @@ namespace ic
             pipeline->pipelineLayout,
             0,
             1,
-            &m_pathTraceResources.tonemapDescriptorSet,
+            &descriptorSet,
             0,
             nullptr);
 
@@ -1493,6 +1576,7 @@ namespace ic
             resources = {};
         }
         m_sceneFrameResources.clear();
+        m_preparedScene = {};
 
         m_pipelineHandles.clear();
         m_computePipelineHandles.clear();
@@ -1553,37 +1637,50 @@ namespace ic
         m_pathTraceResources.tonemapView =
             createTextureView(m_pathTraceResources.tonemap);
 
-        m_pathTraceResources.pathTraceConstants =
-            m_resourceAllocator.createBuffer({
-                .size = sizeof(PathTraceConstants),
-                .usage = BufferUsageFlags::Constant,
-                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                .mappedAtCreation = true,
-                .debugName = "Vulkan path trace constants"
-            });
+        const uint32_t frameCount =
+            static_cast<uint32_t>(std::max<size_t>(1, m_frameSync.size()));
+        m_pathTraceResources.pathTraceConstants.resize(frameCount);
+        m_pathTraceResources.tonemapConstants.resize(frameCount);
+        m_pathTraceResources.pathTraceDescriptorSets.assign(
+            frameCount,
+            VK_NULL_HANDLE);
+        m_pathTraceResources.tonemapDescriptorSets.assign(
+            frameCount,
+            VK_NULL_HANDLE);
+        for (uint32_t i = 0; i < frameCount; ++i)
+        {
+            m_pathTraceResources.pathTraceConstants[i] =
+                m_resourceAllocator.createBuffer({
+                    .size = sizeof(PathTraceConstants),
+                    .usage = BufferUsageFlags::Constant,
+                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                    .mappedAtCreation = true,
+                    .debugName = "Vulkan path trace constants"
+                });
 
-        m_pathTraceResources.tonemapConstants =
-            m_resourceAllocator.createBuffer({
-                .size = sizeof(TonemapConstants),
-                .usage = BufferUsageFlags::Constant,
-                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                .mappedAtCreation = true,
-                .debugName = "Vulkan path trace tonemap constants"
-            });
+            m_pathTraceResources.tonemapConstants[i] =
+                m_resourceAllocator.createBuffer({
+                    .size = sizeof(TonemapConstants),
+                    .usage = BufferUsageFlags::Constant,
+                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                    .mappedAtCreation = true,
+                    .debugName = "Vulkan path trace tonemap constants"
+                });
+        }
 
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSizes[0].descriptorCount = 2;
+        poolSizes[0].descriptorCount = 2 * frameCount;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSizes[1].descriptorCount = 2;
+        poolSizes[1].descriptorCount = 2 * frameCount;
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        poolSizes[2].descriptorCount = 1;
+        poolSizes[2].descriptorCount = frameCount;
         poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSizes[3].descriptorCount = 4;
+        poolSizes[3].descriptorCount = 4 * frameCount;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.maxSets = 2;
+        poolInfo.maxSets = 2 * frameCount;
         poolInfo.poolSizeCount =
             static_cast<uint32_t>(std::size(poolSizes));
         poolInfo.pPoolSizes = poolSizes;
@@ -1654,7 +1751,12 @@ namespace ic
     {
         if (m_device.device() != VK_NULL_HANDLE &&
             (m_pathTraceResources.sceneVertices ||
-                m_pathTraceResources.pathTraceDescriptorSet != VK_NULL_HANDLE))
+                std::ranges::any_of(
+                    m_pathTraceResources.pathTraceDescriptorSets,
+                    [](VkDescriptorSet set)
+                    {
+                        return set != VK_NULL_HANDLE;
+                    })))
         {
             vkDeviceWaitIdle(m_device.device());
         }
@@ -1890,10 +1992,14 @@ namespace ic
             m_pathTraceResources.accumulation);
         m_resourceAllocator.destroyTexture(
             m_pathTraceResources.tonemap);
-        m_resourceAllocator.destroyBuffer(
-            m_pathTraceResources.pathTraceConstants);
-        m_resourceAllocator.destroyBuffer(
-            m_pathTraceResources.tonemapConstants);
+        for (VulkanBuffer& buffer : m_pathTraceResources.pathTraceConstants)
+        {
+            m_resourceAllocator.destroyBuffer(buffer);
+        }
+        for (VulkanBuffer& buffer : m_pathTraceResources.tonemapConstants)
+        {
+            m_resourceAllocator.destroyBuffer(buffer);
+        }
 
         m_pathTraceResources = {};
     }
@@ -1938,22 +2044,36 @@ namespace ic
             bool updateDescriptors =
                 m_pathTraceResources.pathTraceDescriptorsDirty;
 
-            if (m_pathTraceResources.pathTraceDescriptorSet ==
-                VK_NULL_HANDLE)
+            const bool needAllocate =
+                m_pathTraceResources.pathTraceDescriptorSets.empty() ||
+                std::ranges::any_of(
+                    m_pathTraceResources.pathTraceDescriptorSets,
+                    [](VkDescriptorSet set)
+                    {
+                        return set == VK_NULL_HANDLE;
+                    });
+
+            if (needAllocate)
             {
+                const uint32_t setCount =
+                    static_cast<uint32_t>(
+                        m_pathTraceResources.pathTraceDescriptorSets.size());
+                std::vector<VkDescriptorSetLayout> layouts(
+                    setCount,
+                    pathTracePipeline->descriptorSetLayout);
+
                 VkDescriptorSetAllocateInfo allocateInfo{};
                 allocateInfo.sType =
                     VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
                 allocateInfo.descriptorPool =
                     m_pathTraceResources.descriptorPool;
-                allocateInfo.descriptorSetCount = 1;
-                allocateInfo.pSetLayouts =
-                    &pathTracePipeline->descriptorSetLayout;
+                allocateInfo.descriptorSetCount = setCount;
+                allocateInfo.pSetLayouts = layouts.data();
 
                 if (vkAllocateDescriptorSets(
                         m_device.device(),
                         &allocateInfo,
-                        &m_pathTraceResources.pathTraceDescriptorSet) !=
+                        m_pathTraceResources.pathTraceDescriptorSets.data()) !=
                     VK_SUCCESS)
                 {
                     throw std::runtime_error(
@@ -1967,11 +2087,6 @@ namespace ic
             {
                 return;
             }
-
-            VkDescriptorBufferInfo constantsInfo{};
-            constantsInfo.buffer =
-                m_pathTraceResources.pathTraceConstants.buffer;
-            constantsInfo.range = sizeof(PathTraceConstants);
 
             VkDescriptorBufferInfo vertexInfo{};
             vertexInfo.buffer = m_pathTraceResources.sceneVertices.buffer;
@@ -1994,23 +2109,6 @@ namespace ic
                 m_pathTraceResources.accumulationView;
             accumulationInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-            VkWriteDescriptorSet writes[6]{};
-            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[0].dstSet =
-                m_pathTraceResources.pathTraceDescriptorSet;
-            writes[0].dstBinding = 0;
-            writes[0].descriptorCount = 1;
-            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            writes[0].pBufferInfo = &constantsInfo;
-
-            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[1].dstSet =
-                m_pathTraceResources.pathTraceDescriptorSet;
-            writes[1].dstBinding = 1;
-            writes[1].descriptorCount = 1;
-            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            writes[1].pImageInfo = &accumulationInfo;
-
             VkDescriptorBufferInfo* sceneInfos[4] =
             {
                 &vertexInfo,
@@ -2019,23 +2117,63 @@ namespace ic
                 &bvhInfo
             };
 
-            for (uint32_t i = 0; i < 4; ++i)
+            std::vector<VkDescriptorBufferInfo> constantsInfos(
+                m_pathTraceResources.pathTraceConstants.size());
+            std::vector<VkWriteDescriptorSet> writes;
+            writes.reserve(
+                m_pathTraceResources.pathTraceDescriptorSets.size() * 6u);
+
+            for (size_t setIndex = 0;
+                 setIndex < m_pathTraceResources.pathTraceDescriptorSets.size();
+                 ++setIndex)
             {
-                writes[2 + i].sType =
+                constantsInfos[setIndex].buffer =
+                    m_pathTraceResources.pathTraceConstants[setIndex].buffer;
+                constantsInfos[setIndex].range = sizeof(PathTraceConstants);
+
+                VkWriteDescriptorSet constantsWrite{};
+                constantsWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                constantsWrite.dstSet =
+                    m_pathTraceResources.pathTraceDescriptorSets[setIndex];
+                constantsWrite.dstBinding = 0;
+                constantsWrite.descriptorCount = 1;
+                constantsWrite.descriptorType =
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                constantsWrite.pBufferInfo = &constantsInfos[setIndex];
+                writes.push_back(constantsWrite);
+
+                VkWriteDescriptorSet accumulationWrite{};
+                accumulationWrite.sType =
                     VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[2 + i].dstSet =
-                    m_pathTraceResources.pathTraceDescriptorSet;
-                writes[2 + i].dstBinding = 2 + i;
-                writes[2 + i].descriptorCount = 1;
-                writes[2 + i].descriptorType =
-                    VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                writes[2 + i].pBufferInfo = sceneInfos[i];
+                accumulationWrite.dstSet =
+                    m_pathTraceResources.pathTraceDescriptorSets[setIndex];
+                accumulationWrite.dstBinding = 1;
+                accumulationWrite.descriptorCount = 1;
+                accumulationWrite.descriptorType =
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                accumulationWrite.pImageInfo = &accumulationInfo;
+                writes.push_back(accumulationWrite);
+
+                for (uint32_t i = 0; i < 4; ++i)
+                {
+                    VkWriteDescriptorSet sceneWrite{};
+                    sceneWrite.sType =
+                        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    sceneWrite.dstSet =
+                        m_pathTraceResources.pathTraceDescriptorSets[setIndex];
+                    sceneWrite.dstBinding = 2 + i;
+                    sceneWrite.descriptorCount = 1;
+                    sceneWrite.descriptorType =
+                        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    sceneWrite.pBufferInfo = sceneInfos[i];
+                    writes.push_back(sceneWrite);
+                }
             }
 
             vkUpdateDescriptorSets(
                 m_device.device(),
-                static_cast<uint32_t>(std::size(writes)),
-                writes,
+                static_cast<uint32_t>(writes.size()),
+                writes.data(),
                 0,
                 nullptr);
 
@@ -2047,21 +2185,36 @@ namespace ic
             bool updateDescriptors =
                 m_pathTraceResources.tonemapDescriptorsDirty;
 
-            if (m_pathTraceResources.tonemapDescriptorSet == VK_NULL_HANDLE)
+            const bool needAllocate =
+                m_pathTraceResources.tonemapDescriptorSets.empty() ||
+                std::ranges::any_of(
+                    m_pathTraceResources.tonemapDescriptorSets,
+                    [](VkDescriptorSet set)
+                    {
+                        return set == VK_NULL_HANDLE;
+                    });
+
+            if (needAllocate)
             {
+                const uint32_t setCount =
+                    static_cast<uint32_t>(
+                        m_pathTraceResources.tonemapDescriptorSets.size());
+                std::vector<VkDescriptorSetLayout> layouts(
+                    setCount,
+                    tonemapPipeline->descriptorSetLayout);
+
                 VkDescriptorSetAllocateInfo allocateInfo{};
                 allocateInfo.sType =
                     VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
                 allocateInfo.descriptorPool =
                     m_pathTraceResources.descriptorPool;
-                allocateInfo.descriptorSetCount = 1;
-                allocateInfo.pSetLayouts =
-                    &tonemapPipeline->descriptorSetLayout;
+                allocateInfo.descriptorSetCount = setCount;
+                allocateInfo.pSetLayouts = layouts.data();
 
                 if (vkAllocateDescriptorSets(
                         m_device.device(),
                         &allocateInfo,
-                        &m_pathTraceResources.tonemapDescriptorSet) !=
+                        m_pathTraceResources.tonemapDescriptorSets.data()) !=
                     VK_SUCCESS)
                 {
                     throw std::runtime_error(
@@ -2076,11 +2229,6 @@ namespace ic
                 return;
             }
 
-            VkDescriptorBufferInfo constantsInfo{};
-            constantsInfo.buffer =
-                m_pathTraceResources.tonemapConstants.buffer;
-            constantsInfo.range = sizeof(TonemapConstants);
-
             VkDescriptorImageInfo tonemapInfo{};
             tonemapInfo.imageView = m_pathTraceResources.tonemapView;
             tonemapInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -2091,35 +2239,59 @@ namespace ic
             accumulationInfo.imageLayout =
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            VkWriteDescriptorSet writes[3]{};
-            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[0].dstSet =
-                m_pathTraceResources.tonemapDescriptorSet;
-            writes[0].dstBinding = 0;
-            writes[0].descriptorCount = 1;
-            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            writes[0].pBufferInfo = &constantsInfo;
+            std::vector<VkDescriptorBufferInfo> constantsInfos(
+                m_pathTraceResources.tonemapConstants.size());
+            std::vector<VkWriteDescriptorSet> writes;
+            writes.reserve(
+                m_pathTraceResources.tonemapDescriptorSets.size() * 3u);
 
-            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[1].dstSet =
-                m_pathTraceResources.tonemapDescriptorSet;
-            writes[1].dstBinding = 1;
-            writes[1].descriptorCount = 1;
-            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            writes[1].pImageInfo = &tonemapInfo;
+            for (size_t setIndex = 0;
+                 setIndex < m_pathTraceResources.tonemapDescriptorSets.size();
+                 ++setIndex)
+            {
+                constantsInfos[setIndex].buffer =
+                    m_pathTraceResources.tonemapConstants[setIndex].buffer;
+                constantsInfos[setIndex].range = sizeof(TonemapConstants);
 
-            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[2].dstSet =
-                m_pathTraceResources.tonemapDescriptorSet;
-            writes[2].dstBinding = 2;
-            writes[2].descriptorCount = 1;
-            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            writes[2].pImageInfo = &accumulationInfo;
+                VkWriteDescriptorSet constantsWrite{};
+                constantsWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                constantsWrite.dstSet =
+                    m_pathTraceResources.tonemapDescriptorSets[setIndex];
+                constantsWrite.dstBinding = 0;
+                constantsWrite.descriptorCount = 1;
+                constantsWrite.descriptorType =
+                    VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+                constantsWrite.pBufferInfo = &constantsInfos[setIndex];
+                writes.push_back(constantsWrite);
+
+                VkWriteDescriptorSet tonemapWrite{};
+                tonemapWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                tonemapWrite.dstSet =
+                    m_pathTraceResources.tonemapDescriptorSets[setIndex];
+                tonemapWrite.dstBinding = 1;
+                tonemapWrite.descriptorCount = 1;
+                tonemapWrite.descriptorType =
+                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                tonemapWrite.pImageInfo = &tonemapInfo;
+                writes.push_back(tonemapWrite);
+
+                VkWriteDescriptorSet accumulationWrite{};
+                accumulationWrite.sType =
+                    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                accumulationWrite.dstSet =
+                    m_pathTraceResources.tonemapDescriptorSets[setIndex];
+                accumulationWrite.dstBinding = 2;
+                accumulationWrite.descriptorCount = 1;
+                accumulationWrite.descriptorType =
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                accumulationWrite.pImageInfo = &accumulationInfo;
+                writes.push_back(accumulationWrite);
+            }
 
             vkUpdateDescriptorSets(
                 m_device.device(),
-                static_cast<uint32_t>(std::size(writes)),
-                writes,
+                static_cast<uint32_t>(writes.size()),
+                writes.data(),
                 0,
                 nullptr);
 
@@ -2297,41 +2469,137 @@ namespace ic
             return nullptr;
         }
 
-        uploaded.vertexBuffer =
+        const VkDeviceSize vertexBytes =
+            static_cast<VkDeviceSize>(model->vertices.size()) *
+            sizeof(AssetVertex);
+        const VkDeviceSize indexBytes =
+            static_cast<VkDeviceSize>(model->indices.size()) *
+            sizeof(uint32_t);
+
+        VulkanBuffer vertexStaging =
             m_resourceAllocator.createBuffer({
-                .size = model->vertices.size() * sizeof(AssetVertex),
-                .usage = BufferUsageFlags::Vertex,
+                .size = vertexBytes,
+                .usage = BufferUsageFlags::TransferSrc,
                 .memoryUsage = ResourceMemoryUsage::CpuToGpu,
                 .mappedAtCreation = true,
-                .debugName = "Cornell vertex buffer"
+                .debugName = "Vulkan model vertex staging"
+            });
+
+        VulkanBuffer indexStaging =
+            m_resourceAllocator.createBuffer({
+                .size = indexBytes,
+                .usage = BufferUsageFlags::TransferSrc,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = "Vulkan model index staging"
+            });
+
+        std::memcpy(
+            vertexStaging.mapped,
+            model->vertices.data(),
+            static_cast<size_t>(vertexBytes));
+        std::memcpy(
+            indexStaging.mapped,
+            model->indices.data(),
+            static_cast<size_t>(indexBytes));
+
+        m_resourceAllocator.flush(
+            vertexStaging,
+            0,
+            vertexBytes);
+        m_resourceAllocator.flush(
+            indexStaging,
+            0,
+            indexBytes);
+
+        uploaded.vertexBuffer =
+            m_resourceAllocator.createBuffer({
+                .size = vertexBytes,
+                .usage =
+                    BufferUsageFlags::Vertex |
+                    BufferUsageFlags::TransferDst,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .mappedAtCreation = false,
+                .debugName = "Vulkan model vertex buffer"
             });
 
         uploaded.indexBuffer =
             m_resourceAllocator.createBuffer({
-                .size = model->indices.size() * sizeof(uint32_t),
-                .usage = BufferUsageFlags::Index,
-                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                .mappedAtCreation = true,
-                .debugName = "Cornell index buffer"
+                .size = indexBytes,
+                .usage =
+                    BufferUsageFlags::Index |
+                    BufferUsageFlags::TransferDst,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .mappedAtCreation = false,
+                .debugName = "Vulkan model index buffer"
             });
 
-        std::memcpy(
-            uploaded.vertexBuffer.mapped,
-            model->vertices.data(),
-            uploaded.vertexBuffer.size);
-        std::memcpy(
-            uploaded.indexBuffer.mapped,
-            model->indices.data(),
-            uploaded.indexBuffer.size);
+        m_commandSystem.immediateSubmit(
+            m_device.graphicsQueue(),
+            [&](VkCommandBuffer cmd)
+            {
+                VkBufferCopy vertexCopy{};
+                vertexCopy.size = vertexBytes;
+                vkCmdCopyBuffer(
+                    cmd,
+                    vertexStaging.buffer,
+                    uploaded.vertexBuffer.buffer,
+                    1,
+                    &vertexCopy);
 
-        m_resourceAllocator.flush(
-            uploaded.vertexBuffer,
-            0,
-            uploaded.vertexBuffer.size);
-        m_resourceAllocator.flush(
-            uploaded.indexBuffer,
-            0,
-            uploaded.indexBuffer.size);
+                VkBufferCopy indexCopy{};
+                indexCopy.size = indexBytes;
+                vkCmdCopyBuffer(
+                    cmd,
+                    indexStaging.buffer,
+                    uploaded.indexBuffer.buffer,
+                    1,
+                    &indexCopy);
+
+                VkBufferMemoryBarrier barriers[2]{};
+                barriers[0].sType =
+                    VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barriers[0].srcAccessMask =
+                    VK_ACCESS_TRANSFER_WRITE_BIT;
+                barriers[0].dstAccessMask =
+                    VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+                barriers[0].srcQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                barriers[0].dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                barriers[0].buffer = uploaded.vertexBuffer.buffer;
+                barriers[0].offset = 0;
+                barriers[0].size = vertexBytes;
+
+                barriers[1].sType =
+                    VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barriers[1].srcAccessMask =
+                    VK_ACCESS_TRANSFER_WRITE_BIT;
+                barriers[1].dstAccessMask =
+                    VK_ACCESS_INDEX_READ_BIT;
+                barriers[1].srcQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                barriers[1].dstQueueFamilyIndex =
+                    VK_QUEUE_FAMILY_IGNORED;
+                barriers[1].buffer = uploaded.indexBuffer.buffer;
+                barriers[1].offset = 0;
+                barriers[1].size = indexBytes;
+
+                vkCmdPipelineBarrier(
+                    cmd,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                    0,
+                    0,
+                    nullptr,
+                    2,
+                    barriers,
+                    0,
+                    nullptr);
+            });
+
+        m_resourceAllocator.destroyBuffer(vertexStaging);
+        m_resourceAllocator.destroyBuffer(indexStaging);
 
         uploaded.materials.reserve(
             std::max<size_t>(1, model->materials.size()));
@@ -2396,9 +2664,35 @@ namespace ic
     bool VulkanBackend::prepareSceneResources(
         const FrameContext& ctx,
         const SceneRenderView& scene,
-        GraphicsPipelineHandle pipelineHandle,
-        std::vector<DrawItem>& draws)
+        GraphicsPipelineHandle pipelineHandle)
     {
+        if (m_preparedScene.frameIndex == ctx.frameIndex &&
+            m_preparedScene.valid)
+        {
+            if (m_sceneFrameResources.empty())
+            {
+                return false;
+            }
+
+            const uint32_t frameSlot =
+                static_cast<uint32_t>(
+                    ctx.frameIndex % m_sceneFrameResources.size());
+            FrameSceneResources& frameResources =
+                m_sceneFrameResources[frameSlot];
+            if (frameResources.descriptorSet == VK_NULL_HANDLE)
+            {
+                updateFrameDescriptors(frameResources, pipelineHandle);
+            }
+            return true;
+        }
+
+        m_preparedScene.frameIndex = ctx.frameIndex;
+        m_preparedScene.valid = false;
+        m_preparedScene.draws.clear();
+        m_preparedScene.objects.clear();
+        m_preparedScene.materials.clear();
+        m_preparedScene.materialOffsets.clear();
+
         if (!ctx.services ||
             !ctx.services->assetManager ||
             scene.camera.valid == 0 ||
@@ -2408,11 +2702,15 @@ namespace ic
         }
 
         AssetManager& assets = *ctx.services->assetManager;
-        std::vector<GpuObjectData> objects;
-        std::vector<GpuMaterialData> materials;
-        std::unordered_map<AssetHandle, uint32_t, AssetHandleHash> materialOffsets;
+        std::vector<DrawItem>& draws = m_preparedScene.draws;
+        std::vector<GpuObjectData>& objects = m_preparedScene.objects;
+        std::vector<GpuMaterialData>& materials = m_preparedScene.materials;
+        auto& materialOffsets = m_preparedScene.materialOffsets;
 
+        m_uploadedModels.reserve(
+            m_uploadedModels.size() + scene.models.size());
         objects.reserve(scene.models.size());
+        materialOffsets.reserve(scene.models.size());
 
         for (const SceneModelRenderItem& item : scene.models)
         {
@@ -2582,6 +2880,7 @@ namespace ic
             0,
             materials.size() * sizeof(GpuMaterialData));
 
+        m_preparedScene.valid = true;
         return true;
     }
 

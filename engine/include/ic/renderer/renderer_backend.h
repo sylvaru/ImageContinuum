@@ -41,6 +41,15 @@ namespace ic
         {
         }
 
+        virtual bool vsyncEnabled() const
+        {
+            return true;
+        }
+
+        virtual void setVsyncEnabled(bool)
+        {
+        }
+
         // Opaque backend management methods acting entirely on handles
         //virtual void createBuffer(
         //    BufferHandle,

@@ -2,15 +2,16 @@
 name = "ImageContinuum Demo"
 
 [window]
-width = 1920
-height = 1080
+width = 1280
+height = 720
+mode = "windowed"
 
 [paths]
 asset_root = "demo/res"
 model_root = "demo/res/models"
 
 [renderer]
-backend = "Vulkan"
+backend = "DX12"
 path = "PathTraced"
 validation = true
 debug_gui = true

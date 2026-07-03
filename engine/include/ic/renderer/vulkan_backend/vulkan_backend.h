@@ -14,6 +14,8 @@
 #include "ic/renderer/path_tracing/path_tracer_types.h"
 
 #include <glm/glm.hpp>
+#include <unordered_map>
+#include <vector>
 
 namespace ic
 {
@@ -39,6 +41,8 @@ namespace ic
 
         bool beginDebugGuiFrame() override;
         void endDebugGuiFrame() override;
+        bool vsyncEnabled() const override;
+        void setVsyncEnabled(bool enabled) override;
 
         VulkanResourceAllocator& resourceAllocator()
         {
@@ -100,6 +104,18 @@ namespace ic
             uint32_t materialIndex = 0;
         };
 
+        struct PreparedSceneFrame
+        {
+            uint64_t frameIndex = UINT64_MAX;
+            bool valid = false;
+
+            std::vector<DrawItem> draws;
+            std::vector<GpuObjectData> objects;
+            std::vector<GpuMaterialData> materials;
+            std::unordered_map<AssetHandle, uint32_t, AssetHandleHash>
+                materialOffsets;
+        };
+
         struct PathTraceResources
         {
             VulkanTexture accumulation;
@@ -107,16 +123,16 @@ namespace ic
             VkImageView accumulationView = VK_NULL_HANDLE;
             VkImageView tonemapView = VK_NULL_HANDLE;
 
-            VulkanBuffer pathTraceConstants;
-            VulkanBuffer tonemapConstants;
+            std::vector<VulkanBuffer> pathTraceConstants;
+            std::vector<VulkanBuffer> tonemapConstants;
             VulkanBuffer sceneVertices;
             VulkanBuffer sceneMaterials;
             VulkanBuffer sceneTriangles;
             VulkanBuffer sceneBvhNodes;
 
             VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-            VkDescriptorSet pathTraceDescriptorSet = VK_NULL_HANDLE;
-            VkDescriptorSet tonemapDescriptorSet = VK_NULL_HANDLE;
+            std::vector<VkDescriptorSet> pathTraceDescriptorSets;
+            std::vector<VkDescriptorSet> tonemapDescriptorSets;
 
             VkImageLayout accumulationLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             VkImageLayout tonemapLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -157,8 +173,7 @@ namespace ic
 
         void applyBarriers(
             VkCommandBuffer cmd,
-            std::span<const ResourceBarrier> barriers,
-            std::span<const GraphResource> resources,
+            const CompiledGraphPlan& plan,
             const ExecutionNode& node,
             VkImage swapchainImage,
             VkImageLayout swapchainInitialLayout);
@@ -208,6 +223,7 @@ namespace ic
         void executeTonemapNode(
             const CompiledGraphPlan& plan,
             const ExecutionNode& node,
+            const FrameContext& ctx,
             VkCommandBuffer cmd);
 
         void executeTransferNode(
@@ -241,8 +257,7 @@ namespace ic
         bool prepareSceneResources(
             const FrameContext& ctx,
             const SceneRenderView& scene,
-            GraphicsPipelineHandle pipelineHandle,
-            std::vector<DrawItem>& draws);
+            GraphicsPipelineHandle pipelineHandle);
 
         GraphicsPipelineHandle pipelineForNode(
             const CompiledGraphPlan& plan,
@@ -319,6 +334,7 @@ namespace ic
         std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash> m_computePipelineHandles;
         std::unordered_map<AssetHandle, UploadedModel, AssetHandleHash> m_uploadedModels;
         std::vector<FrameSceneResources> m_sceneFrameResources;
+        PreparedSceneFrame m_preparedScene;
         uint32_t m_workerSlots = 1;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;

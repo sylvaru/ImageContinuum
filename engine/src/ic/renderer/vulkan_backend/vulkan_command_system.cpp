@@ -2,6 +2,7 @@
 
 
 #include <spdlog/spdlog.h>
+#include <stdexcept>
 
 
 namespace ic
@@ -44,7 +45,43 @@ namespace ic
             }
         }
 
-        // fence for immediateSubmit
+        VkCommandPoolCreateInfo immediatePoolInfo{};
+        immediatePoolInfo.sType =
+            VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        immediatePoolInfo.queueFamilyIndex =
+            graphicsQueueFamily;
+        immediatePoolInfo.flags =
+            VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+
+        if (vkCreateCommandPool(
+            m_device,
+            &immediatePoolInfo,
+            nullptr,
+            &m_immediatePool) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to create Vulkan immediate command pool.");
+        }
+
+        VkCommandBufferAllocateInfo immediateAllocInfo{};
+        immediateAllocInfo.sType =
+            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        immediateAllocInfo.commandPool =
+            m_immediatePool;
+        immediateAllocInfo.level =
+            VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        immediateAllocInfo.commandBufferCount =
+            1;
+
+        if (vkAllocateCommandBuffers(
+            m_device,
+            &immediateAllocInfo,
+            &m_immediateCommandBuffer) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to allocate Vulkan immediate command buffer.");
+        }
+
         VkFenceCreateInfo fenceInfo{};
         fenceInfo.sType =
             VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -52,11 +89,15 @@ namespace ic
         fenceInfo.flags =
             VK_FENCE_CREATE_SIGNALED_BIT;
 
-        vkCreateFence(
+        if (vkCreateFence(
             m_device,
             &fenceInfo,
             nullptr,
-            &m_immediateFence);
+            &m_immediateFence) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to create Vulkan immediate fence.");
+        }
 
         spdlog::info("[VulkanCommandSystem] Initialized (frames={}, workers={})",
             maxFramesInFlight,
@@ -83,12 +124,23 @@ namespace ic
             }
         }
 
+        if (m_immediatePool != VK_NULL_HANDLE)
+        {
+            vkDestroyCommandPool(
+                m_device,
+                m_immediatePool,
+                nullptr);
+            m_immediatePool = VK_NULL_HANDLE;
+            m_immediateCommandBuffer = VK_NULL_HANDLE;
+        }
+
         if (m_immediateFence)
         {
             vkDestroyFence(
                 m_device,
                 m_immediateFence,
                 nullptr);
+            m_immediateFence = VK_NULL_HANDLE;
         }
 
         m_frames.clear();
@@ -208,50 +260,46 @@ namespace ic
         VkQueue queue,
         std::function<void(VkCommandBuffer cmd)>&& function)
     {
-        vkWaitForFences(
+        std::scoped_lock lock(m_immediateMutex);
+
+        if (m_immediatePool == VK_NULL_HANDLE ||
+            m_immediateCommandBuffer == VK_NULL_HANDLE ||
+            m_immediateFence == VK_NULL_HANDLE)
+        {
+            throw std::runtime_error(
+                "Vulkan immediate submit used before command system init.");
+        }
+
+        if (vkWaitForFences(
             m_device,
             1,
             &m_immediateFence,
             VK_TRUE,
-            UINT64_MAX);
+            UINT64_MAX) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to wait for Vulkan immediate fence.");
+        }
 
-        vkResetFences(
+        if (vkResetFences(
             m_device,
             1,
-            &m_immediateFence);
+            &m_immediateFence) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to reset Vulkan immediate fence.");
+        }
 
-        VkCommandPoolCreateInfo poolInfo{};
-        poolInfo.sType =
-            VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-
-        poolInfo.queueFamilyIndex =
-            m_graphicsQueueFamily;
-
-        poolInfo.flags =
-            VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-
-        VkCommandPool pool;
-        vkCreateCommandPool(
+        if (vkResetCommandPool(
             m_device,
-            &poolInfo,
-            nullptr,
-            &pool);
+            m_immediatePool,
+            0) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to reset Vulkan immediate command pool.");
+        }
 
-        VkCommandBufferAllocateInfo allocInfo{};
-        allocInfo.sType =
-            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        allocInfo.level =
-            VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        allocInfo.commandPool =
-            pool;
-        allocInfo.commandBufferCount =
-            1;
-
-        VkCommandBuffer cmd;
-        vkAllocateCommandBuffers(
-            m_device,
-            &allocInfo,
-            &cmd);
+        VkCommandBuffer cmd = m_immediateCommandBuffer;
 
         VkCommandBufferBeginInfo beginInfo{};
         beginInfo.sType =
@@ -259,11 +307,19 @@ namespace ic
         beginInfo.flags =
             VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
-        vkBeginCommandBuffer(cmd, &beginInfo);
+        if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to begin Vulkan immediate command buffer.");
+        }
 
         function(cmd);
 
-        vkEndCommandBuffer(cmd);
+        if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to end Vulkan immediate command buffer.");
+        }
 
         VkSubmitInfo submitInfo{};
         submitInfo.sType =
@@ -273,28 +329,25 @@ namespace ic
         submitInfo.pCommandBuffers =
             &cmd;
 
-        vkQueueSubmit(
+        if (vkQueueSubmit(
             queue,
             1,
             &submitInfo,
-            m_immediateFence);
+            m_immediateFence) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to submit Vulkan immediate command buffer.");
+        }
 
-        vkWaitForFences(
+        if (vkWaitForFences(
             m_device,
             1,
             &m_immediateFence,
             VK_TRUE,
-            UINT64_MAX);
-
-        vkFreeCommandBuffers(
-            m_device,
-            pool,
-            1,
-            &cmd);
-
-        vkDestroyCommandPool(
-            m_device,
-            pool,
-            nullptr);
+            UINT64_MAX) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to wait for Vulkan immediate submission.");
+        }
     }
 }

@@ -5,6 +5,14 @@ namespace ic
 {
     struct Event;
 
+    enum class WindowMode
+    {
+        Windowed,
+        Maximized,
+        BorderlessFullscreen,
+        Fullscreen
+    };
+
     struct WindowSpecification
     {
         std::string title = "ImageContinuum";
@@ -12,6 +20,7 @@ namespace ic
         uint32_t width = 1920;
         uint32_t height = 1080;
 
+        WindowMode mode = WindowMode::Windowed;
         bool resizable = true;
         bool maximized = false;
         bool fullscreen = false;

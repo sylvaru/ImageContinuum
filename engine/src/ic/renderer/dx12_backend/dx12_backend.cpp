@@ -151,6 +151,19 @@ namespace
         constants.cameraUpAndFar =
             glm::vec4(up, 100.0f);
     }
+
+    bool planUsesPathTracing(const ic::CompiledGraphPlan& plan)
+    {
+        for (const auto& payload : plan.payloads)
+        {
+            if (std::get_if<ic::PathTracePassData>(&payload))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 }
 
 namespace ic
@@ -231,6 +244,11 @@ namespace ic
             return;
         }
 
+        if (planUsesPathTracing(plan))
+        {
+            waitForGpu();
+        }
+
         const uint32_t frameSlot =
             static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size());
 
@@ -302,8 +320,7 @@ namespace ic
 
                 applyBarriers(
                     cmd,
-                    plan.barriers,
-                    plan.resources,
+                    plan,
                     node,
                     swapchainImage);
 
@@ -348,22 +365,46 @@ namespace ic
 
     void DX12Backend::applyBarriers(
         ID3D12GraphicsCommandList4* cmd,
-        std::span<const ResourceBarrier> barriers,
-        std::span<const GraphResource> resources,
+        const CompiledGraphPlan& plan,
         const ExecutionNode& node,
         ID3D12Resource* swapchainImage)
     {
-        for (const ResourceBarrier& barrier : barriers)
+        if (node.nodeId >= plan.nodeSchedules.size())
         {
-            if (barrier.toNode != node.nodeId)
+            for (const ResourceBarrier& barrier : plan.barriers)
+            {
+                if (barrier.toNode != node.nodeId)
+                {
+                    continue;
+                }
+
+                recordBarrier(
+                    cmd,
+                    barrier,
+                    plan.resources,
+                    swapchainImage);
+            }
+
+            return;
+        }
+
+        const NodeSchedule& schedule =
+            plan.nodeSchedules[node.nodeId];
+
+        for (uint32_t i = 0; i < schedule.incomingBarrierCount; ++i)
+        {
+            const uint32_t barrierIndex =
+                plan.incomingBarrierIndices[
+                    schedule.firstIncomingBarrier + i];
+            if (barrierIndex >= plan.barriers.size())
             {
                 continue;
             }
 
             recordBarrier(
                 cmd,
-                barrier,
-                resources,
+                plan.barriers[barrierIndex],
+                plan.resources,
                 swapchainImage);
         }
     }
@@ -516,11 +557,13 @@ namespace ic
                 nullptr);
         }
 
-        std::vector<DrawItem> draws;
-        if (!prepareSceneResources(ctx, scene, draws) || draws.empty())
+        if (!prepareSceneResources(ctx, scene) ||
+            m_preparedScene.draws.empty())
         {
             return;
         }
+
+        const std::vector<DrawItem>& draws = m_preparedScene.draws;
 
         const uint32_t frameSlot =
             static_cast<uint32_t>(ctx.frameIndex % m_sceneFrameResources.size());
@@ -620,7 +663,7 @@ namespace ic
 
         if (std::get_if<TonemapPassData>(&plan.payloads[node.payloadIndex]))
         {
-            executeTonemapNode(plan, node, cmd);
+            executeTonemapNode(plan, node, ctx, cmd);
             return;
         }
 
@@ -760,8 +803,15 @@ namespace ic
             m_pathTraceResources.height,
             constants);
 
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(
+                ctx.frameIndex %
+                m_pathTraceResources.pathTraceConstants.size());
+        DX12Buffer& pathTraceConstants =
+            m_pathTraceResources.pathTraceConstants[frameSlot];
+
         std::memcpy(
-            m_pathTraceResources.pathTraceConstants.mapped,
+            pathTraceConstants.mapped,
             &constants,
             sizeof(constants));
 
@@ -774,7 +824,7 @@ namespace ic
         cmd->SetPipelineState(pipeline->pipelineState.Get());
         cmd->SetComputeRootConstantBufferView(
             0,
-            m_pathTraceResources.pathTraceConstants.gpuAddress);
+            pathTraceConstants.gpuAddress);
         cmd->SetComputeRootDescriptorTable(
             1,
             m_pathTraceResources.accumulationUav.gpuStart);
@@ -804,6 +854,7 @@ namespace ic
     void DX12Backend::executeTonemapNode(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
+        const FrameContext& ctx,
         ID3D12GraphicsCommandList4* cmd)
     {
         ensurePathTraceResources();
@@ -847,8 +898,15 @@ namespace ic
         constants.renderHeight = m_pathTraceResources.height;
         constants.exposure = 1.0f;
 
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(
+                ctx.frameIndex %
+                m_pathTraceResources.tonemapConstants.size());
+        DX12Buffer& tonemapConstants =
+            m_pathTraceResources.tonemapConstants[frameSlot];
+
         std::memcpy(
-            m_pathTraceResources.tonemapConstants.mapped,
+            tonemapConstants.mapped,
             &constants,
             sizeof(constants));
 
@@ -861,7 +919,7 @@ namespace ic
         cmd->SetPipelineState(pipeline->pipelineState.Get());
         cmd->SetComputeRootConstantBufferView(
             0,
-            m_pathTraceResources.tonemapConstants.gpuAddress);
+            tonemapConstants.gpuAddress);
         cmd->SetComputeRootDescriptorTable(
             1,
             m_pathTraceResources.tonemapUav.gpuStart);
@@ -1027,9 +1085,12 @@ namespace ic
             m_resourceAllocator.destroyBuffer(resources.frameConstants);
             m_resourceAllocator.destroyBuffer(resources.objects);
             m_resourceAllocator.destroyBuffer(resources.materials);
+            m_descriptorSystem.releaseResourceDescriptors(resources.objectSrv);
+            m_descriptorSystem.releaseResourceDescriptors(resources.materialSrv);
             resources = {};
         }
         m_sceneFrameResources.clear();
+        m_preparedScene = {};
 
         m_pipelineHandles.clear();
         m_computePipelineHandles.clear();
@@ -1087,23 +1148,30 @@ namespace ic
         m_pathTraceResources.tonemapState =
             m_pathTraceResources.tonemap.initialState;
 
-        m_pathTraceResources.pathTraceConstants =
-            m_resourceAllocator.createBuffer({
-                .size = alignConstantBufferSize(sizeof(PathTraceConstants)),
-                .usage = BufferUsageFlags::Constant,
-                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                .mappedAtCreation = true,
-                .debugName = "DX12 path trace constants"
-            });
+        const uint32_t frameCount =
+            static_cast<uint32_t>(std::max<size_t>(1, m_frameSync.size()));
+        m_pathTraceResources.pathTraceConstants.resize(frameCount);
+        m_pathTraceResources.tonemapConstants.resize(frameCount);
+        for (uint32_t i = 0; i < frameCount; ++i)
+        {
+            m_pathTraceResources.pathTraceConstants[i] =
+                m_resourceAllocator.createBuffer({
+                    .size = alignConstantBufferSize(sizeof(PathTraceConstants)),
+                    .usage = BufferUsageFlags::Constant,
+                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                    .mappedAtCreation = true,
+                    .debugName = "DX12 path trace constants"
+                });
 
-        m_pathTraceResources.tonemapConstants =
-            m_resourceAllocator.createBuffer({
-                .size = alignConstantBufferSize(sizeof(TonemapConstants)),
-                .usage = BufferUsageFlags::Constant,
-                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                .mappedAtCreation = true,
-                .debugName = "DX12 path trace tonemap constants"
-            });
+            m_pathTraceResources.tonemapConstants[i] =
+                m_resourceAllocator.createBuffer({
+                    .size = alignConstantBufferSize(sizeof(TonemapConstants)),
+                    .usage = BufferUsageFlags::Constant,
+                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                    .mappedAtCreation = true,
+                    .debugName = "DX12 path trace tonemap constants"
+                });
+        }
 
         updatePathTraceDescriptors();
     }
@@ -1392,6 +1460,8 @@ namespace ic
         m_resourceAllocator.destroyBuffer(
             m_pathTraceResources.sceneBvhNodes);
 
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_pathTraceResources.sceneSrvs);
         m_pathTraceResources.sceneSrvs = {};
         m_pathTraceResources.sceneVertexCount = 0;
         m_pathTraceResources.sceneMaterialCount = 0;
@@ -1407,10 +1477,21 @@ namespace ic
             m_pathTraceResources.accumulation);
         m_resourceAllocator.destroyTexture(
             m_pathTraceResources.tonemap);
-        m_resourceAllocator.destroyBuffer(
-            m_pathTraceResources.pathTraceConstants);
-        m_resourceAllocator.destroyBuffer(
-            m_pathTraceResources.tonemapConstants);
+        for (DX12Buffer& buffer : m_pathTraceResources.pathTraceConstants)
+        {
+            m_resourceAllocator.destroyBuffer(buffer);
+        }
+        for (DX12Buffer& buffer : m_pathTraceResources.tonemapConstants)
+        {
+            m_resourceAllocator.destroyBuffer(buffer);
+        }
+
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_pathTraceResources.accumulationUav);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_pathTraceResources.accumulationSrv);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_pathTraceResources.tonemapUav);
 
         m_pathTraceResources = {};
     }
@@ -1422,6 +1503,13 @@ namespace ic
         {
             return;
         }
+
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_pathTraceResources.accumulationUav);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_pathTraceResources.accumulationSrv);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_pathTraceResources.tonemapUav);
 
         m_pathTraceResources.accumulationUav =
             m_descriptorSystem.allocateResourceDescriptors(1);
@@ -1523,6 +1611,7 @@ namespace ic
     void DX12Backend::destroyDepthTarget()
     {
         m_resourceAllocator.destroyTexture(m_depthTexture);
+        m_descriptorSystem.releaseDSV(m_depthDsv);
         m_depthDsv = {};
         m_depthState = D3D12_RESOURCE_STATE_COMMON;
         m_depthWidth = 0;
@@ -1554,32 +1643,124 @@ namespace ic
             return nullptr;
         }
 
-        uploaded.vertexBuffer =
+        const uint64_t vertexBytes =
+            static_cast<uint64_t>(model->vertices.size()) *
+            sizeof(AssetVertex);
+        const uint64_t indexBytes =
+            static_cast<uint64_t>(model->indices.size()) *
+            sizeof(uint32_t);
+
+        DX12Buffer vertexStaging =
             m_resourceAllocator.createBuffer({
-                .size = model->vertices.size() * sizeof(AssetVertex),
-                .usage = BufferUsageFlags::Vertex,
+                .size = vertexBytes,
+                .usage = BufferUsageFlags::TransferSrc,
                 .memoryUsage = ResourceMemoryUsage::CpuToGpu,
                 .mappedAtCreation = true,
-                .debugName = "Cornell vertex buffer"
+                .debugName = "DX12 model vertex staging"
+            });
+
+        DX12Buffer indexStaging =
+            m_resourceAllocator.createBuffer({
+                .size = indexBytes,
+                .usage = BufferUsageFlags::TransferSrc,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = "DX12 model index staging"
+            });
+
+        std::memcpy(
+            vertexStaging.mapped,
+            model->vertices.data(),
+            static_cast<size_t>(vertexBytes));
+        std::memcpy(
+            indexStaging.mapped,
+            model->indices.data(),
+            static_cast<size_t>(indexBytes));
+
+        uploaded.vertexBuffer =
+            m_resourceAllocator.createBuffer({
+                .size = vertexBytes,
+                .usage =
+                    BufferUsageFlags::Vertex |
+                    BufferUsageFlags::TransferDst,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .mappedAtCreation = false,
+                .debugName = "DX12 model vertex buffer"
             });
 
         uploaded.indexBuffer =
             m_resourceAllocator.createBuffer({
-                .size = model->indices.size() * sizeof(uint32_t),
-                .usage = BufferUsageFlags::Index,
-                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                .mappedAtCreation = true,
-                .debugName = "Cornell index buffer"
+                .size = indexBytes,
+                .usage =
+                    BufferUsageFlags::Index |
+                    BufferUsageFlags::TransferDst,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .mappedAtCreation = false,
+                .debugName = "DX12 model index buffer"
             });
 
-        std::memcpy(
-            uploaded.vertexBuffer.mapped,
-            model->vertices.data(),
-            uploaded.vertexBuffer.size);
-        std::memcpy(
-            uploaded.indexBuffer.mapped,
-            model->indices.data(),
-            uploaded.indexBuffer.size);
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+        throwIfFailed(
+            m_device.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&allocator)),
+            "Failed to create DX12 model upload allocator.");
+
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd;
+        throwIfFailed(
+            m_device.device()->CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                allocator.Get(),
+                nullptr,
+                IID_PPV_ARGS(&cmd)),
+            "Failed to create DX12 model upload command list.");
+
+        transitionResource(
+            cmd.Get(),
+            uploaded.vertexBuffer.resource.Get(),
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+        transitionResource(
+            cmd.Get(),
+            uploaded.indexBuffer.resource.Get(),
+            D3D12_RESOURCE_STATE_COMMON,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+
+        cmd->CopyBufferRegion(
+            uploaded.vertexBuffer.resource.Get(),
+            0,
+            vertexStaging.resource.Get(),
+            0,
+            vertexBytes);
+        cmd->CopyBufferRegion(
+            uploaded.indexBuffer.resource.Get(),
+            0,
+            indexStaging.resource.Get(),
+            0,
+            indexBytes);
+
+        transitionResource(
+            cmd.Get(),
+            uploaded.vertexBuffer.resource.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+        transitionResource(
+            cmd.Get(),
+            uploaded.indexBuffer.resource.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_INDEX_BUFFER);
+
+        throwIfFailed(
+            cmd->Close(),
+            "Failed to close DX12 model upload command list.");
+
+        ID3D12CommandList* lists[] = { cmd.Get() };
+        m_device.graphicsQueue()->ExecuteCommandLists(1, lists);
+        waitForGpu();
+
+        m_resourceAllocator.destroyBuffer(vertexStaging);
+        m_resourceAllocator.destroyBuffer(indexStaging);
 
         uploaded.materials.reserve(std::max<size_t>(1, model->materials.size()));
         for (const MaterialAsset& src : model->materials)
@@ -1638,9 +1819,21 @@ namespace ic
 
     bool DX12Backend::prepareSceneResources(
         const FrameContext& ctx,
-        const SceneRenderView& scene,
-        std::vector<DrawItem>& draws)
+        const SceneRenderView& scene)
     {
+        if (m_preparedScene.frameIndex == ctx.frameIndex &&
+            m_preparedScene.valid)
+        {
+            return !m_sceneFrameResources.empty();
+        }
+
+        m_preparedScene.frameIndex = ctx.frameIndex;
+        m_preparedScene.valid = false;
+        m_preparedScene.draws.clear();
+        m_preparedScene.objects.clear();
+        m_preparedScene.materials.clear();
+        m_preparedScene.materialOffsets.clear();
+
         if (!ctx.services ||
             !ctx.services->assetManager ||
             scene.camera.valid == 0 ||
@@ -1650,11 +1843,15 @@ namespace ic
         }
 
         AssetManager& assets = *ctx.services->assetManager;
-        std::vector<GpuObjectData> objects;
-        std::vector<GpuMaterialData> materials;
-        std::unordered_map<AssetHandle, uint32_t, AssetHandleHash> materialOffsets;
+        std::vector<DrawItem>& draws = m_preparedScene.draws;
+        std::vector<GpuObjectData>& objects = m_preparedScene.objects;
+        std::vector<GpuMaterialData>& materials = m_preparedScene.materials;
+        auto& materialOffsets = m_preparedScene.materialOffsets;
 
+        m_uploadedModels.reserve(
+            m_uploadedModels.size() + scene.models.size());
         objects.reserve(scene.models.size());
+        materialOffsets.reserve(scene.models.size());
 
         for (const SceneModelRenderItem& item : scene.models)
         {
@@ -1742,6 +1939,10 @@ namespace ic
         if (objects.size() > frameResources.objectCapacity)
         {
             m_resourceAllocator.destroyBuffer(frameResources.objects);
+            m_descriptorSystem.releaseResourceDescriptors(
+                frameResources.objectSrv);
+            frameResources.objectSrv = {};
+
             frameResources.objects =
                 m_resourceAllocator.createBuffer({
                     .size = objects.size() * sizeof(GpuObjectData),
@@ -1773,6 +1974,10 @@ namespace ic
         if (materials.size() > frameResources.materialCapacity)
         {
             m_resourceAllocator.destroyBuffer(frameResources.materials);
+            m_descriptorSystem.releaseResourceDescriptors(
+                frameResources.materialSrv);
+            frameResources.materialSrv = {};
+
             frameResources.materials =
                 m_resourceAllocator.createBuffer({
                     .size = materials.size() * sizeof(GpuMaterialData),
@@ -1836,6 +2041,7 @@ namespace ic
             materials.data(),
             materials.size() * sizeof(GpuMaterialData));
 
+        m_preparedScene.valid = true;
         return true;
     }
 
@@ -1888,6 +2094,16 @@ namespace ic
         m_imguiFrameActive = false;
     }
 
+    bool DX12Backend::vsyncEnabled() const
+    {
+        return m_swapchain.vsyncEnabled();
+    }
+
+    void DX12Backend::setVsyncEnabled(bool enabled)
+    {
+        m_swapchain.setVsyncEnabled(enabled);
+    }
+
     void DX12Backend::initImGui(Window& window)
     {
         if (m_imguiEnabled)
@@ -1900,11 +2116,7 @@ namespace ic
 
         ImGuiIO& io = ImGui::GetIO();
         io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        const std::filesystem::path imguiIniPath =
-            std::filesystem::path("out") / "runtime" / "imgui.ini";
-        std::filesystem::create_directories(imguiIniPath.parent_path());
-        m_imguiIniPath = imguiIniPath.string();
-        io.IniFilename = m_imguiIniPath.c_str();
+        io.IniFilename = nullptr;
 
         ImGui::StyleColorsDark();
 

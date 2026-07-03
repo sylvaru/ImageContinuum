@@ -4,6 +4,7 @@ name = "ImageContinuum Demo"
 [window]
 width = 1920
 height = 1080
+mode = "windowed"
 
 [paths]
 asset_root = "demo/res"

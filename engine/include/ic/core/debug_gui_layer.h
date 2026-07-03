@@ -6,6 +6,7 @@
 namespace ic
 {
     struct FrameContext;
+    class Renderer;
 
     class DebugGuiLayer final : public Layer
     {
@@ -20,5 +21,6 @@ namespace ic
         float m_displayFps = 0.0f;
         float m_sampleElapsed = 0.0f;
         uint32_t m_sampleFrames = 0;
+        Renderer* m_renderer = nullptr;
     };
 }

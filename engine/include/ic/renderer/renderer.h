@@ -35,6 +35,8 @@ namespace ic
             const SceneRenderView& scene);
         bool beginDebugGuiFrame();
         void endDebugGuiFrame();
+        [[nodiscard]] bool vsyncEnabled() const;
+        void setVsyncEnabled(bool enabled);
         
         void rebuildGraph();
 

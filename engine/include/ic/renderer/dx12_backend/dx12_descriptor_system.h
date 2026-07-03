@@ -4,6 +4,7 @@
 
 #include <d3d12.h>
 #include <mutex>
+#include <vector>
 #include <wrl/client.h>
 
 namespace ic
@@ -37,6 +38,7 @@ namespace ic
         void shutdown();
 
         DX12DescriptorAllocation allocate(uint32_t count);
+        void release(DX12DescriptorAllocation allocation);
 
         ID3D12DescriptorHeap* heap() const
         {
@@ -61,11 +63,18 @@ namespace ic
     private:
         Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_heap;
 
+        struct FreeRange
+        {
+            uint32_t baseIndex = 0;
+            uint32_t count = 0;
+        };
+
         D3D12_DESCRIPTOR_HEAP_TYPE m_type{};
         uint32_t m_capacity = 0;
         uint32_t m_allocated = 0;
         uint32_t m_descriptorSize = 0;
         bool m_shaderVisible = false;
+        std::vector<FreeRange> m_freeRanges;
         std::mutex m_mutex;
     };
 
@@ -90,6 +99,10 @@ namespace ic
         DX12DescriptorAllocation allocateDSV(uint32_t count);
         DX12DescriptorAllocation allocateResourceDescriptors(uint32_t count);
         DX12DescriptorAllocation allocateSamplers(uint32_t count);
+        void releaseRTV(DX12DescriptorAllocation allocation);
+        void releaseDSV(DX12DescriptorAllocation allocation);
+        void releaseResourceDescriptors(DX12DescriptorAllocation allocation);
+        void releaseSamplers(DX12DescriptorAllocation allocation);
 
         ID3D12DescriptorHeap* shaderResourceHeap() const;
         ID3D12DescriptorHeap* samplerHeap() const;

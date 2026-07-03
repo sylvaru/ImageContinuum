@@ -53,7 +53,11 @@ namespace ic
         buildBarriers();
         buildNodeSchedules();
 
-        debugLog();
+        if (spdlog::default_logger_raw() &&
+            spdlog::default_logger_raw()->should_log(spdlog::level::trace))
+        {
+            debugLog();
+        }
 
         auto resources = builder.resources();
         auto payloads = builder.payloads();

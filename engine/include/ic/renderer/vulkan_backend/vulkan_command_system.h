@@ -1,7 +1,9 @@
 #pragma once
 #include <vulkan/vulkan.h>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <vector>
 
 /*
 
@@ -118,7 +120,10 @@ namespace ic
 
         std::vector<FrameData> m_frames;
 
+        VkCommandPool m_immediatePool = VK_NULL_HANDLE;
+        VkCommandBuffer m_immediateCommandBuffer = VK_NULL_HANDLE;
         VkFence m_immediateFence = VK_NULL_HANDLE;
+        std::mutex m_immediateMutex;
     };
 
 }

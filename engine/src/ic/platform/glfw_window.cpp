@@ -5,20 +5,128 @@
 
 namespace ic
 {
+    namespace
+    {
+        constexpr int WindowedTopMargin = 32;
+
+        void placeWindowOnPrimaryMonitor(GLFWwindow* window)
+        {
+            GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+            if (!monitor)
+            {
+                return;
+            }
+
+            int workX = 0;
+            int workY = 0;
+            int workWidth = 0;
+            int workHeight = 0;
+            glfwGetMonitorWorkarea(
+                monitor,
+                &workX,
+                &workY,
+                &workWidth,
+                &workHeight);
+
+            int windowWidth = 0;
+            int windowHeight = 0;
+            glfwGetWindowSize(window, &windowWidth, &windowHeight);
+
+            const int x =
+                workX + std::max(0, (workWidth - windowWidth) / 2);
+            const int y =
+                workY +
+                std::max(WindowedTopMargin, (workHeight - windowHeight) / 2);
+
+            glfwSetWindowPos(window, x, y);
+        }
+
+        WindowMode resolvedWindowMode(const WindowSpecification& spec)
+        {
+            if (spec.fullscreen)
+            {
+                return WindowMode::Fullscreen;
+            }
+
+            if (spec.maximized)
+            {
+                return WindowMode::Maximized;
+            }
+
+            return spec.mode;
+        }
+
+        void primaryMonitorBounds(
+            int& x,
+            int& y,
+            int& width,
+            int& height)
+        {
+            GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+            const GLFWvidmode* mode =
+                monitor ? glfwGetVideoMode(monitor) : nullptr;
+            if (!monitor || !mode)
+            {
+                return;
+            }
+
+            glfwGetMonitorPos(monitor, &x, &y);
+            width = mode->width;
+            height = mode->height;
+        }
+    }
+
     GLFWWindow::GLFWWindow(const WindowSpecification& spec)
     {
+        const WindowMode mode = resolvedWindowMode(spec);
+        int windowX = 0;
+        int windowY = 0;
+        int windowWidth = static_cast<int>(spec.width);
+        int windowHeight = static_cast<int>(spec.height);
+        primaryMonitorBounds(windowX, windowY, windowWidth, windowHeight);
+
+        const bool useMonitorSize =
+            mode == WindowMode::BorderlessFullscreen ||
+            mode == WindowMode::Fullscreen;
+        if (!useMonitorSize)
+        {
+            windowWidth = static_cast<int>(spec.width);
+            windowHeight = static_cast<int>(spec.height);
+        }
+
+        GLFWmonitor* fullscreenMonitor =
+            mode == WindowMode::Fullscreen ? glfwGetPrimaryMonitor() : nullptr;
+
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
+        glfwWindowHint(GLFW_RESIZABLE, spec.resizable ? GLFW_TRUE : GLFW_FALSE);
+        glfwWindowHint(
+            GLFW_DECORATED,
+            mode == WindowMode::BorderlessFullscreen ? GLFW_FALSE : GLFW_TRUE);
 
         m_window = glfwCreateWindow(
-            spec.width,
-            spec.height,
+            windowWidth,
+            windowHeight,
             spec.title.c_str(),
-            nullptr,
+            fullscreenMonitor,
             nullptr
         );
 
         if (!m_window)
             throw std::runtime_error("Failed to create GLFW window");
+
+        if (mode == WindowMode::BorderlessFullscreen)
+        {
+            glfwSetWindowPos(m_window, windowX, windowY);
+        }
+        else if (mode == WindowMode::Maximized)
+        {
+            placeWindowOnPrimaryMonitor(m_window);
+            glfwMaximizeWindow(m_window);
+        }
+        else if (mode == WindowMode::Windowed)
+        {
+            placeWindowOnPrimaryMonitor(m_window);
+        }
 
         glfwSetWindowUserPointer(m_window, this);
 

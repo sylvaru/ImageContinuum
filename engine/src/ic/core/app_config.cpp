@@ -153,6 +153,37 @@ namespace
         throw std::runtime_error("Unknown renderer backend: " + value);
     }
 
+    ic::WindowMode parseWindowMode(std::string value)
+    {
+        value = lower(std::move(value));
+
+        if (value == "windowed")
+        {
+            return ic::WindowMode::Windowed;
+        }
+
+        if (value == "maximized")
+        {
+            return ic::WindowMode::Maximized;
+        }
+
+        if (value == "borderless" ||
+            value == "borderless_fullscreen" ||
+            value == "borderless-fullscreen")
+        {
+            return ic::WindowMode::BorderlessFullscreen;
+        }
+
+        if (value == "fullscreen" ||
+            value == "exclusive_fullscreen" ||
+            value == "exclusive-fullscreen")
+        {
+            return ic::WindowMode::Fullscreen;
+        }
+
+        throw std::runtime_error("Unknown window mode: " + value);
+    }
+
     ic::RenderPathType parseRenderPath(std::string value)
     {
         value = lower(std::move(value));
@@ -238,6 +269,26 @@ namespace ic
                 uintOr(*window, "width", config.app.window.width);
             config.app.window.height =
                 uintOr(*window, "height", config.app.window.height);
+            config.app.window.resizable =
+                boolOr(*window, "resizable", config.app.window.resizable);
+            config.app.window.maximized =
+                boolOr(*window, "maximized", config.app.window.maximized);
+            config.app.window.fullscreen =
+                boolOr(*window, "fullscreen", config.app.window.fullscreen);
+
+            if (const std::optional<std::string> mode =
+                (*window)["mode"].value<std::string>())
+            {
+                config.app.window.mode = parseWindowMode(*mode);
+            }
+            else if (config.app.window.fullscreen)
+            {
+                config.app.window.mode = WindowMode::Fullscreen;
+            }
+            else if (config.app.window.maximized)
+            {
+                config.app.window.mode = WindowMode::Maximized;
+            }
         }
 
         if (const toml::table* paths = root["paths"].as_table())

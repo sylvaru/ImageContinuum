@@ -16,6 +16,7 @@
 #include <d3d12.h>
 #include <glm/glm.hpp>
 #include <unordered_map>
+#include <vector>
 
 
 namespace ic
@@ -41,6 +42,8 @@ namespace ic
 
         bool beginDebugGuiFrame() override;
         void endDebugGuiFrame() override;
+        bool vsyncEnabled() const override;
+        void setVsyncEnabled(bool enabled) override;
 
         DX12ResourceAllocator& resourceAllocator()
         {
@@ -95,12 +98,24 @@ namespace ic
             uint32_t materialIndex = 0;
         };
 
+        struct PreparedSceneFrame
+        {
+            uint64_t frameIndex = UINT64_MAX;
+            bool valid = false;
+
+            std::vector<DrawItem> draws;
+            std::vector<GpuObjectData> objects;
+            std::vector<GpuMaterialData> materials;
+            std::unordered_map<AssetHandle, uint32_t, AssetHandleHash>
+                materialOffsets;
+        };
+
         struct PathTraceResources
         {
             DX12Texture accumulation;
             DX12Texture tonemap;
-            DX12Buffer pathTraceConstants;
-            DX12Buffer tonemapConstants;
+            std::vector<DX12Buffer> pathTraceConstants;
+            std::vector<DX12Buffer> tonemapConstants;
             DX12Buffer sceneVertices;
             DX12Buffer sceneMaterials;
             DX12Buffer sceneTriangles;
@@ -146,8 +161,7 @@ namespace ic
 
         void applyBarriers(
             ID3D12GraphicsCommandList4* cmd,
-            std::span<const ResourceBarrier> barriers,
-            std::span<const GraphResource> resources,
+            const CompiledGraphPlan& plan,
             const ExecutionNode& node,
             ID3D12Resource* swapchainImage);
 
@@ -190,6 +204,7 @@ namespace ic
         void executeTonemapNode(
             const CompiledGraphPlan& plan,
             const ExecutionNode& node,
+            const FrameContext& ctx,
             ID3D12GraphicsCommandList4* cmd);
 
         void executeTransferNode(
@@ -218,8 +233,7 @@ namespace ic
 
         bool prepareSceneResources(
             const FrameContext& ctx,
-            const SceneRenderView& scene,
-            std::vector<DrawItem>& draws);
+            const SceneRenderView& scene);
 
         GraphicsPipelineHandle pipelineForNode(
             const CompiledGraphPlan& plan,
@@ -270,6 +284,7 @@ namespace ic
         std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash> m_computePipelineHandles;
         std::unordered_map<AssetHandle, UploadedModel, AssetHandleHash> m_uploadedModels;
         std::vector<FrameSceneResources> m_sceneFrameResources;
+        PreparedSceneFrame m_preparedScene;
 
         Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
         HANDLE m_fenceEvent = nullptr;

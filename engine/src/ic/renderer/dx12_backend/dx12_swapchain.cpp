@@ -122,7 +122,7 @@ namespace ic
                     m_width,
                     m_height,
                     m_format,
-                    m_factory->allowTearing() ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0),
+                    0),
                 "Failed to resize DX12 swapchain buffers.");
         }
 
@@ -144,10 +144,7 @@ namespace ic
         }
 
         const UINT syncInterval = m_vsync ? 1u : 0u;
-        const UINT flags =
-            (!m_vsync && m_factory->allowTearing())
-                ? DXGI_PRESENT_ALLOW_TEARING
-                : 0u;
+        const UINT flags = 0u;
 
         HRESULT hr = m_swapchain->Present(syncInterval, flags);
         if (hr == DXGI_ERROR_DEVICE_REMOVED ||
@@ -219,7 +216,7 @@ namespace ic
         desc.Scaling = DXGI_SCALING_STRETCH;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        desc.Flags = m_factory->allowTearing() ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+        desc.Flags = 0;
 
         Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain1;
         throwIfFailed(

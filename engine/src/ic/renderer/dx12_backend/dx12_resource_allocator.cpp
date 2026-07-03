@@ -1,5 +1,7 @@
 #include "ic/renderer/dx12_backend/dx12_resource_allocator.h"
 
+#include "ic/core/asset_manager.h"
+
 #include <spdlog/spdlog.h>
 
 #include <string>
@@ -13,6 +15,28 @@ namespace
         {
             throw std::runtime_error(message);
         }
+    }
+
+    ic::TextureFormat textureFormatFromImageAsset(const ic::ImageAsset& image)
+    {
+        switch (image.format)
+        {
+        case ic::ImageFormat::RGBA8:
+            return image.srgb
+                ? ic::TextureFormat::RGBA8_SRGB
+                : ic::TextureFormat::RGBA8_UNorm;
+        case ic::ImageFormat::RGBA32F:
+            return ic::TextureFormat::RGBA32_Float;
+        case ic::ImageFormat::R8:
+        case ic::ImageFormat::RG8:
+        case ic::ImageFormat::RGB8:
+        case ic::ImageFormat::Unknown:
+            break;
+        }
+
+        throw std::runtime_error(
+            "ImageAsset format cannot be represented by the DX12 texture allocator. "
+            "Decode with forceRGBA=true or add a renderer TextureFormat mapping.");
     }
 }
 
@@ -167,6 +191,29 @@ namespace ic
         }
 
         return texture;
+    }
+
+    DX12Texture DX12ResourceAllocator::createTexture(
+        const ImageAsset& image,
+        TextureUsageFlags usage,
+        const char* debugName)
+    {
+        if (!image.valid())
+        {
+            throw std::runtime_error("Cannot create DX12 texture from invalid ImageAsset.");
+        }
+
+        TextureDesc desc{};
+        desc.width = image.width;
+        desc.height = image.height;
+        desc.depth = 1;
+        desc.mipLevels = 1;
+        desc.arrayLayers = 1;
+        desc.format = textureFormatFromImageAsset(image);
+        desc.usage = usage;
+        desc.memoryUsage = ResourceMemoryUsage::GpuOnly;
+        desc.debugName = debugName;
+        return createTexture(desc);
     }
 
     void DX12ResourceAllocator::destroyBuffer(DX12Buffer& buffer)

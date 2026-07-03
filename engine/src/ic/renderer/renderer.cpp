@@ -179,5 +179,20 @@ namespace ic
         }
     }
 
+    bool Renderer::vsyncEnabled() const
+    {
+        return m_runtime &&
+            m_runtime->backend &&
+            m_runtime->backend->vsyncEnabled();
+    }
+
+    void Renderer::setVsyncEnabled(bool enabled)
+    {
+        if (m_runtime && m_runtime->backend)
+        {
+            m_runtime->backend->setVsyncEnabled(enabled);
+        }
+    }
+
 
 }

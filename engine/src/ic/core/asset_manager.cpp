@@ -105,6 +105,348 @@ namespace ic
         {
             return table[key].value_or(fallback);
         }
+
+        std::vector<std::byte> copyBytes(std::span<const std::byte> bytes)
+        {
+            return std::vector<std::byte>(bytes.begin(), bytes.end());
+        }
+
+        TextureWrapMode convertWrap(fastgltf::Wrap wrap)
+        {
+            switch (wrap)
+            {
+            case fastgltf::Wrap::Repeat:
+                return TextureWrapMode::Repeat;
+            case fastgltf::Wrap::MirroredRepeat:
+                return TextureWrapMode::MirroredRepeat;
+            case fastgltf::Wrap::ClampToEdge:
+                return TextureWrapMode::ClampToEdge;
+            }
+
+            return TextureWrapMode::Repeat;
+        }
+
+        TextureFilterMode convertFilter(fastgltf::Optional<fastgltf::Filter> filter)
+        {
+            if (!filter.has_value())
+            {
+                return TextureFilterMode::Default;
+            }
+
+            switch (*filter)
+            {
+            case fastgltf::Filter::Nearest:
+                return TextureFilterMode::Nearest;
+            case fastgltf::Filter::Linear:
+                return TextureFilterMode::Linear;
+            case fastgltf::Filter::NearestMipMapNearest:
+                return TextureFilterMode::NearestMipmapNearest;
+            case fastgltf::Filter::LinearMipMapNearest:
+                return TextureFilterMode::LinearMipmapNearest;
+            case fastgltf::Filter::NearestMipMapLinear:
+                return TextureFilterMode::NearestMipmapLinear;
+            case fastgltf::Filter::LinearMipMapLinear:
+                return TextureFilterMode::LinearMipmapLinear;
+            }
+
+            return TextureFilterMode::Default;
+        }
+
+        SamplerAsset decodeSampler(const fastgltf::Sampler& src)
+        {
+            SamplerAsset dst{};
+            dst.name = std::string(src.name);
+            dst.minFilter = convertFilter(src.minFilter);
+            dst.magFilter = convertFilter(src.magFilter);
+            dst.wrapU = convertWrap(src.wrapS);
+            dst.wrapV = convertWrap(src.wrapT);
+            return dst;
+        }
+
+        MaterialTextureSlot decodeTextureInfo(
+            const fastgltf::TextureInfo& info,
+            TextureTransferFunction transfer)
+        {
+            MaterialTextureSlot slot{};
+            slot.textureIndex = static_cast<int32_t>(info.textureIndex);
+            slot.texCoord = static_cast<uint32_t>(info.texCoordIndex);
+            slot.transfer = transfer;
+            return slot;
+        }
+
+        MaterialTextureSlot decodeNormalTextureInfo(
+            const fastgltf::NormalTextureInfo& info)
+        {
+            MaterialTextureSlot slot =
+                decodeTextureInfo(info, TextureTransferFunction::Linear);
+            slot.scale = static_cast<float>(info.scale);
+            return slot;
+        }
+
+        MaterialTextureSlot decodeOcclusionTextureInfo(
+            const fastgltf::OcclusionTextureInfo& info)
+        {
+            MaterialTextureSlot slot =
+                decodeTextureInfo(info, TextureTransferFunction::Linear);
+            slot.strength = static_cast<float>(info.strength);
+            return slot;
+        }
+
+        std::vector<std::byte> readWholeFileBytes(
+            const std::filesystem::path& path,
+            bool nullTerminate)
+        {
+            std::ifstream file(path, std::ios::binary | std::ios::ate);
+            if (!file)
+            {
+                throw std::runtime_error("Could not open file: " + path.string());
+            }
+
+            const std::streamsize size = file.tellg();
+            if (size < 0)
+            {
+                throw std::runtime_error("Could not determine file size: " + path.string());
+            }
+
+            file.seekg(0, std::ios::beg);
+
+            std::vector<std::byte> bytes(
+                static_cast<size_t>(size) + (nullTerminate ? 1u : 0u));
+
+            if (size > 0)
+            {
+                file.read(reinterpret_cast<char*>(bytes.data()), size);
+                if (!file)
+                {
+                    throw std::runtime_error("Could not read file: " + path.string());
+                }
+            }
+
+            if (nullTerminate)
+            {
+                bytes[static_cast<size_t>(size)] = std::byte{ 0 };
+            }
+
+            return bytes;
+        }
+
+        ImageAsset decodeImageBytes(
+            std::span<const std::byte> bytes,
+            const ImageLoadOptions& options)
+        {
+            if (bytes.empty())
+            {
+                throw std::runtime_error("Image byte span is empty");
+            }
+
+            stbi_set_flip_vertically_on_load_thread(options.flipY ? 1 : 0);
+
+            int width = 0;
+            int height = 0;
+            int sourceChannels = 0;
+            const int desiredChannels = options.forceRGBA ? 4 : 0;
+
+            if (stbi_is_hdr_from_memory(
+                    reinterpret_cast<const stbi_uc*>(bytes.data()),
+                    static_cast<int>(bytes.size())) != 0)
+            {
+                float* decoded = stbi_loadf_from_memory(
+                    reinterpret_cast<const stbi_uc*>(bytes.data()),
+                    static_cast<int>(bytes.size()),
+                    &width,
+                    &height,
+                    &sourceChannels,
+                    desiredChannels);
+
+                if (!decoded)
+                {
+                    const char* reason = stbi_failure_reason();
+                    throw std::runtime_error(
+                        std::string("stbi_loadf_from_memory failed: ") +
+                        (reason ? reason : "unknown error"));
+                }
+
+                const uint32_t outputChannels =
+                    options.forceRGBA ? 4u : static_cast<uint32_t>(sourceChannels);
+                if (outputChannels != 4)
+                {
+                    stbi_image_free(decoded);
+                    throw std::runtime_error("HDR images must decode to RGBA32F");
+                }
+
+                const size_t pixelByteCount =
+                    static_cast<size_t>(width) *
+                    static_cast<size_t>(height) *
+                    static_cast<size_t>(outputChannels) *
+                    sizeof(float);
+
+                ImageAsset image{};
+                image.width = static_cast<uint32_t>(width);
+                image.height = static_cast<uint32_t>(height);
+                image.channels = outputChannels;
+                image.format = ImageFormat::RGBA32F;
+                image.srgb = false;
+                image.pixels.resize(pixelByteCount);
+                std::memcpy(image.pixels.data(), decoded, pixelByteCount);
+                stbi_image_free(decoded);
+                return image;
+            }
+
+            stbi_uc* decoded = stbi_load_from_memory(
+                reinterpret_cast<const stbi_uc*>(bytes.data()),
+                static_cast<int>(bytes.size()),
+                &width,
+                &height,
+                &sourceChannels,
+                desiredChannels);
+
+            if (!decoded)
+            {
+                const char* reason = stbi_failure_reason();
+                throw std::runtime_error(
+                    std::string("stbi_load_from_memory failed: ") +
+                    (reason ? reason : "unknown error"));
+            }
+
+            const uint32_t outputChannels =
+                options.forceRGBA ? 4u : static_cast<uint32_t>(sourceChannels);
+            const size_t pixelByteCount =
+                static_cast<size_t>(width) *
+                static_cast<size_t>(height) *
+                static_cast<size_t>(outputChannels);
+
+            ImageAsset image{};
+            image.width = static_cast<uint32_t>(width);
+            image.height = static_cast<uint32_t>(height);
+            image.channels = outputChannels;
+            image.srgb = options.srgb;
+
+            switch (outputChannels)
+            {
+            case 1:
+                image.format = ImageFormat::R8;
+                break;
+            case 2:
+                image.format = ImageFormat::RG8;
+                break;
+            case 3:
+                image.format = ImageFormat::RGB8;
+                break;
+            case 4:
+                image.format = ImageFormat::RGBA8;
+                break;
+            default:
+                stbi_image_free(decoded);
+                throw std::runtime_error("Unsupported image channel count");
+            }
+
+            image.pixels.resize(pixelByteCount);
+            std::memcpy(image.pixels.data(), decoded, pixelByteCount);
+            stbi_image_free(decoded);
+            return image;
+        }
+
+        std::vector<std::byte> extractGltfImageBytes(
+            const fastgltf::Asset& gltf,
+            const fastgltf::Image& image,
+            const std::filesystem::path& modelDirectory)
+        {
+            return std::visit(
+                fastgltf::visitor{
+                    [](const fastgltf::sources::Array& array)
+                    {
+                        return copyBytes(
+                            std::span<const std::byte>(
+                                array.bytes.data(),
+                                array.bytes.size_bytes()));
+                    },
+                    [](const fastgltf::sources::Vector& vector)
+                    {
+                        return copyBytes(vector.bytes);
+                    },
+                    [](const fastgltf::sources::ByteView& view)
+                    {
+                        return copyBytes(view.bytes);
+                    },
+                    [&](const fastgltf::sources::BufferView& view)
+                    {
+                        if (view.bufferViewIndex >= gltf.bufferViews.size())
+                        {
+                            throw std::runtime_error("glTF image references an invalid buffer view");
+                        }
+
+                        fastgltf::DefaultBufferDataAdapter adapter{};
+                        return copyBytes(adapter(gltf, view.bufferViewIndex));
+                    },
+                    [&](const fastgltf::sources::URI& uri)
+                    {
+                        if (!uri.uri.isLocalPath())
+                        {
+                            throw std::runtime_error("glTF image URI is not a local path");
+                        }
+
+                        const std::string uriPath(
+                            uri.uri.path().begin(),
+                            uri.uri.path().end());
+                        const std::filesystem::path imagePath =
+                            (modelDirectory / uriPath).lexically_normal();
+                        std::vector<std::byte> bytes =
+                            readWholeFileBytes(imagePath, false);
+
+                        if (uri.fileByteOffset > bytes.size())
+                        {
+                            throw std::runtime_error("glTF image URI byte offset is out of range");
+                        }
+
+                        if (uri.fileByteOffset == 0)
+                        {
+                            return bytes;
+                        }
+
+                        return std::vector<std::byte>(
+                            bytes.begin() + static_cast<ptrdiff_t>(uri.fileByteOffset),
+                            bytes.end());
+                    },
+                    [](const auto&) -> std::vector<std::byte>
+                    {
+                        throw std::runtime_error("Unsupported glTF image data source");
+                    }},
+                image.data);
+        }
+
+        ImageAsset decodeGltfImage(
+            const std::vector<std::byte>& bytes,
+            bool flipY,
+            std::string_view debugName)
+        {
+            ImageLoadOptions options{};
+            options.forceRGBA = true;
+            options.srgb = false;
+            options.flipY = flipY;
+
+            try
+            {
+                return decodeImageBytes(bytes, options);
+            }
+            catch (const std::exception& e)
+            {
+                throw std::runtime_error(
+                    "Failed to decode glTF image '" +
+                    std::string(debugName) +
+                    "': " +
+                    e.what());
+            }
+        }
+
+        glm::vec3 toGlm(const fastgltf::math::fvec3& v)
+        {
+            return glm::vec3(v[0], v[1], v[2]);
+        }
+
+        glm::quat toGlm(const fastgltf::math::fquat& q)
+        {
+            return glm::quat(q[3], q[0], q[1], q[2]);
+        }
     }
 
     size_t AssetManager::AssetKeyHash::operator()(const AssetKey& key) const noexcept
@@ -346,7 +688,6 @@ namespace ic
                     options.loadTextures = tomlBoolOr(assetTable, "load_textures", options.loadTextures);
                     options.generateTangentsIfMissing = tomlBoolOr(assetTable, "generate_tangents_if_missing", options.generateTangentsIfMissing);
                     options.mergeMeshes = tomlBoolOr(assetTable, "merge_meshes", options.mergeMeshes);
-                    options.srgbBaseColorTextures = tomlBoolOr(assetTable, "srgb_base_color_textures", options.srgbBaseColorTextures);
                     handle = loadModelAsync(assetPath, options);
                     break;
                 }
@@ -441,6 +782,11 @@ namespace ic
             r->error.clear();
         }
 
+        {
+            std::unique_lock recordsLock(m_recordsMutex);
+            m_cache.erase(r->key);
+        }
+
         r->state.store(AssetState::Unloaded, std::memory_order_release);
     }
 
@@ -519,6 +865,48 @@ namespace ic
 
     const AssetData* AssetManager::data(AssetHandle handle) const
     {
+        std::shared_ptr<const AssetData> asset = dataShared(handle);
+        return asset ? asset.get() : nullptr;
+    }
+
+    std::shared_ptr<const ImageAsset> AssetManager::imageShared(AssetHandle handle) const
+    {
+        std::shared_ptr<const AssetData> asset = dataShared(handle);
+        if (!asset)
+        {
+            return nullptr;
+        }
+
+        const ImageAsset* image = std::get_if<ImageAsset>(asset.get());
+        return image ? std::shared_ptr<const ImageAsset>(std::move(asset), image) : nullptr;
+    }
+
+    std::shared_ptr<const ModelAsset> AssetManager::modelShared(AssetHandle handle) const
+    {
+        std::shared_ptr<const AssetData> asset = dataShared(handle);
+        if (!asset)
+        {
+            return nullptr;
+        }
+
+        const ModelAsset* model = std::get_if<ModelAsset>(asset.get());
+        return model ? std::shared_ptr<const ModelAsset>(std::move(asset), model) : nullptr;
+    }
+
+    std::shared_ptr<const BinaryAsset> AssetManager::binaryShared(AssetHandle handle) const
+    {
+        std::shared_ptr<const AssetData> asset = dataShared(handle);
+        if (!asset)
+        {
+            return nullptr;
+        }
+
+        const BinaryAsset* binary = std::get_if<BinaryAsset>(asset.get());
+        return binary ? std::shared_ptr<const BinaryAsset>(std::move(asset), binary) : nullptr;
+    }
+
+    std::shared_ptr<const AssetData> AssetManager::dataShared(AssetHandle handle) const
+    {
         const AssetRecord* r = record(handle);
         if (!r)
         {
@@ -526,7 +914,7 @@ namespace ic
         }
 
         std::shared_lock lock(r->mutex);
-        return r->data ? r->data.get() : nullptr;
+        return r->data;
     }
 
     AssetHandle AssetManager::requestLoad(
@@ -815,7 +1203,6 @@ namespace ic
         hashCombine(h, options.loadTextures ? 1ull : 0ull);
         hashCombine(h, options.generateTangentsIfMissing ? 1ull : 0ull);
         hashCombine(h, options.mergeMeshes ? 1ull : 0ull);
-        hashCombine(h, options.srgbBaseColorTextures ? 1ull : 0ull);
         return h;
     }
 
@@ -830,109 +1217,14 @@ namespace ic
         const std::filesystem::path& path,
         bool nullTerminate)
     {
-        std::ifstream file(path, std::ios::binary | std::ios::ate);
-        if (!file)
-        {
-            throw std::runtime_error("Could not open file: " + path.string());
-        }
-
-        const std::streamsize size = file.tellg();
-        if (size < 0)
-        {
-            throw std::runtime_error("Could not determine file size: " + path.string());
-        }
-
-        file.seekg(0, std::ios::beg);
-
-        std::vector<std::byte> bytes(
-            static_cast<size_t>(size) + (nullTerminate ? 1u : 0u));
-
-        if (size > 0)
-        {
-            file.read(reinterpret_cast<char*>(bytes.data()), size);
-            if (!file)
-            {
-                throw std::runtime_error("Could not read file: " + path.string());
-            }
-        }
-
-        if (nullTerminate)
-        {
-            bytes[static_cast<size_t>(size)] = std::byte{ 0 };
-        }
-
-        return bytes;
+        return readWholeFileBytes(path, nullTerminate);
     }
 
     ImageAsset AssetManager::decodeImage(
         std::span<const std::byte> bytes,
         const ImageLoadOptions& options)
     {
-        if (bytes.empty())
-        {
-            throw std::runtime_error("Image byte span is empty");
-        }
-
-        stbi_set_flip_vertically_on_load(options.flipY ? 1 : 0);
-
-        int width = 0;
-        int height = 0;
-        int sourceChannels = 0;
-        const int desiredChannels = options.forceRGBA ? 4 : 0;
-
-        stbi_uc* decoded = stbi_load_from_memory(
-            reinterpret_cast<const stbi_uc*>(bytes.data()),
-            static_cast<int>(bytes.size()),
-            &width,
-            &height,
-            &sourceChannels,
-            desiredChannels);
-
-        if (!decoded)
-        {
-            const char* reason = stbi_failure_reason();
-            throw std::runtime_error(
-                std::string("stbi_load_from_memory failed: ") +
-                (reason ? reason : "unknown error"));
-        }
-
-        const uint32_t outputChannels =
-            options.forceRGBA ? 4u : static_cast<uint32_t>(sourceChannels);
-        const size_t pixelByteCount =
-            static_cast<size_t>(width) *
-            static_cast<size_t>(height) *
-            static_cast<size_t>(outputChannels);
-
-        ImageAsset image{};
-        image.width = static_cast<uint32_t>(width);
-        image.height = static_cast<uint32_t>(height);
-        image.channels = outputChannels;
-        image.srgb = options.srgb;
-
-        switch (outputChannels)
-        {
-        case 1:
-            image.format = ImageFormat::R8;
-            break;
-        case 2:
-            image.format = ImageFormat::RG8;
-            break;
-        case 3:
-            image.format = ImageFormat::RGB8;
-            break;
-        case 4:
-            image.format = ImageFormat::RGBA8;
-            break;
-        default:
-            stbi_image_free(decoded);
-            throw std::runtime_error("Unsupported image channel count");
-        }
-
-        image.pixels.resize(pixelByteCount);
-        std::memcpy(image.pixels.data(), decoded, pixelByteCount);
-        stbi_image_free(decoded);
-
-        return image;
+        return decodeImageBytes(bytes, options);
     }
 
     ModelAsset AssetManager::decodeModel(
@@ -945,14 +1237,17 @@ namespace ic
             throw std::runtime_error("fastgltf could not read file: " + path.string());
         }
 
-        constexpr auto gltfOptions = fastgltf::Options::LoadExternalBuffers;
+        constexpr auto gltfOptions =
+            fastgltf::Options::LoadExternalBuffers |
+            fastgltf::Options::LoadExternalImages |
+            fastgltf::Options::DecomposeNodeMatrices;
 
         fastgltf::Parser parser{};
         auto assetResult = parser.loadGltf(
             data.get(),
             path.parent_path(),
             gltfOptions,
-            fastgltf::Category::OnlyRenderable);
+            fastgltf::Category::All);
 
         if (assetResult.error() != fastgltf::Error::None)
         {
@@ -963,6 +1258,65 @@ namespace ic
 
         ModelAsset model{};
         model.name = path.stem().string();
+
+        model.samplers.reserve(gltf.samplers.size());
+        for (const fastgltf::Sampler& src : gltf.samplers)
+        {
+            model.samplers.push_back(decodeSampler(src));
+        }
+
+        if (options.loadTextures)
+        {
+            model.images.reserve(gltf.images.size());
+            for (size_t imageIndex = 0; imageIndex < gltf.images.size(); ++imageIndex)
+            {
+                const fastgltf::Image& src = gltf.images[imageIndex];
+                std::vector<std::byte> imageBytes =
+                    extractGltfImageBytes(gltf, src, path.parent_path());
+                model.images.push_back(
+                    decodeGltfImage(
+                        imageBytes,
+                        false,
+                        src.name.empty()
+                            ? std::string_view("image")
+                            : std::string_view(src.name)));
+            }
+        }
+
+        model.textures.reserve(gltf.textures.size());
+        for (size_t textureIndex = 0; textureIndex < gltf.textures.size(); ++textureIndex)
+        {
+            const fastgltf::Texture& src = gltf.textures[textureIndex];
+
+            TextureAsset dst{};
+            dst.name = std::string(src.name);
+
+            if (src.imageIndex.has_value())
+            {
+                dst.imageIndex = static_cast<int32_t>(*src.imageIndex);
+            }
+            else if (src.basisuImageIndex.has_value() ||
+                     src.ddsImageIndex.has_value() ||
+                     src.webpImageIndex.has_value())
+            {
+                spdlog::warn(
+                    "[AssetManager] glTF texture {} uses a compressed/webp image path that is not decoded yet.",
+                    textureIndex);
+            }
+            else
+            {
+                spdlog::warn(
+                    "[AssetManager] glTF texture {} does not reference an image.",
+                    textureIndex);
+            }
+
+            if (src.samplerIndex.has_value())
+            {
+                dst.samplerIndex = static_cast<int32_t>(*src.samplerIndex);
+            }
+
+            model.textures.push_back(std::move(dst));
+        }
 
         if (options.loadMaterials)
         {
@@ -983,29 +1337,42 @@ namespace ic
                     src.emissiveFactor[0],
                     src.emissiveFactor[1],
                     src.emissiveFactor[2]);
+                dst.emissiveStrength = src.emissiveStrength;
                 dst.doubleSided = src.doubleSided;
                 dst.alphaBlend = src.alphaMode == fastgltf::AlphaMode::Blend;
                 dst.alphaMask = src.alphaMode == fastgltf::AlphaMode::Mask;
+                dst.unlit = src.unlit;
 
                 if (src.pbrData.baseColorTexture.has_value())
                 {
-                    dst.baseColorImage =
-                        static_cast<int32_t>(src.pbrData.baseColorTexture->textureIndex);
+                    dst.baseColorTexture =
+                        decodeTextureInfo(
+                            *src.pbrData.baseColorTexture,
+                            TextureTransferFunction::SRGB);
                 }
                 if (src.normalTexture.has_value())
                 {
-                    dst.normalImage =
-                        static_cast<int32_t>(src.normalTexture->textureIndex);
+                    dst.normalTexture =
+                        decodeNormalTextureInfo(*src.normalTexture);
                 }
                 if (src.pbrData.metallicRoughnessTexture.has_value())
                 {
-                    dst.metallicRoughnessImage =
-                        static_cast<int32_t>(src.pbrData.metallicRoughnessTexture->textureIndex);
+                    dst.metallicRoughnessTexture =
+                        decodeTextureInfo(
+                            *src.pbrData.metallicRoughnessTexture,
+                            TextureTransferFunction::Linear);
+                }
+                if (src.occlusionTexture.has_value())
+                {
+                    dst.occlusionTexture =
+                        decodeOcclusionTextureInfo(*src.occlusionTexture);
                 }
                 if (src.emissiveTexture.has_value())
                 {
-                    dst.emissiveImage =
-                        static_cast<int32_t>(src.emissiveTexture->textureIndex);
+                    dst.emissiveTexture =
+                        decodeTextureInfo(
+                            *src.emissiveTexture,
+                            TextureTransferFunction::SRGB);
                 }
 
                 model.materials.push_back(std::move(dst));
@@ -1023,9 +1390,20 @@ namespace ic
 
             for (const fastgltf::Primitive& primitive : srcMesh.primitives)
             {
+                if (primitive.type != fastgltf::PrimitiveType::Triangles)
+                {
+                    spdlog::warn(
+                        "[AssetManager] Skipping non-triangle glTF primitive in '{}'.",
+                        path.string());
+                    continue;
+                }
+
                 const auto positionIt = primitive.findAttribute("POSITION");
                 if (positionIt == primitive.attributes.end())
                 {
+                    spdlog::warn(
+                        "[AssetManager] Skipping glTF primitive without POSITION in '{}'.",
+                        path.string());
                     continue;
                 }
 
@@ -1037,6 +1415,14 @@ namespace ic
                 {
                     dstPrimitive.materialIndex =
                         static_cast<uint32_t>(*primitive.materialIndex);
+                    if (options.loadMaterials &&
+                        *primitive.materialIndex >= model.materials.size())
+                    {
+                        spdlog::warn(
+                            "[AssetManager] glTF primitive references missing material {} in '{}'.",
+                            *primitive.materialIndex,
+                            path.string());
+                    }
                 }
 
                 const fastgltf::Accessor& positionAccessor =
@@ -1169,8 +1555,33 @@ namespace ic
             {
                 dstNode.meshIndex = static_cast<int32_t>(*srcNode.meshIndex);
             }
+            if (srcNode.cameraIndex.has_value())
+            {
+                dstNode.cameraIndex = static_cast<int32_t>(*srcNode.cameraIndex);
+            }
+            if (srcNode.lightIndex.has_value())
+            {
+                dstNode.lightIndex = static_cast<int32_t>(*srcNode.lightIndex);
+            }
+            if (srcNode.skinIndex.has_value())
+            {
+                dstNode.skinIndex = static_cast<int32_t>(*srcNode.skinIndex);
+            }
 
             dstNode.localMatrix = toGlm(fastgltf::getTransformMatrix(srcNode));
+            if (const auto* trs = std::get_if<fastgltf::TRS>(&srcNode.transform))
+            {
+                dstNode.translation = toGlm(trs->translation);
+                dstNode.rotation = toGlm(trs->rotation);
+                dstNode.scale = toGlm(trs->scale);
+            }
+
+            dstNode.children.reserve(srcNode.children.size());
+            for (size_t childIndex : srcNode.children)
+            {
+                dstNode.children.push_back(static_cast<uint32_t>(childIndex));
+            }
+
             model.nodes.push_back(std::move(dstNode));
         }
 
@@ -1185,9 +1596,30 @@ namespace ic
             }
         }
 
+        model.scenes.reserve(gltf.scenes.size());
+        for (const fastgltf::Scene& srcScene : gltf.scenes)
+        {
+            SceneAsset dstScene{};
+            dstScene.name = std::string(srcScene.name);
+            dstScene.rootNodes.reserve(srcScene.nodeIndices.size());
+            for (size_t nodeIndex : srcScene.nodeIndices)
+            {
+                dstScene.rootNodes.push_back(static_cast<uint32_t>(nodeIndex));
+            }
+            model.scenes.push_back(std::move(dstScene));
+        }
+
+        model.defaultScene =
+            gltf.defaultScene.has_value()
+                ? static_cast<int32_t>(*gltf.defaultScene)
+                : (model.scenes.empty() ? -1 : 0);
+
         if (!gltf.scenes.empty())
         {
-            const size_t sceneIndex = gltf.defaultScene.value_or(0);
+            const size_t sceneIndex =
+                model.defaultScene >= 0
+                    ? static_cast<size_t>(model.defaultScene)
+                    : 0;
             fastgltf::iterateSceneNodes(
                 gltf,
                 sceneIndex,
@@ -1202,10 +1634,43 @@ namespace ic
                 });
         }
 
-        if (options.loadTextures)
+        for (size_t materialIndex = 0; materialIndex < model.materials.size(); ++materialIndex)
         {
-            spdlog::debug("[AssetManager] glTF texture extraction is not implemented yet: {}", path.string());
+            const MaterialAsset& material = model.materials[materialIndex];
+            const MaterialTextureSlot slots[] = {
+                material.baseColorTexture,
+                material.normalTexture,
+                material.metallicRoughnessTexture,
+                material.occlusionTexture,
+                material.emissiveTexture,
+            };
+
+            for (const MaterialTextureSlot& slot : slots)
+            {
+                if (slot.textureIndex >= 0 &&
+                    static_cast<size_t>(slot.textureIndex) >= model.textures.size())
+                {
+                    spdlog::warn(
+                        "[AssetManager] glTF material {} references missing texture {} in '{}'.",
+                        materialIndex,
+                        slot.textureIndex,
+                        path.string());
+                }
+            }
         }
+
+        spdlog::info(
+            "[AssetManager] Loaded glTF '{}': {} vertices, {} indices, {} meshes, {} materials, {} images, {} textures, {} samplers, {} nodes, {} scenes",
+            path.string(),
+            model.vertices.size(),
+            model.indices.size(),
+            model.meshes.size(),
+            model.materials.size(),
+            model.images.size(),
+            model.textures.size(),
+            model.samplers.size(),
+            model.nodes.size(),
+            model.scenes.size());
 
         return model;
     }
