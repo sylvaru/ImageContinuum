@@ -1,6 +1,8 @@
 #ifndef IC_MATERIALS_HLSLI
 #define IC_MATERIALS_HLSLI
 
+static const uint IC_INVALID_BINDLESS_INDEX = 0xffffffffu;
+
 struct ObjectData
 {
     float4x4 world;

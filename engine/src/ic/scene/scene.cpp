@@ -74,6 +74,9 @@ namespace ic
     {
         m_registry.clear();
         m_entityById.clear();
+        m_environmentTexture = {};
+        m_environmentSettings = {};
+        m_environmentVersion = 1;
         ++m_version;
     }
 

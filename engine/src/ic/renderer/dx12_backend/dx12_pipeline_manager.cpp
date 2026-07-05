@@ -1,4 +1,4 @@
-#include "ic/renderer/dx12_backend/dx12_pipeline_manager.h"
+﻿#include "ic/renderer/dx12_backend/dx12_pipeline_manager.h"
 
 #include <cstddef>
 #include <fstream>
@@ -7,6 +7,8 @@
 #include <d3dcompiler.h>
 
 #include "ic/core/asset_manager.h"
+#include "ic/util/util.h"
+#include "ic/renderer/renderer_common/renderer_util.h"
 
 namespace
 {
@@ -306,7 +308,7 @@ namespace ic
         if (layout == PipelineBindingLayoutKind::PathTrace ||
             layout == PipelineBindingLayoutKind::PathTraceTonemap)
         {
-            D3D12_ROOT_PARAMETER rootParameters[3]{};
+            D3D12_ROOT_PARAMETER rootParameters[4]{};
 
             rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             rootParameters[0].Descriptor.ShaderRegister = 0;
@@ -330,7 +332,7 @@ namespace ic
             srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
             srvRange.NumDescriptors =
                 layout == PipelineBindingLayoutKind::PathTrace
-                    ? 4u
+                    ? 5u
                     : 1u;
             srvRange.BaseShaderRegister =
                 layout == PipelineBindingLayoutKind::PathTrace
@@ -345,8 +347,22 @@ namespace ic
             rootParameters[2].DescriptorTable.pDescriptorRanges = &srvRange;
             rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+            D3D12_DESCRIPTOR_RANGE samplerRange{};
+            samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            samplerRange.NumDescriptors = 1;
+            samplerRange.BaseShaderRegister = 7;
+            samplerRange.RegisterSpace = 0;
+            samplerRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[3].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[3].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[3].DescriptorTable.pDescriptorRanges = &samplerRange;
+            rootParameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
             D3D12_ROOT_SIGNATURE_DESC rootDesc{};
-            rootDesc.NumParameters = 3u;
+            rootDesc.NumParameters =
+                layout == PipelineBindingLayoutKind::PathTrace ? 4u : 3u;
             rootDesc.pParameters = rootParameters;
             rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -378,13 +394,149 @@ namespace ic
             return rootSignature;
         }
 
+        if (layout == PipelineBindingLayoutKind::EnvironmentConvert)
+        {
+            D3D12_ROOT_PARAMETER rootParameters[3]{};
+            D3D12_DESCRIPTOR_RANGE ranges[3]{};
+
+            ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            ranges[0].NumDescriptors = 1;
+            ranges[0].BaseShaderRegister = 0;
+            ranges[0].RegisterSpace = 0;
+            ranges[0].OffsetInDescriptorsFromTableStart = 0;
+
+            ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            ranges[1].NumDescriptors = 1;
+            ranges[1].BaseShaderRegister = 1;
+            ranges[1].RegisterSpace = 0;
+            ranges[1].OffsetInDescriptorsFromTableStart = 0;
+
+            ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            ranges[2].NumDescriptors = 1;
+            ranges[2].BaseShaderRegister = 2;
+            ranges[2].RegisterSpace = 0;
+            ranges[2].OffsetInDescriptorsFromTableStart = 0;
+
+            for (UINT i = 0; i < static_cast<UINT>(std::size(rootParameters)); ++i)
+            {
+                rootParameters[i].ParameterType =
+                    D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                rootParameters[i].DescriptorTable.NumDescriptorRanges = 1;
+                rootParameters[i].DescriptorTable.pDescriptorRanges = &ranges[i];
+                rootParameters[i].ShaderVisibility =
+                    D3D12_SHADER_VISIBILITY_ALL;
+            }
+
+            D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+            rootDesc.NumParameters =
+                static_cast<UINT>(std::size(rootParameters));
+            rootDesc.pParameters = rootParameters;
+            rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+            Microsoft::WRL::ComPtr<ID3DBlob> signature;
+            Microsoft::WRL::ComPtr<ID3DBlob> error;
+            HRESULT hr = D3D12SerializeRootSignature(
+                &rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &signature,
+                &error);
+
+            if (FAILED(hr))
+            {
+                const char* message = error
+                    ? static_cast<const char*>(error->GetBufferPointer())
+                    : "Failed to serialize DX12 environment root signature.";
+                throw std::runtime_error(message);
+            }
+
+            Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+            throwIfFailed(
+                m_device->CreateRootSignature(
+                    0,
+                    signature->GetBufferPointer(),
+                    signature->GetBufferSize(),
+                    IID_PPV_ARGS(&rootSignature)),
+                "Failed to create DX12 environment root signature.");
+
+            return rootSignature;
+        }
+
+        if (layout == PipelineBindingLayoutKind::Skybox)
+        {
+            D3D12_ROOT_PARAMETER rootParameters[3]{};
+
+            rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rootParameters[0].Descriptor.ShaderRegister = 0;
+            rootParameters[0].Descriptor.RegisterSpace = 0;
+            rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_DESCRIPTOR_RANGE cubemapRange{};
+            cubemapRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            cubemapRange.NumDescriptors = 1;
+            cubemapRange.BaseShaderRegister = 0;
+            cubemapRange.RegisterSpace = 0;
+            cubemapRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[1].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[1].DescriptorTable.pDescriptorRanges = &cubemapRange;
+            rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_DESCRIPTOR_RANGE samplerRange{};
+            samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            samplerRange.NumDescriptors = 1;
+            samplerRange.BaseShaderRegister = 0;
+            samplerRange.RegisterSpace = 0;
+            samplerRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[2].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[2].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[2].DescriptorTable.pDescriptorRanges = &samplerRange;
+            rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+            rootDesc.NumParameters =
+                static_cast<UINT>(std::size(rootParameters));
+            rootDesc.pParameters = rootParameters;
+            rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+            Microsoft::WRL::ComPtr<ID3DBlob> signature;
+            Microsoft::WRL::ComPtr<ID3DBlob> error;
+            HRESULT hr = D3D12SerializeRootSignature(
+                &rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &signature,
+                &error);
+
+            if (FAILED(hr))
+            {
+                const char* message = error
+                    ? static_cast<const char*>(error->GetBufferPointer())
+                    : "Failed to serialize DX12 skybox root signature.";
+                throw std::runtime_error(message);
+            }
+
+            Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+            throwIfFailed(
+                m_device->CreateRootSignature(
+                    0,
+                    signature->GetBufferPointer(),
+                    signature->GetBufferSize(),
+                    IID_PPV_ARGS(&rootSignature)),
+                "Failed to create DX12 skybox root signature.");
+
+            return rootSignature;
+        }
+
         if (layout != PipelineBindingLayoutKind::ForwardBindless)
         {
             throw std::runtime_error(
                 "Unsupported DX12 pipeline binding layout.");
         }
 
-        D3D12_ROOT_PARAMETER rootParameters[4]{};
+        D3D12_ROOT_PARAMETER rootParameters[6]{};
 
         rootParameters[0].ParameterType =
             D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -429,6 +581,36 @@ namespace ic
         rootParameters[3].ShaderVisibility =
             D3D12_SHADER_VISIBILITY_ALL;
 
+        D3D12_DESCRIPTOR_RANGE bindlessTextureRange{};
+        bindlessTextureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        bindlessTextureRange.NumDescriptors = MaxBindlessTextures;
+        bindlessTextureRange.BaseShaderRegister = 2;
+        bindlessTextureRange.RegisterSpace = 0;
+        bindlessTextureRange.OffsetInDescriptorsFromTableStart = 0;
+
+        rootParameters[4].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParameters[4].DescriptorTable.NumDescriptorRanges = 1;
+        rootParameters[4].DescriptorTable.pDescriptorRanges =
+            &bindlessTextureRange;
+        rootParameters[4].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_DESCRIPTOR_RANGE bindlessSamplerRange{};
+        bindlessSamplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        bindlessSamplerRange.NumDescriptors = MaxBindlessSamplers;
+        bindlessSamplerRange.BaseShaderRegister = 0;
+        bindlessSamplerRange.RegisterSpace = 0;
+        bindlessSamplerRange.OffsetInDescriptorsFromTableStart = 0;
+
+        rootParameters[5].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParameters[5].DescriptorTable.NumDescriptorRanges = 1;
+        rootParameters[5].DescriptorTable.pDescriptorRanges =
+            &bindlessSamplerRange;
+        rootParameters[5].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_PIXEL;
+
         D3D12_ROOT_SIGNATURE_DESC rootDesc{};
         rootDesc.NumParameters =
             static_cast<UINT>(std::size(rootParameters));
@@ -467,6 +649,11 @@ namespace ic
     std::vector<D3D12_INPUT_ELEMENT_DESC>
         DX12PipelineManager::createInputLayout(VertexLayoutKind layout) const
     {
+        if (layout == VertexLayoutKind::Unknown)
+        {
+            return {};
+        }
+
         if (layout != VertexLayoutKind::AssetVertex)
         {
             throw std::runtime_error(
@@ -555,48 +742,4 @@ namespace ic
         return DXGI_FORMAT_UNKNOWN;
     }
 
-    std::vector<std::byte> DX12PipelineManager::readBinaryFile(
-        const std::filesystem::path& path)
-    {
-        std::filesystem::path candidate = path;
-        if (!std::filesystem::exists(candidate))
-        {
-            std::filesystem::path cursor = std::filesystem::current_path();
-            while (!cursor.empty())
-            {
-                candidate = (cursor / path).lexically_normal();
-                if (std::filesystem::exists(candidate))
-                {
-                    break;
-                }
-
-                const std::filesystem::path parent = cursor.parent_path();
-                if (parent == cursor)
-                {
-                    break;
-                }
-                cursor = parent;
-            }
-        }
-
-        std::ifstream file(candidate, std::ios::binary | std::ios::ate);
-        if (!file)
-        {
-            throw std::runtime_error(
-                "Could not open shader file: " + path.string());
-        }
-
-        const std::streamsize size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        std::vector<std::byte> bytes(static_cast<size_t>(size));
-        if (size > 0)
-        {
-            file.read(
-                reinterpret_cast<char*>(bytes.data()),
-                size);
-        }
-
-        return bytes;
-    }
 }

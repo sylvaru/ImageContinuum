@@ -7,6 +7,7 @@
 #include "ic/renderer/pipeline_library.h"
 #include "ic/renderer/renderer_specification.h"
 #include "ic/renderer/path_tracing/path_trace_scene_builder.h"
+#include "ic/renderer/renderer_common/renderer_util.h"
 
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
@@ -22,147 +23,12 @@
 
 namespace
 {
-    constexpr uint64_t ConstantBufferAlignment = 256;
-    constexpr uint32_t DefaultPathTraceMaxBounces = 4;
-    constexpr uint32_t DefaultPathTraceSamplesPerPixel = 2;
-
     void throwIfFailed(HRESULT hr, const char* message)
     {
         if (FAILED(hr))
         {
             throw std::runtime_error(message);
         }
-    }
-
-    uint64_t alignConstantBufferSize(uint64_t size)
-    {
-        return (size + ConstantBufferAlignment - 1u) &
-            ~(ConstantBufferAlignment - 1u);
-    }
-
-    struct PathTraceConstants
-    {
-        uint32_t renderWidth = 0;
-        uint32_t renderHeight = 0;
-        uint32_t frameIndex = 0;
-        uint32_t accumulatedSampleCount = 0;
-
-        float exposure = 1.0f;
-        uint32_t resetAccumulation = 1;
-        uint32_t maxBounces = 4;
-        uint32_t samplesPerPixel = 1;
-
-        uint32_t sceneVertexCount = 0;
-        uint32_t sceneMaterialCount = 0;
-        uint32_t sceneTriangleCount = 0;
-        uint32_t sceneBvhNodeCount = 0;
-
-        uint32_t useSceneGeometry = 0;
-        uint32_t padding0 = 0;
-        uint32_t padding1 = 0;
-        uint32_t padding2 = 0;
-
-        glm::vec4 cameraPositionAndTanHalfFov = glm::vec4(0.0f);
-        glm::vec4 cameraForwardAndAspect = glm::vec4(0.0f);
-        glm::vec4 cameraRightAndNear = glm::vec4(0.0f);
-        glm::vec4 cameraUpAndFar = glm::vec4(0.0f);
-    };
-
-    struct TonemapConstants
-    {
-        uint32_t renderWidth = 0;
-        uint32_t renderHeight = 0;
-        float exposure = 1.0f;
-        uint32_t padding0 = 0;
-    };
-
-    static_assert(sizeof(PathTraceConstants) == 128);
-    static_assert(sizeof(TonemapConstants) == 16);
-
-    bool matricesDiffer(const glm::mat4& a, const glm::mat4& b)
-    {
-        constexpr float CameraMatrixEpsilon = 1.0e-5f;
-        for (glm::length_t column = 0; column < 4; ++column)
-        {
-            for (glm::length_t row = 0; row < 4; ++row)
-            {
-                if (std::fabs(a[column][row] - b[column][row]) >
-                    CameraMatrixEpsilon)
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    void fillPathTraceCameraConstants(
-        const ic::SceneCameraView& camera,
-        uint32_t width,
-        uint32_t height,
-        PathTraceConstants& constants)
-    {
-        const float fallbackAspect =
-            height == 0u
-                ? 1.0f
-                : static_cast<float>(width) / static_cast<float>(height);
-
-        if (camera.valid != 0u)
-        {
-            const glm::mat4 inverseView = glm::inverse(camera.view);
-            const glm::vec3 right =
-                glm::normalize(glm::vec3(inverseView[0]));
-            const glm::vec3 up =
-                glm::normalize(glm::vec3(inverseView[1]));
-            const glm::vec3 forward =
-                glm::normalize(-glm::vec3(inverseView[2]));
-            const float aspect =
-                camera.aspectRatio > 0.0f
-                    ? camera.aspectRatio
-                    : fallbackAspect;
-            const float tanHalfFov =
-                std::tan(camera.verticalFovRadians * 0.5f);
-
-            constants.cameraPositionAndTanHalfFov =
-                glm::vec4(camera.position, tanHalfFov);
-            constants.cameraForwardAndAspect =
-                glm::vec4(forward, aspect);
-            constants.cameraRightAndNear =
-                glm::vec4(right, camera.nearPlane);
-            constants.cameraUpAndFar =
-                glm::vec4(up, camera.farPlane);
-            return;
-        }
-
-        const glm::vec3 origin(0.0f, 1.05f, -3.25f);
-        const glm::vec3 target(0.0f, 0.95f, 0.95f);
-        const glm::vec3 forward = glm::normalize(target - origin);
-        const glm::vec3 right =
-            glm::normalize(glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
-        const glm::vec3 up = glm::normalize(glm::cross(right, forward));
-
-        constants.cameraPositionAndTanHalfFov =
-            glm::vec4(origin, std::tan(glm::radians(39.0f) * 0.5f));
-        constants.cameraForwardAndAspect =
-            glm::vec4(forward, fallbackAspect);
-        constants.cameraRightAndNear =
-            glm::vec4(right, 0.1f);
-        constants.cameraUpAndFar =
-            glm::vec4(up, 100.0f);
-    }
-
-    bool planUsesPathTracing(const ic::CompiledGraphPlan& plan)
-    {
-        for (const auto& payload : plan.payloads)
-        {
-            if (std::get_if<ic::PathTracePassData>(&payload))
-            {
-                return true;
-            }
-        }
-
-        return false;
     }
 }
 
@@ -187,6 +53,8 @@ namespace ic
         const uint32_t workerSlots =
             workerCount == 0 ? 1 : workerCount;
         m_workerSlots = workerSlots;
+
+        m_swapchain.setVsyncEnabled(spec.settings.vsync);
 
         m_swapchain.init(
             m_factory,
@@ -220,6 +88,8 @@ namespace ic
 
         shutdownImGui();
         destroySceneResources();
+        destroyEnvironmentResources();
+        destroyPathTraceResources();
         destroyFrameSync();
         m_pipelineManager.shutdown();
         m_descriptorSystem.shutdown();
@@ -502,6 +372,12 @@ namespace ic
             return;
         }
 
+        const GraphicsPassData* pass =
+            node.payloadIndex < plan.payloads.size()
+                ? std::get_if<GraphicsPassData>(
+                    &plan.payloads[node.payloadIndex])
+                : nullptr;
+
         const bool hasColorTarget =
             pipeline->desc.colorAttachmentCount > 0;
 
@@ -542,11 +418,13 @@ namespace ic
             &m_depthDsv.cpuStart);
 
         constexpr FLOAT clearColor[4] = { 0.02f, 0.02f, 0.025f, 1.0f };
-        if (hasColorTarget)
+        if (hasColorTarget &&
+            (!pass || pass->colorLoadOp == AttachmentLoadOp::Clear))
         {
             cmd->ClearRenderTargetView(rtv, clearColor, 0, nullptr);
         }
-        else
+        if (!hasColorTarget ||
+            (pass && pass->depthLoadOp == AttachmentLoadOp::Clear))
         {
             cmd->ClearDepthStencilView(
                 m_depthDsv.cpuStart,
@@ -555,6 +433,17 @@ namespace ic
                 0,
                 0,
                 nullptr);
+        }
+
+        if (pass && pass->drawList == DrawListKind::Skybox)
+        {
+            drawSkybox(*pipeline, ctx, scene, cmd);
+            return;
+        }
+
+        if (!pass || pass->drawList != DrawListKind::SceneGeometry)
+        {
+            return;
         }
 
         if (!prepareSceneResources(ctx, scene) ||
@@ -571,10 +460,13 @@ namespace ic
 
         ID3D12DescriptorHeap* heaps[] =
         {
-            m_descriptorSystem.shaderResourceHeap()
+            m_descriptorSystem.shaderResourceHeap(),
+            m_descriptorSystem.samplerHeap()
         };
 
-        cmd->SetDescriptorHeaps(1, heaps);
+        cmd->SetDescriptorHeaps(
+            static_cast<UINT>(std::size(heaps)),
+            heaps);
 
         cmd->SetGraphicsRootSignature(pipeline->rootSignature.Get());
         cmd->SetPipelineState(pipeline->pipelineState.Get());
@@ -587,6 +479,12 @@ namespace ic
         cmd->SetGraphicsRootDescriptorTable(
             2,
             frameResources.materialSrv.gpuStart);
+        cmd->SetGraphicsRootDescriptorTable(
+            4,
+            m_descriptorSystem.shaderResourceGpuStart());
+        cmd->SetGraphicsRootDescriptorTable(
+            5,
+            m_descriptorSystem.samplerGpuStart());
         cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         UploadedModel* boundModel = nullptr;
@@ -661,6 +559,13 @@ namespace ic
             return;
         }
 
+        if (std::get_if<EnvironmentConvertPassData>(
+                &plan.payloads[node.payloadIndex]))
+        {
+            executeEnvironmentConvertNode(plan, node, ctx, scene, cmd);
+            return;
+        }
+
         if (std::get_if<TonemapPassData>(&plan.payloads[node.payloadIndex]))
         {
             executeTonemapNode(plan, node, ctx, cmd);
@@ -721,6 +626,137 @@ namespace ic
         }
     }
 
+    void DX12Backend::executeEnvironmentConvertNode(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd)
+    {
+        if (!ensureEnvironmentResources(ctx, scene, cmd) ||
+            m_environmentResources.converted)
+        {
+            return;
+        }
+
+        DX12ComputePipeline* pipeline =
+            m_pipelineManager.computePipeline(
+                computePipelineForNode(plan, node));
+        if (!pipeline)
+        {
+            return;
+        }
+
+        (void)convertEnvironmentIfReady(*pipeline, ctx, scene, cmd);
+    }
+
+    DX12ComputePipeline* DX12Backend::environmentConvertPipeline()
+    {
+        if (!m_pipelineLibrary)
+        {
+            return nullptr;
+        }
+
+        const PipelineId pipelineId = makePipelineId("equirect_to_cubemap");
+        auto it = m_computePipelineHandles.find(pipelineId);
+        ComputePipelineHandle handle{};
+        if (it != m_computePipelineHandles.end())
+        {
+            handle = it->second;
+        }
+        else
+        {
+            ComputePipelineDesc desc =
+                m_pipelineLibrary->resolveCompute(
+                    pipelineId,
+                    RendererBackendType::DX12);
+            handle = m_pipelineManager.requestComputePipeline(desc);
+            m_computePipelineHandles.emplace(pipelineId, handle);
+        }
+
+        return m_pipelineManager.computePipeline(handle);
+    }
+
+    bool DX12Backend::convertEnvironmentIfReady(
+        DX12ComputePipeline& pipeline,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd)
+    {
+        if (!ensureEnvironmentResources(ctx, scene, cmd) ||
+            m_environmentResources.converted)
+        {
+            return m_environmentResources.converted;
+        }
+        if (!pipeline.rootSignature || !pipeline.pipelineState)
+        {
+            spdlog::error(
+                "[DX12] Environment conversion pipeline is incomplete; skipping HDR conversion");
+            return false;
+        }
+
+        const uint64_t key =
+            uploadedTextureKey(
+                scene.environment.equirectTexture,
+                0,
+                TextureTransferFunction::Linear);
+        auto textureIt = m_uploadedTextures.find(key);
+        if (textureIt == m_uploadedTextures.end())
+        {
+            return false;
+        }
+
+        if (m_environmentResources.cubemapState !=
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        {
+            transitionResource(
+                cmd,
+                m_environmentResources.cubemap.resource.Get(),
+                m_environmentResources.cubemapState,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            m_environmentResources.cubemapState =
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
+
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            m_descriptorSystem.shaderResourceHeap(),
+            m_descriptorSystem.samplerHeap()
+        };
+        cmd->SetDescriptorHeaps(
+            static_cast<UINT>(std::size(heaps)),
+            heaps);
+        cmd->SetComputeRootSignature(pipeline.rootSignature.Get());
+        cmd->SetPipelineState(pipeline.pipelineState.Get());
+        cmd->SetComputeRootDescriptorTable(0, textureIt->second.srv.gpuStart);
+        cmd->SetComputeRootDescriptorTable(1, m_environmentResources.cubemapUav.gpuStart);
+        cmd->SetComputeRootDescriptorTable(2, m_environmentResources.sampler.gpuStart);
+        cmd->Dispatch(
+            (m_environmentResources.cubemapSize + 7u) / 8u,
+            (m_environmentResources.cubemapSize + 7u) / 8u,
+            6u);
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource =
+            m_environmentResources.cubemap.resource.Get();
+        cmd->ResourceBarrier(1, &barrier);
+
+        transitionResource(
+            cmd,
+            m_environmentResources.cubemap.resource.Get(),
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        m_environmentResources.cubemapState =
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        m_environmentResources.converted = true;
+        m_pathTraceResources.resetAccumulation = true;
+        spdlog::info("[DX12] Converted HDR environment to cubemap");
+        return true;
+    }
+
     void DX12Backend::executePathTraceNode(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
@@ -728,13 +764,12 @@ namespace ic
         const SceneRenderView& scene,
         ID3D12GraphicsCommandList4* cmd)
     {
+        const ComputePipelineHandle pathTracePipelineHandle =
+            computePipelineForNode(plan, node);
+
         ensurePathTraceResources();
         ensurePathTraceSceneResources(ctx, scene);
-
-        DX12ComputePipeline* pipeline =
-            m_pipelineManager.computePipeline(
-                computePipelineForNode(plan, node));
-        if (!pipeline || !m_pathTraceResources.accumulation)
+        if (!m_pathTraceResources.accumulation)
         {
             return;
         }
@@ -761,6 +796,17 @@ namespace ic
             m_pathTraceResources.hasPreviousCamera = false;
         }
 
+        if (m_pathTraceResources.environmentVersion !=
+            scene.environment.version)
+        {
+            m_pathTraceResources.environmentVersion =
+                scene.environment.version;
+            m_pathTraceResources.accumulatedSampleCount = 0;
+            m_pathTraceResources.resetAccumulation = true;
+        }
+        m_pathTraceResources.tonemapExposure =
+            scene.environment.settings.tonemapExposure;
+
         if (m_pathTraceResources.accumulationState !=
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
         {
@@ -779,7 +825,7 @@ namespace ic
         constants.frameIndex = static_cast<uint32_t>(ctx.frameIndex);
         constants.accumulatedSampleCount =
             m_pathTraceResources.accumulatedSampleCount;
-        constants.exposure = 1.0f;
+        constants.exposure = m_pathTraceResources.tonemapExposure;
         constants.resetAccumulation =
             m_pathTraceResources.resetAccumulation ? 1u : 0u;
         constants.maxBounces = DefaultPathTraceMaxBounces;
@@ -797,6 +843,30 @@ namespace ic
             m_pathTraceResources.sceneBvhNodeCount != 0u
                 ? 1u
                 : 0u;
+        const bool environmentResourcesAvailable =
+            ensureEnvironmentResources(ctx, scene, cmd);
+        if (!environmentResourcesAvailable)
+        {
+            return;
+        }
+        if (!m_environmentResources.converted)
+        {
+            if (DX12ComputePipeline* convertPipeline =
+                    environmentConvertPipeline())
+            {
+                (void)convertEnvironmentIfReady(
+                    *convertPipeline,
+                    ctx,
+                    scene,
+                    cmd);
+            }
+        }
+        const bool environmentReady = m_environmentResources.converted;
+
+        constants.environmentEnabled = environmentReady ? 1u : 0u;
+        constants.environmentIntensity = scene.environment.settings.intensity;
+        constants.environmentExposure =
+            scene.environment.settings.pathTraceExposure;
         fillPathTraceCameraConstants(
             scene.camera,
             m_pathTraceResources.width,
@@ -817,9 +887,25 @@ namespace ic
 
         ID3D12DescriptorHeap* heaps[] =
         {
-            m_descriptorSystem.shaderResourceHeap()
+            m_descriptorSystem.shaderResourceHeap(),
+            m_descriptorSystem.samplerHeap()
         };
-        cmd->SetDescriptorHeaps(1, heaps);
+        cmd->SetDescriptorHeaps(
+            static_cast<UINT>(std::size(heaps)),
+            heaps);
+
+        DX12ComputePipeline* pipeline =
+            m_pipelineManager.computePipeline(pathTracePipelineHandle);
+        if (!pipeline)
+        {
+            return;
+        }
+        if (!pipeline->rootSignature || !pipeline->pipelineState)
+        {
+            spdlog::error(
+                "[DX12] Path trace pipeline is incomplete; skipping dispatch");
+            return;
+        }
         cmd->SetComputeRootSignature(pipeline->rootSignature.Get());
         cmd->SetPipelineState(pipeline->pipelineState.Get());
         cmd->SetComputeRootConstantBufferView(
@@ -830,9 +916,36 @@ namespace ic
             m_pathTraceResources.accumulationUav.gpuStart);
         if (m_pathTraceResources.sceneSrvs.valid())
         {
+            if (m_environmentResources.cubemapSrv.valid() &&
+                m_environmentResources.cubemap.resource &&
+                m_pathTraceResources.sceneSrvs.count > 4u)
+            {
+                D3D12_CPU_DESCRIPTOR_HANDLE environmentDst =
+                    m_pathTraceResources.sceneSrvs.cpuStart;
+                environmentDst.ptr +=
+                    static_cast<SIZE_T>(4u) *
+                    m_pathTraceResources.sceneSrvs.descriptorSize;
+
+                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                srv.Shader4ComponentMapping =
+                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                srv.Format = m_environmentResources.cubemap.desc.Format;
+                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+                srv.TextureCube.MipLevels = 1;
+                m_device.device()->CreateShaderResourceView(
+                    m_environmentResources.cubemap.resource.Get(),
+                    &srv,
+                    environmentDst);
+            }
             cmd->SetComputeRootDescriptorTable(
                 2,
                 m_pathTraceResources.sceneSrvs.gpuStart);
+        }
+        if (m_environmentResources.sampler.valid())
+        {
+            cmd->SetComputeRootDescriptorTable(
+                3,
+                m_environmentResources.sampler.gpuStart);
         }
 
         const uint32_t groupCountX =
@@ -896,7 +1009,7 @@ namespace ic
         TonemapConstants constants{};
         constants.renderWidth = m_pathTraceResources.width;
         constants.renderHeight = m_pathTraceResources.height;
-        constants.exposure = 1.0f;
+        constants.exposure = m_pathTraceResources.tonemapExposure;
 
         const uint32_t frameSlot =
             static_cast<uint32_t>(
@@ -1079,6 +1192,19 @@ namespace ic
             m_resourceAllocator.destroyBuffer(model.indexBuffer);
         }
         m_uploadedModels.clear();
+
+        for (auto& [key, texture] : m_uploadedTextures)
+        {
+            m_resourceAllocator.destroyTexture(texture.texture);
+            m_descriptorSystem.releaseResourceDescriptors(texture.srv);
+        }
+        m_uploadedTextures.clear();
+
+        for (auto& [key, sampler] : m_uploadedSamplers)
+        {
+            m_descriptorSystem.releaseSamplers(sampler.descriptor);
+        }
+        m_uploadedSamplers.clear();
 
         for (FrameSceneResources& resources : m_sceneFrameResources)
         {
@@ -1397,8 +1523,10 @@ namespace ic
             }
         }
 
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_pathTraceResources.sceneSrvs);
         m_pathTraceResources.sceneSrvs =
-            m_descriptorSystem.allocateResourceDescriptors(4);
+            m_descriptorSystem.allocateResourceDescriptors(5);
 
         auto writeSrv =
             [&](const DX12Buffer& buffer,
@@ -1570,6 +1698,211 @@ namespace ic
         m_computeTestBufferState = m_computeTestBuffer.initialState;
     }
 
+    bool DX12Backend::ensureEnvironmentResources(
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd)
+    {
+        if (scene.environment.enabled == 0u ||
+            !scene.environment.equirectTexture ||
+            !ctx.services ||
+            !ctx.services->assetManager)
+        {
+            return false;
+        }
+
+        const uint32_t cubemapSize =
+            std::max(1u, scene.environment.settings.cubemapSize);
+        if (m_environmentResources.source != scene.environment.equirectTexture ||
+            m_environmentResources.cubemapSize != cubemapSize)
+        {
+            destroyEnvironmentResources();
+            m_environmentResources.source = scene.environment.equirectTexture;
+            m_environmentResources.cubemapSize = cubemapSize;
+        }
+
+        if (!m_environmentResources.cubemap)
+        {
+            m_environmentResources.cubemap =
+                m_resourceAllocator.createTexture({
+                    .width = m_environmentResources.cubemapSize,
+                    .height = m_environmentResources.cubemapSize,
+                    .depth = 1,
+                    .mipLevels = 1,
+                    .arrayLayers = 6,
+                    .cubeCompatible = true,
+                    .format = TextureFormat::RGBA32_Float,
+                    .usage =
+                        TextureUsageFlags::Sampled |
+                        TextureUsageFlags::Storage,
+                    .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                    .debugName = "DX12 environment cubemap"
+                });
+            m_environmentResources.cubemapState =
+                m_environmentResources.cubemap.initialState;
+
+            m_environmentResources.cubemapSrv =
+                m_descriptorSystem.allocateResourceDescriptors(1);
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Format = m_environmentResources.cubemap.desc.Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            srv.TextureCube.MipLevels = 1;
+            m_device.device()->CreateShaderResourceView(
+                m_environmentResources.cubemap.resource.Get(),
+                &srv,
+                m_environmentResources.cubemapSrv.cpuStart);
+
+            m_environmentResources.cubemapUav =
+                m_descriptorSystem.allocateResourceDescriptors(1);
+            D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+            uav.Format = m_environmentResources.cubemap.desc.Format;
+            uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            uav.Texture2DArray.ArraySize = 6;
+            m_device.device()->CreateUnorderedAccessView(
+                m_environmentResources.cubemap.resource.Get(),
+                nullptr,
+                &uav,
+                m_environmentResources.cubemapUav.cpuStart);
+
+            m_environmentResources.sampler =
+                m_descriptorSystem.allocateSamplers(1);
+            D3D12_SAMPLER_DESC sampler{};
+            sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+            sampler.MaxLOD = D3D12_FLOAT32_MAX;
+            m_device.device()->CreateSampler(
+                &sampler,
+                m_environmentResources.sampler.cpuStart);
+        }
+
+        if (m_environmentResources.skyboxConstants.empty())
+        {
+            const uint32_t frameCount =
+                std::max<uint32_t>(1u, m_workerSlots);
+            m_environmentResources.skyboxConstants.resize(frameCount);
+            for (DX12Buffer& buffer :
+                m_environmentResources.skyboxConstants)
+            {
+                buffer = m_resourceAllocator.createBuffer({
+                    .size = alignConstantBufferSize(sizeof(SkyboxConstants)),
+                    .usage = BufferUsageFlags::Constant,
+                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                    .mappedAtCreation = true,
+                    .debugName = "DX12 skybox constants"
+                });
+            }
+        }
+
+        if (m_environmentResources.converted)
+        {
+            return true;
+        }
+
+        const ImageAsset* image =
+            ctx.services->assetManager->image(scene.environment.equirectTexture);
+        if (!image || !image->valid())
+        {
+            return true;
+        }
+
+        requestTexture(
+            scene.environment.equirectTexture,
+            0,
+            *image,
+            TextureTransferFunction::Linear);
+
+        (void)cmd;
+        return true;
+    }
+
+    void DX12Backend::drawSkybox(
+        DX12GraphicsPipeline& pipeline,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd)
+    {
+        if (!m_environmentResources.converted)
+        {
+            if (DX12ComputePipeline* convertPipeline =
+                    environmentConvertPipeline())
+            {
+                (void)convertEnvironmentIfReady(
+                    *convertPipeline,
+                    ctx,
+                    scene,
+                    cmd);
+            }
+        }
+
+        if (!ensureEnvironmentResources(ctx, scene, cmd) ||
+            !m_environmentResources.converted ||
+            m_environmentResources.skyboxConstants.empty())
+        {
+            return;
+        }
+
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(
+                ctx.frameIndex %
+                m_environmentResources.skyboxConstants.size());
+        DX12Buffer& constantsBuffer =
+            m_environmentResources.skyboxConstants[frameSlot];
+
+        SkyboxConstants constants{};
+        fillSkyboxConstants(
+            scene.camera,
+            m_swapchain.width(),
+            m_swapchain.height(),
+            scene.environment.settings,
+            constants);
+        std::memcpy(
+            constantsBuffer.mapped,
+            &constants,
+            sizeof(constants));
+
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            m_descriptorSystem.shaderResourceHeap(),
+            m_descriptorSystem.samplerHeap()
+        };
+        cmd->SetDescriptorHeaps(
+            static_cast<UINT>(std::size(heaps)),
+            heaps);
+        cmd->SetGraphicsRootSignature(pipeline.rootSignature.Get());
+        cmd->SetPipelineState(pipeline.pipelineState.Get());
+        cmd->SetGraphicsRootConstantBufferView(
+            0,
+            constantsBuffer.gpuAddress);
+        cmd->SetGraphicsRootDescriptorTable(
+            1,
+            m_environmentResources.cubemapSrv.gpuStart);
+        cmd->SetGraphicsRootDescriptorTable(
+            2,
+            m_environmentResources.sampler.gpuStart);
+        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        cmd->DrawInstanced(3, 1, 0, 0);
+    }
+
+    void DX12Backend::destroyEnvironmentResources()
+    {
+        m_resourceAllocator.destroyTexture(m_environmentResources.cubemap);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_environmentResources.cubemapSrv);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_environmentResources.cubemapUav);
+        m_descriptorSystem.releaseSamplers(m_environmentResources.sampler);
+        for (DX12Buffer& buffer :
+            m_environmentResources.skyboxConstants)
+        {
+            m_resourceAllocator.destroyBuffer(buffer);
+        }
+        m_environmentResources = {};
+    }
+
     void DX12Backend::ensureDepthTarget()
     {
         const uint32_t width = m_swapchain.width();
@@ -1616,6 +1949,205 @@ namespace ic
         m_depthState = D3D12_RESOURCE_STATE_COMMON;
         m_depthWidth = 0;
         m_depthHeight = 0;
+    }
+
+    uint32_t DX12Backend::requestTexture(
+        AssetHandle modelHandle,
+        uint32_t imageIndex,
+        const ImageAsset& image,
+        TextureTransferFunction transfer)
+    {
+        const uint64_t key = uploadedTextureKey(modelHandle, imageIndex, transfer);
+        if (auto it = m_uploadedTextures.find(key);
+            it != m_uploadedTextures.end())
+        {
+            return it->second.srv.baseIndex;
+        }
+
+        ImageAsset uploadImage = image;
+        if (transfer != TextureTransferFunction::Unknown &&
+            uploadImage.format == ImageFormat::RGBA8)
+        {
+            uploadImage.srgb = transfer == TextureTransferFunction::SRGB;
+        }
+
+        UploadedTexture uploaded{};
+        uploaded.texture =
+            m_resourceAllocator.createTexture(
+                uploadImage,
+                TextureUsageFlags::Sampled | TextureUsageFlags::TransferDst,
+                "DX12 bindless model texture");
+        uploaded.srv =
+            m_descriptorSystem.allocateResourceDescriptors(1);
+
+        const uint64_t sourceBytes = imageByteSize(uploadImage);
+
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+        UINT rowCount = 0;
+        UINT64 rowSize = 0;
+        UINT64 uploadBytes = 0;
+        m_device.device()->GetCopyableFootprints(
+            &uploaded.texture.desc,
+            0,
+            1,
+            0,
+            &footprint,
+            &rowCount,
+            &rowSize,
+            &uploadBytes);
+
+        DX12Buffer staging =
+            m_resourceAllocator.createBuffer({
+                .size = uploadBytes,
+                .usage = BufferUsageFlags::TransferSrc,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = "DX12 texture upload staging"
+            });
+
+        const uint8_t* src =
+            reinterpret_cast<const uint8_t*>(uploadImage.pixels.data());
+        uint8_t* dst =
+            reinterpret_cast<uint8_t*>(staging.mapped) + footprint.Offset;
+        const uint64_t tightRowBytes =
+            uploadImage.height != 0 ? sourceBytes / uploadImage.height : 0;
+        for (uint32_t row = 0; row < uploadImage.height; ++row)
+        {
+            std::memcpy(
+                dst + static_cast<uint64_t>(row) * footprint.Footprint.RowPitch,
+                src + static_cast<uint64_t>(row) * tightRowBytes,
+                static_cast<size_t>(tightRowBytes));
+        }
+
+        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+        throwIfFailed(
+            m_device.device()->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                IID_PPV_ARGS(&allocator)),
+            "Failed to create DX12 texture upload allocator.");
+
+        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd;
+        throwIfFailed(
+            m_device.device()->CreateCommandList(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                allocator.Get(),
+                nullptr,
+                IID_PPV_ARGS(&cmd)),
+            "Failed to create DX12 texture upload command list.");
+
+        transitionResource(
+            cmd.Get(),
+            uploaded.texture.resource.Get(),
+            uploaded.texture.initialState,
+            D3D12_RESOURCE_STATE_COPY_DEST);
+
+        D3D12_TEXTURE_COPY_LOCATION dstLocation{};
+        dstLocation.pResource = uploaded.texture.resource.Get();
+        dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+        D3D12_TEXTURE_COPY_LOCATION srcLocation{};
+        srcLocation.pResource = staging.resource.Get();
+        srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        srcLocation.PlacedFootprint = footprint;
+
+        cmd->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, nullptr);
+
+        transitionResource(
+            cmd.Get(),
+            uploaded.texture.resource.Get(),
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        uploaded.state =
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+        throwIfFailed(
+            cmd->Close(),
+            "Failed to close DX12 texture upload command list.");
+
+        ID3D12CommandList* lists[] = { cmd.Get() };
+        m_device.graphicsQueue()->ExecuteCommandLists(1, lists);
+        waitForGpu();
+
+        m_resourceAllocator.destroyBuffer(staging);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Shader4ComponentMapping =
+            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = uploaded.texture.desc.Format;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Texture2D.MipLevels = 1;
+
+        m_device.device()->CreateShaderResourceView(
+            uploaded.texture.resource.Get(),
+            &srv,
+            uploaded.srv.cpuStart);
+
+        const uint32_t descriptorIndex = uploaded.srv.baseIndex;
+        m_uploadedTextures.emplace(key, std::move(uploaded));
+        return descriptorIndex;
+    }
+
+    uint32_t DX12Backend::requestSampler(const SamplerAsset* sampler)
+    {
+        const uint64_t key = samplerKey(sampler);
+        if (auto it = m_uploadedSamplers.find(key);
+            it != m_uploadedSamplers.end())
+        {
+            return it->second.descriptor.baseIndex;
+        }
+
+        auto toFilter = [](TextureFilterMode minFilter, TextureFilterMode magFilter)
+        {
+            const bool minLinear =
+                minFilter == TextureFilterMode::Linear ||
+                minFilter == TextureFilterMode::LinearMipmapNearest ||
+                minFilter == TextureFilterMode::LinearMipmapLinear;
+            const bool magLinear = magFilter != TextureFilterMode::Nearest;
+            if (minLinear && magLinear)
+            {
+                return D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+            }
+            if (!minLinear && !magLinear)
+            {
+                return D3D12_FILTER_MIN_MAG_MIP_POINT;
+            }
+            return D3D12_FILTER_MIN_LINEAR_MAG_POINT_MIP_LINEAR;
+        };
+
+        auto toAddress = [](TextureWrapMode mode)
+        {
+            switch (mode)
+            {
+            case TextureWrapMode::MirroredRepeat:
+                return D3D12_TEXTURE_ADDRESS_MODE_MIRROR;
+            case TextureWrapMode::ClampToEdge:
+                return D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+            case TextureWrapMode::Repeat:
+                break;
+            }
+            return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        };
+
+        UploadedSampler uploaded{};
+        uploaded.descriptor = m_descriptorSystem.allocateSamplers(1);
+
+        D3D12_SAMPLER_DESC desc{};
+        desc.Filter = sampler
+            ? toFilter(sampler->minFilter, sampler->magFilter)
+            : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        desc.AddressU = sampler ? toAddress(sampler->wrapU) : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        desc.AddressV = sampler ? toAddress(sampler->wrapV) : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        desc.MaxLOD = D3D12_FLOAT32_MAX;
+
+        m_device.device()->CreateSampler(&desc, uploaded.descriptor.cpuStart);
+
+        const uint32_t descriptorIndex = uploaded.descriptor.baseIndex;
+        m_uploadedSamplers.emplace(key, uploaded);
+        return descriptorIndex;
     }
 
     DX12Backend::UploadedModel* DX12Backend::requestModel(
@@ -1762,18 +2294,73 @@ namespace ic
         m_resourceAllocator.destroyBuffer(vertexStaging);
         m_resourceAllocator.destroyBuffer(indexStaging);
 
+        uploaded.samplerDescriptorIndices.assign(
+            model->samplers.size(),
+            UINT32_MAX);
+        for (size_t samplerIndex = 0;
+             samplerIndex < model->samplers.size();
+             ++samplerIndex)
+        {
+            uploaded.samplerDescriptorIndices[samplerIndex] =
+                requestSampler(&model->samplers[samplerIndex]);
+        }
+        const uint32_t defaultSampler = requestSampler(nullptr);
+
+        auto textureDescriptor = [&](const MaterialTextureSlot& slot)
+        {
+            if (slot.textureIndex < 0 ||
+                static_cast<size_t>(slot.textureIndex) >= model->textures.size())
+            {
+                return UINT32_MAX;
+            }
+
+            const TextureAsset& texture =
+                model->textures[static_cast<size_t>(slot.textureIndex)];
+            if (texture.imageIndex < 0 ||
+                static_cast<size_t>(texture.imageIndex) >= model->images.size())
+            {
+                return UINT32_MAX;
+            }
+
+            return requestTexture(
+                handle,
+                static_cast<uint32_t>(texture.imageIndex),
+                model->images[static_cast<size_t>(texture.imageIndex)],
+                slot.transfer);
+        };
+
+        auto samplerDescriptor = [&](const MaterialTextureSlot& slot)
+        {
+            if (slot.textureIndex < 0 ||
+                static_cast<size_t>(slot.textureIndex) >= model->textures.size())
+            {
+                return defaultSampler;
+            }
+
+            const TextureAsset& texture =
+                model->textures[static_cast<size_t>(slot.textureIndex)];
+            if (texture.samplerIndex < 0 ||
+                static_cast<size_t>(texture.samplerIndex) >=
+                    uploaded.samplerDescriptorIndices.size())
+            {
+                return defaultSampler;
+            }
+
+            const uint32_t descriptor =
+                uploaded.samplerDescriptorIndices[
+                    static_cast<size_t>(texture.samplerIndex)];
+            return descriptor != UINT32_MAX ? descriptor : defaultSampler;
+        };
+
         uploaded.materials.reserve(std::max<size_t>(1, model->materials.size()));
         for (const MaterialAsset& src : model->materials)
         {
-            GpuMaterialData dst{};
-            dst.baseColorFactor = src.baseColorFactor;
-            dst.metallicFactor = src.metallicFactor;
-            dst.roughnessFactor = src.roughnessFactor;
-            dst.alphaCutoff = src.alphaCutoff;
-            dst.flags =
-                (src.doubleSided ? 1u : 0u) |
-                (src.alphaBlend ? 2u : 0u) |
-                (src.alphaMask ? 4u : 0u);
+            GpuMaterialData dst = makeGpuMaterialData(src);
+            dst.baseColorTextureIndex = textureDescriptor(src.baseColorTexture);
+            dst.normalTextureIndex = textureDescriptor(src.normalTexture);
+            dst.metallicRoughnessTextureIndex =
+                textureDescriptor(src.metallicRoughnessTexture);
+            dst.samplerIndex = samplerDescriptor(src.baseColorTexture);
             uploaded.materials.push_back(dst);
         }
         if (uploaded.materials.empty())

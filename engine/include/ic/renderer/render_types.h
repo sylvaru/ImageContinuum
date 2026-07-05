@@ -5,6 +5,9 @@
 
 namespace ic 
 {
+    constexpr uint32_t MaxBindlessTextures = 4096;
+    constexpr uint32_t MaxBindlessSamplers = 256;
+
     enum class ResourceMemoryUsage : uint8_t
     {
         GpuOnly,
@@ -113,6 +116,7 @@ namespace ic
         uint32_t depth = 1;
         uint32_t mipLevels = 1;
         uint32_t arrayLayers = 1;
+        bool cubeCompatible = false;
         TextureFormat format = TextureFormat::RGBA8_UNorm;
         TextureUsageFlags usage = TextureUsageFlags::Sampled;
         ResourceMemoryUsage memoryUsage = ResourceMemoryUsage::GpuOnly;

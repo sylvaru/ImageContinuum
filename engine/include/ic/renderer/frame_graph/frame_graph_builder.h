@@ -25,6 +25,9 @@ namespace ic
             {}
 
             GraphicsPassBuilder& pipeline(std::string_view logicalName);
+            GraphicsPassBuilder& drawList(DrawListKind kind);
+            GraphicsPassBuilder& colorLoadOp(AttachmentLoadOp op);
+            GraphicsPassBuilder& depthLoadOp(AttachmentLoadOp op);
             GraphicsPassBuilder& color(GraphResourceId resource);
             GraphicsPassBuilder& depth(GraphResourceId resource);
 
@@ -162,6 +165,18 @@ namespace ic
         void setGraphicsPassPipeline(
             GraphNodeId node,
             PipelineId pipeline);
+
+        void setGraphicsPassDrawList(
+            GraphNodeId node,
+            DrawListKind kind);
+
+        void setGraphicsPassColorLoadOp(
+            GraphNodeId node,
+            AttachmentLoadOp op);
+
+        void setGraphicsPassDepthLoadOp(
+            GraphNodeId node,
+            AttachmentLoadOp op);
 
         void setComputePassPipeline(
             GraphNodeId node,

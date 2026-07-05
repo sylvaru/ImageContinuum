@@ -135,6 +135,38 @@ namespace
         return fallback;
     }
 
+    float floatOr(
+        const toml::table& table,
+        std::string_view key,
+        float fallback)
+    {
+        if (const std::optional<double> value = table[key].value<double>())
+        {
+            return static_cast<float>(*value);
+        }
+        if (const std::optional<int64_t> value = table[key].value<int64_t>())
+        {
+            return static_cast<float>(*value);
+        }
+        return fallback;
+    }
+
+    void readEnvironmentSettings(
+        const toml::table& table,
+        ic::EnvironmentSettings& settings)
+    {
+        settings.enabled = boolOr(table, "enabled", settings.enabled);
+        settings.intensity = floatOr(table, "intensity", settings.intensity);
+        settings.skyboxExposure =
+            floatOr(table, "skybox_exposure", settings.skyboxExposure);
+        settings.pathTraceExposure =
+            floatOr(table, "path_trace_exposure", settings.pathTraceExposure);
+        settings.tonemapExposure =
+            floatOr(table, "tonemap_exposure", settings.tonemapExposure);
+        settings.cubemapSize =
+            uintOr(table, "cubemap_size", settings.cubemapSize);
+    }
+
     ic::RendererBackendType parseBackend(std::string value)
     {
         value = lower(std::move(value));
@@ -187,19 +219,37 @@ namespace
     ic::RenderPathType parseRenderPath(std::string value)
     {
         value = lower(std::move(value));
-        if (value == "forward")
+        if (value == "forward" ||
+            value == "Forward")
         {
             return ic::RenderPathType::Forward;
         }
 
-        if (value == "deferred")
+        if (value == "deferred" ||
+            value == "Deferred")
         {
             throw std::runtime_error(
                 "Deferred render path is not implemented yet.");
         }
 
+        if (value == "forward_plus" ||
+            value == "ForwardPlus" ||
+            value == "forwardplus")
+        {
+            throw std::runtime_error(
+                "ForwardPlus render path is not implemented yet.");
+        }
+
         if (value == "pathtraced" ||
             value == "path_traced" ||
+            value == "path_tracer" ||
+            value == "path_trace" ||
+            value == "PathTrace" ||
+            value == "PathTracer" ||
+            value == "PathTracing" ||
+            value == "PathTraced" ||
+            value == "pathtrace" ||
+            value == "path-trace" ||
             value == "path-traced" ||
             value == "pathtracing" ||
             value == "path_tracing" ||
@@ -338,6 +388,23 @@ namespace ic
                     *renderer,
                     "debug_gui",
                     config.app.rendererSpec.useDebugGui);
+            config.app.rendererSpec.settings.vsync =
+                boolOr(
+                    *renderer,
+                    "vsync",
+                    config.app.rendererSpec.settings.vsync);
+            config.app.rendererSpec.settings.targetFps =
+                floatOr(
+                    *renderer,
+                    "target_fps",
+                    config.app.rendererSpec.settings.targetFps);
+            if (const toml::table* environment =
+                    renderer->get_as<toml::table>("environment"))
+            {
+                readEnvironmentSettings(
+                    *environment,
+                    config.app.rendererSpec.settings.environment);
+            }
             config.app.rendererSpec.framesInFlight =
                 uintOr(
                     *renderer,

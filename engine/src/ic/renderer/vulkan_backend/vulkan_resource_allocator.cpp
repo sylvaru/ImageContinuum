@@ -201,6 +201,8 @@ namespace ic
         };
         imageInfo.mipLevels = desc.mipLevels;
         imageInfo.arrayLayers = desc.arrayLayers;
+        imageInfo.flags =
+            desc.cubeCompatible ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
         imageInfo.format = toVkFormat(desc.format);
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;

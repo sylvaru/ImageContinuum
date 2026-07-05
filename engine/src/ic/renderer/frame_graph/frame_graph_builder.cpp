@@ -16,6 +16,32 @@ namespace ic
     }
 
     FrameGraphBuilder::GraphicsPassBuilder&
+        FrameGraphBuilder::GraphicsPassBuilder::drawList(
+            DrawListKind kind)
+    {
+        m_builder.setGraphicsPassDrawList(
+            m_node,
+            kind);
+        return *this;
+    }
+
+    FrameGraphBuilder::GraphicsPassBuilder&
+        FrameGraphBuilder::GraphicsPassBuilder::colorLoadOp(
+            AttachmentLoadOp op)
+    {
+        m_builder.setGraphicsPassColorLoadOp(m_node, op);
+        return *this;
+    }
+
+    FrameGraphBuilder::GraphicsPassBuilder&
+        FrameGraphBuilder::GraphicsPassBuilder::depthLoadOp(
+            AttachmentLoadOp op)
+    {
+        m_builder.setGraphicsPassDepthLoadOp(m_node, op);
+        return *this;
+    }
+
+    FrameGraphBuilder::GraphicsPassBuilder&
         FrameGraphBuilder::GraphicsPassBuilder::color(
             GraphResourceId resource)
     {
@@ -258,6 +284,75 @@ namespace ic
             std::get_if<GraphicsPassData>(&m_payloads[payloadIndex]))
         {
             data->pipeline = pipeline;
+        }
+    }
+
+    void FrameGraphBuilder::setGraphicsPassDrawList(
+        GraphNodeId node,
+        DrawListKind kind)
+    {
+        if (node >= m_nodes.size())
+        {
+            return;
+        }
+
+        const uint32_t payloadIndex =
+            m_nodes[node].graphNode.payloadIndex;
+        if (payloadIndex >= m_payloads.size())
+        {
+            return;
+        }
+
+        if (GraphicsPassData* data =
+            std::get_if<GraphicsPassData>(&m_payloads[payloadIndex]))
+        {
+            data->drawList = kind;
+        }
+    }
+
+    void FrameGraphBuilder::setGraphicsPassColorLoadOp(
+        GraphNodeId node,
+        AttachmentLoadOp op)
+    {
+        if (node >= m_nodes.size())
+        {
+            return;
+        }
+
+        const uint32_t payloadIndex =
+            m_nodes[node].graphNode.payloadIndex;
+        if (payloadIndex >= m_payloads.size())
+        {
+            return;
+        }
+
+        if (GraphicsPassData* data =
+            std::get_if<GraphicsPassData>(&m_payloads[payloadIndex]))
+        {
+            data->colorLoadOp = op;
+        }
+    }
+
+    void FrameGraphBuilder::setGraphicsPassDepthLoadOp(
+        GraphNodeId node,
+        AttachmentLoadOp op)
+    {
+        if (node >= m_nodes.size())
+        {
+            return;
+        }
+
+        const uint32_t payloadIndex =
+            m_nodes[node].graphNode.payloadIndex;
+        if (payloadIndex >= m_payloads.size())
+        {
+            return;
+        }
+
+        if (GraphicsPassData* data =
+            std::get_if<GraphicsPassData>(&m_payloads[payloadIndex]))
+        {
+            data->depthLoadOp = op;
         }
     }
 

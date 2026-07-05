@@ -1,6 +1,14 @@
 [scene]
 name = "Cornell Box"
 
+[scene.environment]
+equirect = "../hdri/puresky_4k.hdr"
+intensity = 1.0
+skybox_exposure = 0.9
+path_trace_exposure = 0.25
+tonemap_exposure = 1.0
+cubemap_size = 512
+
 [[entities]]
 id = 1
 name = "Main Camera"

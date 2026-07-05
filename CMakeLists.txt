@@ -12,6 +12,7 @@ option(IC_BUILD_TESTS "Build tests" ON)
 option(IC_BUILD_EDITOR "Build editor" OFF)
 option(IC_BUILD_SHARED "Build libraries as shared" OFF)
 option(IC_DEVELOPER_BUILD "Enable developer-only runtime configuration features" ON)
+option(IC_ENABLE_TRACY "Enable Tracy profiler instrumentation" OFF)
 
 
 # Setup the scalable compiler warnings module

@@ -317,4 +317,32 @@ namespace ic
     {
         return m_samplerHeap.heap();
     }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE DX12DescriptorSystem::shaderResourceCpuStart() const
+    {
+        return m_cbvSrvUavHeap.heap()
+            ? m_cbvSrvUavHeap.heap()->GetCPUDescriptorHandleForHeapStart()
+            : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    }
+
+    D3D12_GPU_DESCRIPTOR_HANDLE DX12DescriptorSystem::shaderResourceGpuStart() const
+    {
+        return m_cbvSrvUavHeap.heap()
+            ? m_cbvSrvUavHeap.heap()->GetGPUDescriptorHandleForHeapStart()
+            : D3D12_GPU_DESCRIPTOR_HANDLE{};
+    }
+
+    D3D12_CPU_DESCRIPTOR_HANDLE DX12DescriptorSystem::samplerCpuStart() const
+    {
+        return m_samplerHeap.heap()
+            ? m_samplerHeap.heap()->GetCPUDescriptorHandleForHeapStart()
+            : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    }
+
+    D3D12_GPU_DESCRIPTOR_HANDLE DX12DescriptorSystem::samplerGpuStart() const
+    {
+        return m_samplerHeap.heap()
+            ? m_samplerHeap.heap()->GetGPUDescriptorHandleForHeapStart()
+            : D3D12_GPU_DESCRIPTOR_HANDLE{};
+    }
 }

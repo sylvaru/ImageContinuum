@@ -319,10 +319,29 @@ namespace ic
     }
 
     VkPresentModeKHR VulkanSwapchain::choosePresentMode(
-        [[maybe_unused]] std::span<const VkPresentModeKHR> modes) const
+        std::span<const VkPresentModeKHR> modes) const
     {
-        // FIFO is the only universally available Vulkan present mode that
-        // guarantees no tearing.
+        if (!m_vsync)
+        {
+            for (VkPresentModeKHR mode : modes)
+            {
+                if (mode == VK_PRESENT_MODE_MAILBOX_KHR)
+                {
+                    return mode;
+                }
+            }
+
+            for (VkPresentModeKHR mode : modes)
+            {
+                if (mode == VK_PRESENT_MODE_IMMEDIATE_KHR)
+                {
+                    return mode;
+                }
+            }
+        }
+
+        // FIFO is universally available and is the correct fallback when
+        // tearing-free presentation is requested or no low-latency mode exists.
         return VK_PRESENT_MODE_FIFO_KHR;
     }
 

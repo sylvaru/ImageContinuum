@@ -38,6 +38,9 @@ namespace ic
         void onMouseButtonPressed(MouseButton b) override;
         void onMouseButtonReleased(MouseButton b) override;
     private:
+        void syncMousePosition();
+        bool isWindowFocused() const;
+
         Window& m_window;
 
         // Key state
@@ -58,6 +61,7 @@ namespace ic
         double m_scrollY = 0.0;
 
         bool m_cursorLocked = false;
+        bool m_windowFocused = true;
 
         // Mouse buttons
         bool m_mouseButtons[8]{};

@@ -80,7 +80,23 @@ namespace ic
             std::vector<GpuMesh> meshes;
             std::vector<glm::mat4> meshTransforms;
             std::vector<GpuMaterialData> materials;
+            std::vector<uint32_t> textureDescriptorIndices;
+            std::vector<uint32_t> samplerDescriptorIndices;
             bool uploaded = false;
+        };
+
+        struct UploadedTexture
+        {
+            VulkanTexture texture;
+            VkImageView view = VK_NULL_HANDLE;
+            VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            uint32_t descriptorIndex = UINT32_MAX;
+        };
+
+        struct UploadedSampler
+        {
+            VkSampler sampler = VK_NULL_HANDLE;
+            uint32_t descriptorIndex = UINT32_MAX;
         };
 
         struct FrameSceneResources
@@ -94,6 +110,8 @@ namespace ic
 
             uint32_t objectCapacity = 0;
             uint32_t materialCapacity = 0;
+            uint32_t bindlessTextureCount = 0;
+            uint32_t bindlessSamplerCount = 0;
         };
 
         struct DrawItem
@@ -145,13 +163,35 @@ namespace ic
             uint32_t sceneBvhNodeCount = 0;
             uint32_t accumulatedSampleCount = 0;
             uint64_t sceneVersion = UINT64_MAX;
+            uint64_t environmentVersion = UINT64_MAX;
             uint64_t lastSceneBuildFrame = UINT64_MAX;
+            float tonemapExposure = 1.0f;
             glm::mat4 previousView = glm::mat4(1.0f);
             glm::mat4 previousProjection = glm::mat4(1.0f);
             bool resetAccumulation = true;
             bool hasPreviousCamera = false;
             bool pathTraceDescriptorsDirty = true;
             bool tonemapDescriptorsDirty = true;
+        };
+
+        struct EnvironmentResources
+        {
+            AssetHandle source = {};
+            VulkanTexture cubemap;
+            VulkanTexture equirect;
+            VkImageView cubemapView = VK_NULL_HANDLE;
+            VkImageView cubemapStorageView = VK_NULL_HANDLE;
+            VkImageView equirectView = VK_NULL_HANDLE;
+            VkSampler sampler = VK_NULL_HANDLE;
+            VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+            VkDescriptorSet convertDescriptorSet = VK_NULL_HANDLE;
+            std::vector<VulkanBuffer> skyboxConstants;
+            std::vector<VkDescriptorSet> skyboxDescriptorSets;
+            VkImageLayout cubemapLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImageLayout equirectLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            uint32_t cubemapSize = 512;
+            bool converted = false;
+            bool skyboxDescriptorsDirty = true;
         };
 
     private:
@@ -220,6 +260,13 @@ namespace ic
             const SceneRenderView& scene,
             VkCommandBuffer cmd);
 
+        void executeEnvironmentConvertNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            VkCommandBuffer cmd);
+
         void executeTonemapNode(
             const CompiledGraphPlan& plan,
             const ExecutionNode& node,
@@ -245,6 +292,23 @@ namespace ic
         void updatePathTraceDescriptors(
             const VulkanComputePipeline* pathTracePipeline,
             const VulkanComputePipeline* tonemapPipeline);
+        bool ensureEnvironmentResources(
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            VkCommandBuffer cmd);
+        VulkanComputePipeline* environmentConvertPipeline();
+        bool convertEnvironmentIfReady(
+            VulkanComputePipeline& pipeline,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            VkCommandBuffer cmd);
+        void updateSkyboxDescriptors(const VulkanGraphicsPipeline& pipeline);
+        void destroyEnvironmentResources();
+        void drawSkybox(
+            VulkanGraphicsPipeline& pipeline,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            VkCommandBuffer cmd);
         void ensureDepthTarget();
         void destroyDepthTarget();
         void ensureComputeTestResources(
@@ -253,6 +317,14 @@ namespace ic
         UploadedModel* requestModel(
             AssetHandle handle,
             const AssetManager& assets);
+
+        uint32_t requestTexture(
+            AssetHandle modelHandle,
+            uint32_t imageIndex,
+            const ImageAsset& image,
+            TextureTransferFunction transfer);
+
+        uint32_t requestSampler(const SamplerAsset* sampler);
 
         bool prepareSceneResources(
             const FrameContext& ctx,
@@ -328,11 +400,14 @@ namespace ic
         VkDescriptorPool m_computeTestDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_computeTestDescriptorSet = VK_NULL_HANDLE;
         PathTraceResources m_pathTraceResources;
+        EnvironmentResources m_environmentResources;
 
         const PipelineLibrary* m_pipelineLibrary = nullptr;
         std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash> m_pipelineHandles;
         std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash> m_computePipelineHandles;
         std::unordered_map<AssetHandle, UploadedModel, AssetHandleHash> m_uploadedModels;
+        std::unordered_map<uint64_t, UploadedTexture> m_uploadedTextures;
+        std::unordered_map<uint64_t, UploadedSampler> m_uploadedSamplers;
         std::vector<FrameSceneResources> m_sceneFrameResources;
         PreparedSceneFrame m_preparedScene;
         uint32_t m_workerSlots = 1;

@@ -81,9 +81,6 @@ namespace ic
         VkCompareOp toVkCompareOp(CompareOp compare) const;
         VkFormat toVkFormat(TextureFormat format) const;
 
-        static std::vector<std::byte> readBinaryFile(
-            const std::filesystem::path& path);
-
         VkDevice m_device = VK_NULL_HANDLE;
         std::vector<VulkanGraphicsPipeline> m_graphicsPipelines;
         std::vector<VulkanComputePipeline> m_computePipelines;

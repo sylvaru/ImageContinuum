@@ -119,7 +119,6 @@ namespace ic
         AppServices m_services{};
         FrameContext m_frame{};
         
-        static constexpr float kTargetFPS = 144.0f;
-        static constexpr float kTargetFrameTime = 1.0f / kTargetFPS;
+        static constexpr float kFallbackTargetFPS = 500.0f;
     };
 }

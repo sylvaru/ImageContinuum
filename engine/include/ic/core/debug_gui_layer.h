@@ -7,6 +7,7 @@ namespace ic
 {
     struct FrameContext;
     class Renderer;
+    class SceneManager;
 
     class DebugGuiLayer final : public Layer
     {
@@ -22,5 +23,6 @@ namespace ic
         float m_sampleElapsed = 0.0f;
         uint32_t m_sampleFrames = 0;
         Renderer* m_renderer = nullptr;
+        SceneManager* m_sceneManager = nullptr;
     };
 }

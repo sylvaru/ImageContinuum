@@ -1,11 +1,12 @@
-#include "ic/renderer/vulkan_backend/vulkan_pipeline_manager.h"
+﻿#include "ic/renderer/vulkan_backend/vulkan_pipeline_manager.h"
 
 #include <fstream>
 #include <stdexcept>
 
 #include "ic/core/asset_manager.h"
 #include "ic/renderer/renderer_gpu_assets.h"
-
+#include "ic/renderer/renderer_common/renderer_util.h"
+#include "ic/util/util.h"
 namespace
 {
     void throwIfFailed(VkResult result, const char* message)
@@ -223,19 +224,22 @@ namespace ic
         shaderStages[1].module = pixelShader;
         shaderStages[1].pName = "PSMain";
 
+        const std::vector<VkVertexInputAttributeDescription> attributes =
+            createInputAttributes(desc.vertexLayout);
         VkVertexInputBindingDescription vertexBinding{};
         vertexBinding.binding = 0;
         vertexBinding.stride = sizeof(AssetVertex);
         vertexBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-        const std::vector<VkVertexInputAttributeDescription> attributes =
-            createInputAttributes(desc.vertexLayout);
+        const bool hasVertexInput =
+            desc.vertexLayout == VertexLayoutKind::AssetVertex;
 
         VkPipelineVertexInputStateCreateInfo vertexInput{};
         vertexInput.sType =
             VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-        vertexInput.vertexBindingDescriptionCount = 1;
-        vertexInput.pVertexBindingDescriptions = &vertexBinding;
+        vertexInput.vertexBindingDescriptionCount =
+            hasVertexInput ? 1u : 0u;
+        vertexInput.pVertexBindingDescriptions =
+            hasVertexInput ? &vertexBinding : nullptr;
         vertexInput.vertexAttributeDescriptionCount =
             static_cast<uint32_t>(attributes.size());
         vertexInput.pVertexAttributeDescriptions = attributes.data();
@@ -448,7 +452,7 @@ namespace ic
         if (layout == PipelineBindingLayoutKind::PathTrace ||
             layout == PipelineBindingLayoutKind::PathTraceTonemap)
         {
-            VkDescriptorSetLayoutBinding bindings[6]{};
+            VkDescriptorSetLayoutBinding bindings[8]{};
 
             bindings[0].binding = 0;
             bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -462,12 +466,12 @@ namespace ic
 
             const uint32_t bindingCount =
                 layout == PipelineBindingLayoutKind::PathTrace
-                    ? 6u
+                    ? 8u
                     : 3u;
 
             if (layout == PipelineBindingLayoutKind::PathTrace)
             {
-                for (uint32_t i = 2; i < bindingCount; ++i)
+                for (uint32_t i = 2; i < 6u; ++i)
                 {
                     bindings[i].binding = i;
                     bindings[i].descriptorType =
@@ -475,6 +479,16 @@ namespace ic
                     bindings[i].descriptorCount = 1;
                     bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
                 }
+
+                bindings[6].binding = 6;
+                bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                bindings[6].descriptorCount = 1;
+                bindings[6].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+                bindings[7].binding = 7;
+                bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                bindings[7].descriptorCount = 1;
+                bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
             }
             else
             {
@@ -502,13 +516,88 @@ namespace ic
             return setLayout;
         }
 
+        if (layout == PipelineBindingLayoutKind::EnvironmentConvert)
+        {
+            VkDescriptorSetLayoutBinding bindings[3]{};
+            bindings[0].binding = 0;
+            bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            bindings[0].descriptorCount = 1;
+            bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[1].binding = 1;
+            bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            bindings[1].descriptorCount = 1;
+            bindings[1].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            bindings[2].binding = 2;
+            bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            bindings[2].descriptorCount = 1;
+            bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{};
+            layoutInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            layoutInfo.bindingCount =
+                static_cast<uint32_t>(std::size(bindings));
+            layoutInfo.pBindings = bindings;
+
+            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            throwIfFailed(
+                vkCreateDescriptorSetLayout(
+                    m_device,
+                    &layoutInfo,
+                    nullptr,
+                    &setLayout),
+                "Failed to create Vulkan environment descriptor set layout.");
+
+            return setLayout;
+        }
+
+        if (layout == PipelineBindingLayoutKind::Skybox)
+        {
+            VkDescriptorSetLayoutBinding bindings[3]{};
+            bindings[0].binding = 0;
+            bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            bindings[0].descriptorCount = 1;
+            bindings[0].stageFlags =
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+            bindings[1].binding = 1;
+            bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            bindings[1].descriptorCount = 1;
+            bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+            bindings[2].binding = 100;
+            bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            bindings[2].descriptorCount = 1;
+            bindings[2].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{};
+            layoutInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            layoutInfo.bindingCount =
+                static_cast<uint32_t>(std::size(bindings));
+            layoutInfo.pBindings = bindings;
+
+            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            throwIfFailed(
+                vkCreateDescriptorSetLayout(
+                    m_device,
+                    &layoutInfo,
+                    nullptr,
+                    &setLayout),
+                "Failed to create Vulkan skybox descriptor set layout.");
+
+            return setLayout;
+        }
+
         if (layout != PipelineBindingLayoutKind::ForwardBindless)
         {
             throw std::runtime_error(
                 "Unsupported Vulkan pipeline binding layout.");
         }
 
-        VkDescriptorSetLayoutBinding bindings[3]{};
+        VkDescriptorSetLayoutBinding bindings[5]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[0].descriptorCount = 1;
@@ -526,6 +615,16 @@ namespace ic
         bindings[2].descriptorCount = 1;
         bindings[2].stageFlags =
             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        bindings[3].binding = 3;
+        bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bindings[3].descriptorCount = MaxBindlessTextures;
+        bindings[3].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        bindings[4].binding = 100;
+        bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        bindings[4].descriptorCount = MaxBindlessSamplers;
+        bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType =
@@ -549,6 +648,11 @@ namespace ic
     std::vector<VkVertexInputAttributeDescription>
         VulkanPipelineManager::createInputAttributes(VertexLayoutKind layout) const
     {
+        if (layout == VertexLayoutKind::Unknown)
+        {
+            return {};
+        }
+
         if (layout != VertexLayoutKind::AssetVertex)
         {
             throw std::runtime_error("Unsupported Vulkan vertex layout.");
@@ -655,48 +759,4 @@ namespace ic
         return VK_FORMAT_UNDEFINED;
     }
 
-    std::vector<std::byte> VulkanPipelineManager::readBinaryFile(
-        const std::filesystem::path& path)
-    {
-        std::filesystem::path candidate = path;
-        if (!std::filesystem::exists(candidate))
-        {
-            std::filesystem::path cursor = std::filesystem::current_path();
-            while (!cursor.empty())
-            {
-                candidate = (cursor / path).lexically_normal();
-                if (std::filesystem::exists(candidate))
-                {
-                    break;
-                }
-
-                const std::filesystem::path parent = cursor.parent_path();
-                if (parent == cursor)
-                {
-                    break;
-                }
-                cursor = parent;
-            }
-        }
-
-        std::ifstream file(candidate, std::ios::binary | std::ios::ate);
-        if (!file)
-        {
-            throw std::runtime_error(
-                "Could not open shader file: " + path.string());
-        }
-
-        const std::streamsize size = file.tellg();
-        file.seekg(0, std::ios::beg);
-
-        std::vector<std::byte> bytes(static_cast<size_t>(size));
-        if (size > 0)
-        {
-            file.read(
-                reinterpret_cast<char*>(bytes.data()),
-                size);
-        }
-
-        return bytes;
-    }
 }

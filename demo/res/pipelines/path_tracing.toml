@@ -17,3 +17,13 @@ compute = "demo/res/compiled_shaders/dx12/path_trace_tonemap.cs.dxil"
 
 [pipelines.path_trace_tonemap.shaders.vulkan]
 compute = "demo/res/compiled_shaders/vulkan/path_trace_tonemap.comp.spv"
+
+[pipelines.equirect_to_cubemap]
+type = "Compute"
+bindingLayout = "EnvironmentConvert"
+
+[pipelines.equirect_to_cubemap.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/equirect_to_cubemap.cs.dxil"
+
+[pipelines.equirect_to_cubemap.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/equirect_to_cubemap.comp.spv"

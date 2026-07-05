@@ -88,6 +88,8 @@ namespace ic
         {
             std::string name;
             std::filesystem::path sourcePath;
+            AssetHandle environmentTexture = {};
+            EnvironmentSettings environmentSettings = {};
 
             struct EntityDesc
             {
@@ -136,7 +138,7 @@ namespace ic
 
         static std::unique_ptr<LoadedSceneData> loadSceneFile(
             const std::filesystem::path& path,
-            const std::filesystem::path& modelRoot,
+            const SceneManagerDesc& desc,
             AssetManager& assets,
             const SceneLoadOptions& options);
 

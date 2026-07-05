@@ -51,8 +51,14 @@ float4 PSMain(VertexOutput input) : SV_Target0
 
     float4 sampledBaseColor = float4(1.0f, 1.0f, 1.0f, 1.0f);
 #if !defined(IC_DISABLE_TEXTURE_SAMPLING)
-    sampledBaseColor =
-        gBindlessTextures[textureIndex].Sample(gBindlessSamplers[samplerIndex], input.uv0);
+    if (textureIndex != IC_INVALID_BINDLESS_INDEX &&
+        samplerIndex != IC_INVALID_BINDLESS_INDEX)
+    {
+        sampledBaseColor =
+            gBindlessTextures[NonUniformResourceIndex(textureIndex)].Sample(
+                gBindlessSamplers[NonUniformResourceIndex(samplerIndex)],
+                input.uv0);
+    }
 #else
     sampledBaseColor.rgb += 0.0f * float3(textureIndex, samplerIndex, 0.0f);
 #endif

@@ -314,7 +314,7 @@ namespace ic
             try
             {
                 completion.data =
-                    loadSceneFile(path, m_desc.modelRoot, *m_assets, options);
+                    loadSceneFile(path, m_desc, *m_assets, options);
                 completion.success = true;
             }
             catch (const std::exception& e)
@@ -336,7 +336,7 @@ namespace ic
                 try
                 {
                     completion.data =
-                        loadSceneFile(path, m_desc.modelRoot, *m_assets, options);
+                        loadSceneFile(path, m_desc, *m_assets, options);
                     completion.success = true;
                 }
                 catch (const std::exception& e)
@@ -616,12 +616,15 @@ namespace ic
             }
         }
 
+        r->scene->setEnvironmentTexture(data->environmentTexture);
+        r->scene->setEnvironmentSettings(data->environmentSettings);
+
         spdlog::info("[SceneManager] Loaded scene '{}'", r->scene->name());
     }
 
     std::unique_ptr<SceneManager::LoadedSceneData> SceneManager::loadSceneFile(
         const std::filesystem::path& path,
-        const std::filesystem::path& modelRoot,
+        const SceneManagerDesc& desc,
         AssetManager& assets,
         const SceneLoadOptions& options)
     {
@@ -630,6 +633,7 @@ namespace ic
 
         auto result = std::make_unique<LoadedSceneData>();
         result->sourcePath = resolvedPath;
+        result->environmentSettings = desc.defaultEnvironment;
 
         if (auto* sceneTable = table["scene"].as_table())
         {
@@ -637,6 +641,66 @@ namespace ic
                 sceneTable->get_as<std::string>("name")
                     ? sceneTable->get_as<std::string>("name")->get()
                     : resolvedPath.stem().string();
+
+            if (auto* environment =
+                    sceneTable->get_as<toml::table>("environment"))
+            {
+                if (auto equirect =
+                        environment->get_as<std::string>("equirect"))
+                {
+                    const std::filesystem::path environmentPath =
+                        resolveEntityAssetPath(
+                            resolvedPath,
+                            desc.modelRoot,
+                            equirect->get());
+                    if (options.loadReferencedAssets)
+                    {
+                        ImageLoadOptions imageOptions{};
+                        imageOptions.forceRGBA = true;
+                        imageOptions.srgb = false;
+                        imageOptions.flipY = false;
+                        result->environmentTexture =
+                            assets.loadImageAsync(
+                                environmentPath,
+                                imageOptions);
+                    }
+                }
+
+                result->environmentSettings.enabled =
+                    readBool(
+                        *environment,
+                        "enabled",
+                        result->environmentSettings.enabled);
+                result->environmentSettings.intensity =
+                    readFloat(
+                        *environment,
+                        "intensity",
+                        result->environmentSettings.intensity);
+                result->environmentSettings.skyboxExposure =
+                    readFloat(
+                        *environment,
+                        "skybox_exposure",
+                        result->environmentSettings.skyboxExposure);
+                result->environmentSettings.pathTraceExposure =
+                    readFloat(
+                        *environment,
+                        "path_trace_exposure",
+                        result->environmentSettings.pathTraceExposure);
+                result->environmentSettings.tonemapExposure =
+                    readFloat(
+                        *environment,
+                        "tonemap_exposure",
+                        result->environmentSettings.tonemapExposure);
+                result->environmentSettings.cubemapSize =
+                    static_cast<uint32_t>(
+                        std::max(
+                            1.0f,
+                            readFloat(
+                                *environment,
+                                "cubemap_size",
+                                static_cast<float>(
+                                    result->environmentSettings.cubemapSize))));
+            }
         }
         else
         {
@@ -657,115 +721,117 @@ namespace ic
                 continue;
             }
 
-            LoadedSceneData::EntityDesc desc{};
+            LoadedSceneData::EntityDesc entityDesc{};
 
             if (auto id = entityTable->get_as<int64_t>("id"))
             {
-                desc.id = static_cast<uint64_t>(std::max<int64_t>(0, id->get()));
+                entityDesc.id =
+                    static_cast<uint64_t>(std::max<int64_t>(0, id->get()));
             }
 
             if (auto name = entityTable->get_as<std::string>("name"))
             {
-                desc.name = name->get();
+                entityDesc.name = name->get();
             }
 
             if (auto model = entityTable->get_as<std::string>("model"))
             {
-                desc.modelPath =
+                entityDesc.modelPath =
                     resolveEntityAssetPath(
                         resolvedPath,
-                        modelRoot,
+                        desc.modelRoot,
                         model->get());
 
                 if (options.loadReferencedAssets)
                 {
-                    desc.modelHandle = assets.loadModelAsync(desc.modelPath);
+                    entityDesc.modelHandle =
+                        assets.loadModelAsync(entityDesc.modelPath);
                 }
             }
 
             if (auto parent = entityTable->get_as<int64_t>("parent"))
             {
-                desc.parentId = parent->get();
+                entityDesc.parentId = parent->get();
             }
 
             if (auto* transform = entityTable->get_as<toml::table>("transform"))
             {
-                desc.translation =
+                entityDesc.translation =
                     readVec3(*transform, "translation", glm::vec3(0.0f));
-                desc.rotation =
+                entityDesc.rotation =
                     readQuat(*transform, "rotation", glm::quat(1.0f, 0.0f, 0.0f, 0.0f));
-                desc.scale =
+                entityDesc.scale =
                     readVec3(*transform, "scale", glm::vec3(1.0f));
             }
 
             if (auto* camera = entityTable->get_as<toml::table>("camera"))
             {
-                desc.hasCamera = true;
-                desc.camera.primary = readBool(*camera, "primary", false);
-                desc.camera.verticalFovRadians =
+                entityDesc.hasCamera = true;
+                entityDesc.camera.primary = readBool(*camera, "primary", false);
+                entityDesc.camera.verticalFovRadians =
                     glm::radians(readFloat(*camera, "vertical_fov_degrees", 60.0f));
-                desc.camera.nearPlane = readFloat(*camera, "near", 0.1f);
-                desc.camera.farPlane = readFloat(*camera, "far", 1000.0f);
+                entityDesc.camera.nearPlane = readFloat(*camera, "near", 0.1f);
+                entityDesc.camera.farPlane = readFloat(*camera, "far", 1000.0f);
             }
 
             if (auto* flyCamera = entityTable->get_as<toml::table>("fly_camera"))
             {
-                desc.hasFlyCamera = true;
-                desc.flyCamera.moveSpeed =
-                    readFloat(*flyCamera, "move_speed", desc.flyCamera.moveSpeed);
-                desc.flyCamera.fastMoveMultiplier =
+                entityDesc.hasFlyCamera = true;
+                entityDesc.flyCamera.moveSpeed =
+                    readFloat(*flyCamera, "move_speed", entityDesc.flyCamera.moveSpeed);
+                entityDesc.flyCamera.fastMoveMultiplier =
                     readFloat(
                         *flyCamera,
                         "fast_move_multiplier",
-                        desc.flyCamera.fastMoveMultiplier);
-                desc.flyCamera.mouseSensitivity =
+                        entityDesc.flyCamera.fastMoveMultiplier);
+                entityDesc.flyCamera.mouseSensitivity =
                     readFloat(
                         *flyCamera,
                         "mouse_sensitivity",
-                        desc.flyCamera.mouseSensitivity);
-                desc.flyCamera.yaw =
-                    readFloat(*flyCamera, "yaw", desc.flyCamera.yaw);
-                desc.flyCamera.pitch =
-                    readFloat(*flyCamera, "pitch", desc.flyCamera.pitch);
-                desc.flyCamera.captureMouse =
+                        entityDesc.flyCamera.mouseSensitivity);
+                entityDesc.flyCamera.yaw =
+                    readFloat(*flyCamera, "yaw", entityDesc.flyCamera.yaw);
+                entityDesc.flyCamera.pitch =
+                    readFloat(*flyCamera, "pitch", entityDesc.flyCamera.pitch);
+                entityDesc.flyCamera.captureMouse =
                     readBool(
                         *flyCamera,
                         "capture_mouse",
-                        desc.flyCamera.captureMouse);
+                        entityDesc.flyCamera.captureMouse);
             }
 
             if (auto* light = entityTable->get_as<toml::table>("light"))
             {
-                desc.hasLight = true;
+                entityDesc.hasLight = true;
 
                 const std::string type =
                     lowerCopy(readString(*light, "type", "point"));
                 if (type == "directional")
                 {
-                    desc.light.type = LightType::Directional;
+                    entityDesc.light.type = LightType::Directional;
                 }
                 else if (type == "spot")
                 {
-                    desc.light.type = LightType::Spot;
+                    entityDesc.light.type = LightType::Spot;
                 }
                 else
                 {
-                    desc.light.type = LightType::Point;
+                    entityDesc.light.type = LightType::Point;
                 }
 
-                desc.light.color =
+                entityDesc.light.color =
                     readVec3(*light, "color", glm::vec3(1.0f));
-                desc.light.intensity =
+                entityDesc.light.intensity =
                     readFloat(*light, "intensity", 1.0f);
-                desc.light.range =
+                entityDesc.light.range =
                     readFloat(*light, "range", 10.0f);
-                desc.light.innerConeRadians =
+                entityDesc.light.innerConeRadians =
                     glm::radians(readFloat(*light, "inner_cone_degrees", 15.0f));
-                desc.light.outerConeRadians =
+                entityDesc.light.outerConeRadians =
                     glm::radians(readFloat(*light, "outer_cone_degrees", 30.0f));
             }
 
-            result->entities.push_back(std::move(desc));
+            result->entities.push_back(std::move(entityDesc));
         }
 
         return result;
@@ -888,6 +954,19 @@ namespace ic
         }
 
         m_renderView.camera = {};
+        if (scene->environmentTexture())
+        {
+            m_renderView.environment.equirectTexture =
+                scene->environmentTexture();
+            m_renderView.environment.settings =
+                scene->environmentSettings();
+            m_renderView.environment.version =
+                scene->environmentVersion();
+            m_renderView.environment.intensity =
+                scene->environmentSettings().intensity;
+            m_renderView.environment.enabled =
+                scene->environmentSettings().enabled ? 1u : 0u;
+        }
         m_renderView.models =
             std::span<const SceneModelRenderItem>(m_modelItems.data(), m_modelItems.size());
         m_renderView.lights =

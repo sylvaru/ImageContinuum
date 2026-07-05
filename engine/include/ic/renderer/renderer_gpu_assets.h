@@ -44,11 +44,13 @@ namespace ic
         float alphaCutoff = 0.5f;
         uint32_t flags = 0;
 
-        uint32_t baseColorTextureIndex = 0;
-        uint32_t normalTextureIndex = 2;
-        uint32_t metallicRoughnessTextureIndex = 3;
-        uint32_t samplerIndex = 0;
+        uint32_t baseColorTextureIndex = UINT32_MAX;
+        uint32_t normalTextureIndex = UINT32_MAX;
+        uint32_t metallicRoughnessTextureIndex = UINT32_MAX;
+        uint32_t samplerIndex = UINT32_MAX;
     };
+
+    GpuMaterialData makeGpuMaterialData(const MaterialAsset& src);
 
     struct GpuMesh
     {

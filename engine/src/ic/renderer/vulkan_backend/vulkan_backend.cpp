@@ -4,6 +4,7 @@
 #include "ic/renderer/pipeline_library.h"
 #include "ic/renderer/renderer_specification.h"
 #include "ic/renderer/path_tracing/path_trace_scene_builder.h"
+#include "ic/renderer/renderer_common/renderer_util.h"
 #include "ic/interface/window.h"
 #include "ic/core/frame_context.h"
 #include "ic/scene/scene_render_view.h"
@@ -25,133 +26,12 @@ namespace ic
 {
     namespace
     {
-        constexpr uint32_t DefaultPathTraceMaxBounces = 4;
-        constexpr uint32_t DefaultPathTraceSamplesPerPixel = 2;
-
-        struct PathTraceConstants
+        void throwIfFailed(VkResult result, const char* message)
         {
-            uint32_t renderWidth = 0;
-            uint32_t renderHeight = 0;
-            uint32_t frameIndex = 0;
-            uint32_t accumulatedSampleCount = 0;
-
-            float exposure = 1.0f;
-            uint32_t resetAccumulation = 1;
-            uint32_t maxBounces = 4;
-            uint32_t samplesPerPixel = 1;
-
-            uint32_t sceneVertexCount = 0;
-            uint32_t sceneMaterialCount = 0;
-            uint32_t sceneTriangleCount = 0;
-            uint32_t sceneBvhNodeCount = 0;
-
-            uint32_t useSceneGeometry = 0;
-            uint32_t padding0 = 0;
-            uint32_t padding1 = 0;
-            uint32_t padding2 = 0;
-
-            glm::vec4 cameraPositionAndTanHalfFov = glm::vec4(0.0f);
-            glm::vec4 cameraForwardAndAspect = glm::vec4(0.0f);
-            glm::vec4 cameraRightAndNear = glm::vec4(0.0f);
-            glm::vec4 cameraUpAndFar = glm::vec4(0.0f);
-        };
-
-        struct TonemapConstants
-        {
-            uint32_t renderWidth = 0;
-            uint32_t renderHeight = 0;
-            float exposure = 1.0f;
-            uint32_t padding0 = 0;
-        };
-
-        static_assert(sizeof(PathTraceConstants) == 128);
-        static_assert(sizeof(TonemapConstants) == 16);
-
-        bool matricesDiffer(const glm::mat4& a, const glm::mat4& b)
-        {
-            constexpr float CameraMatrixEpsilon = 1.0e-5f;
-            for (glm::length_t column = 0; column < 4; ++column)
+            if (result != VK_SUCCESS)
             {
-                for (glm::length_t row = 0; row < 4; ++row)
-                {
-                    if (std::fabs(a[column][row] - b[column][row]) >
-                        CameraMatrixEpsilon)
-                    {
-                        return true;
-                    }
-                }
+                throw std::runtime_error(message);
             }
-
-            return false;
-        }
-
-        void fillPathTraceCameraConstants(
-            const SceneCameraView& camera,
-            uint32_t width,
-            uint32_t height,
-            PathTraceConstants& constants)
-        {
-            const float fallbackAspect =
-                height == 0u
-                    ? 1.0f
-                    : static_cast<float>(width) / static_cast<float>(height);
-
-            if (camera.valid != 0u)
-            {
-                const glm::mat4 inverseView = glm::inverse(camera.view);
-                const glm::vec3 right =
-                    glm::normalize(glm::vec3(inverseView[0]));
-                const glm::vec3 up =
-                    glm::normalize(glm::vec3(inverseView[1]));
-                const glm::vec3 forward =
-                    glm::normalize(-glm::vec3(inverseView[2]));
-                const float aspect =
-                    camera.aspectRatio > 0.0f
-                        ? camera.aspectRatio
-                        : fallbackAspect;
-                const float tanHalfFov =
-                    std::tan(camera.verticalFovRadians * 0.5f);
-
-                constants.cameraPositionAndTanHalfFov =
-                    glm::vec4(camera.position, tanHalfFov);
-                constants.cameraForwardAndAspect =
-                    glm::vec4(forward, aspect);
-                constants.cameraRightAndNear =
-                    glm::vec4(right, camera.nearPlane);
-                constants.cameraUpAndFar =
-                    glm::vec4(up, camera.farPlane);
-                return;
-            }
-
-            const glm::vec3 origin(0.0f, 1.05f, -3.25f);
-            const glm::vec3 target(0.0f, 0.95f, 0.95f);
-            const glm::vec3 forward = glm::normalize(target - origin);
-            const glm::vec3 right =
-                glm::normalize(
-                    glm::cross(forward, glm::vec3(0.0f, 1.0f, 0.0f)));
-            const glm::vec3 up = glm::normalize(glm::cross(right, forward));
-
-            constants.cameraPositionAndTanHalfFov =
-                glm::vec4(origin, std::tan(glm::radians(39.0f) * 0.5f));
-            constants.cameraForwardAndAspect =
-                glm::vec4(forward, fallbackAspect);
-            constants.cameraRightAndNear =
-                glm::vec4(right, 0.1f);
-            constants.cameraUpAndFar =
-                glm::vec4(up, 100.0f);
-        }
-
-        bool planUsesPathTracing(const CompiledGraphPlan& plan)
-        {
-            for (const auto& payload : plan.payloads)
-            {
-                if (std::get_if<PathTracePassData>(&payload))
-                {
-                    return true;
-                }
-            }
-
-            return false;
         }
     }
 
@@ -180,6 +60,8 @@ namespace ic
             m_adapter.device(),
             m_device.device(),
             m_device.info());
+
+        m_swapchain.setVsyncEnabled(spec.settings.vsync);
 
 		m_swapchain.init(
 			m_adapter,
@@ -225,6 +107,8 @@ namespace ic
 
         shutdownImGui();
         destroySceneResources();
+        destroyEnvironmentResources();
+        destroyPathTraceResources();
         m_pipelineManager.shutdown();
 
         destroySwapchainSync();
@@ -860,8 +744,28 @@ namespace ic
             return;
         }
 
+        const GraphicsPassData* pass =
+            node.payloadIndex < plan.payloads.size()
+                ? std::get_if<GraphicsPassData>(
+                    &plan.payloads[node.payloadIndex])
+                : nullptr;
+
         const bool hasColorTarget =
             pipeline->desc.colorAttachmentCount > 0;
+
+        if (pass && pass->drawList == DrawListKind::Skybox &&
+            !m_environmentResources.converted)
+        {
+            if (VulkanComputePipeline* convertPipeline =
+                    environmentConvertPipeline())
+            {
+                (void)convertEnvironmentIfReady(
+                    *convertPipeline,
+                    ctx,
+                    scene,
+                    cmd);
+            }
+        }
 
         VkClearValue clear{};
         clear.color = { { 0.02f, 0.02f, 0.025f, 1.0f } };
@@ -903,7 +807,12 @@ namespace ic
         colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         colorAttachment.imageView = m_swapchain.imageView(m_currentSwapchainImage);
         colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.loadOp =
+            pass && pass->colorLoadOp == AttachmentLoadOp::Load
+                ? VK_ATTACHMENT_LOAD_OP_LOAD
+                : (pass && pass->colorLoadOp == AttachmentLoadOp::DontCare
+                    ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                    : VK_ATTACHMENT_LOAD_OP_CLEAR);
         colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         colorAttachment.clearValue = clear;
 
@@ -916,9 +825,11 @@ namespace ic
         depthAttachment.imageLayout =
             VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depthAttachment.loadOp =
-            hasColorTarget
+            pass && pass->depthLoadOp == AttachmentLoadOp::Load
                 ? VK_ATTACHMENT_LOAD_OP_LOAD
-                : VK_ATTACHMENT_LOAD_OP_CLEAR;
+                : (pass && pass->depthLoadOp == AttachmentLoadOp::DontCare
+                    ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                    : VK_ATTACHMENT_LOAD_OP_CLEAR);
         depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         depthAttachment.clearValue = depthClear;
 
@@ -933,7 +844,9 @@ namespace ic
 
         vkCmdBeginRendering(cmd, &renderingInfo);
 
-        if (prepareSceneResources(ctx, scene, pipelineHandle) &&
+        if (pass &&
+            pass->drawList == DrawListKind::SceneGeometry &&
+            prepareSceneResources(ctx, scene, pipelineHandle) &&
             !m_preparedScene.draws.empty())
         {
             const std::vector<DrawItem>& draws =
@@ -1032,6 +945,10 @@ namespace ic
                     0);
             }
         }
+        else if (pass && pass->drawList == DrawListKind::Skybox)
+        {
+            drawSkybox(*pipeline, ctx, scene, cmd);
+        }
 
         vkCmdEndRendering(cmd);
 
@@ -1052,6 +969,13 @@ namespace ic
         if (std::get_if<PathTracePassData>(&plan.payloads[node.payloadIndex]))
         {
             executePathTraceNode(plan, node, ctx, scene, cmd);
+            return;
+        }
+
+        if (std::get_if<EnvironmentConvertPassData>(
+                &plan.payloads[node.payloadIndex]))
+        {
+            executeEnvironmentConvertNode(plan, node, ctx, scene, cmd);
             return;
         }
 
@@ -1127,13 +1051,19 @@ namespace ic
         }
     }
 
-    void VulkanBackend::executePathTraceNode(
+    void VulkanBackend::executeEnvironmentConvertNode(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
         const FrameContext& ctx,
         const SceneRenderView& scene,
         VkCommandBuffer cmd)
     {
+        if (!ensureEnvironmentResources(ctx, scene, cmd) ||
+            m_environmentResources.converted)
+        {
+            return;
+        }
+
         VulkanComputePipeline* pipeline =
             m_pipelineManager.computePipeline(
                 computePipelineForNode(plan, node));
@@ -1142,8 +1072,686 @@ namespace ic
             return;
         }
 
+        (void)convertEnvironmentIfReady(*pipeline, ctx, scene, cmd);
+    }
+
+    VulkanComputePipeline* VulkanBackend::environmentConvertPipeline()
+    {
+        if (!m_pipelineLibrary)
+        {
+            return nullptr;
+        }
+
+        const PipelineId pipelineId = makePipelineId("equirect_to_cubemap");
+        auto it = m_computePipelineHandles.find(pipelineId);
+        ComputePipelineHandle handle{};
+        if (it != m_computePipelineHandles.end())
+        {
+            handle = it->second;
+        }
+        else
+        {
+            ComputePipelineDesc desc =
+                m_pipelineLibrary->resolveCompute(
+                    pipelineId,
+                    RendererBackendType::Vulkan);
+            handle = m_pipelineManager.requestComputePipeline(desc);
+            m_computePipelineHandles.emplace(pipelineId, handle);
+        }
+
+        return m_pipelineManager.computePipeline(handle);
+    }
+
+    bool VulkanBackend::convertEnvironmentIfReady(
+        VulkanComputePipeline& pipeline,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        VkCommandBuffer cmd)
+    {
+        if (!ensureEnvironmentResources(ctx, scene, cmd) ||
+            m_environmentResources.converted)
+        {
+            return m_environmentResources.converted;
+        }
+
+        const uint64_t key =
+            uploadedTextureKey(
+                scene.environment.equirectTexture,
+                0,
+                TextureTransferFunction::Linear);
+        auto textureIt = m_uploadedTextures.find(key);
+        if (textureIt == m_uploadedTextures.end())
+        {
+            return false;
+        }
+
+        if (m_environmentResources.convertDescriptorSet == VK_NULL_HANDLE)
+        {
+            VkDescriptorSetAllocateInfo allocateInfo{};
+            allocateInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocateInfo.descriptorPool =
+                m_environmentResources.descriptorPool;
+            allocateInfo.descriptorSetCount = 1;
+            allocateInfo.pSetLayouts = &pipeline.descriptorSetLayout;
+            throwIfFailed(
+                vkAllocateDescriptorSets(
+                    m_device.device(),
+                    &allocateInfo,
+                    &m_environmentResources.convertDescriptorSet),
+                "Failed to allocate Vulkan environment conversion descriptor set.");
+
+            VkDescriptorImageInfo sourceInfo{};
+            sourceInfo.imageView = textureIt->second.view;
+            sourceInfo.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorImageInfo outputInfo{};
+            outputInfo.imageView =
+                m_environmentResources.cubemapStorageView;
+            outputInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+
+            VkDescriptorImageInfo samplerInfo{};
+            samplerInfo.sampler = m_environmentResources.sampler;
+
+            VkWriteDescriptorSet writes[3]{};
+            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[0].dstSet =
+                m_environmentResources.convertDescriptorSet;
+            writes[0].dstBinding = 0;
+            writes[0].descriptorCount = 1;
+            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            writes[0].pImageInfo = &sourceInfo;
+
+            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[1].dstSet =
+                m_environmentResources.convertDescriptorSet;
+            writes[1].dstBinding = 1;
+            writes[1].descriptorCount = 1;
+            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            writes[1].pImageInfo = &outputInfo;
+
+            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[2].dstSet =
+                m_environmentResources.convertDescriptorSet;
+            writes[2].dstBinding = 2;
+            writes[2].descriptorCount = 1;
+            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            writes[2].pImageInfo = &samplerInfo;
+
+            vkUpdateDescriptorSets(
+                m_device.device(),
+                static_cast<uint32_t>(std::size(writes)),
+                writes,
+                0,
+                nullptr);
+        }
+
+        if (m_environmentResources.cubemapLayout !=
+            VK_IMAGE_LAYOUT_GENERAL)
+        {
+            VkImageMemoryBarrier barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.oldLayout = m_environmentResources.cubemapLayout;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.srcAccessMask = 0;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = m_environmentResources.cubemap.image;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 6;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                0,
+                0, nullptr,
+                0, nullptr,
+                1,
+                &barrier);
+            m_environmentResources.cubemapLayout = VK_IMAGE_LAYOUT_GENERAL;
+        }
+
+        vkCmdBindPipeline(
+            cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipeline);
+        vkCmdBindDescriptorSets(
+            cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipelineLayout,
+            0,
+            1,
+            &m_environmentResources.convertDescriptorSet,
+            0,
+            nullptr);
+        vkCmdDispatch(
+            cmd,
+            (m_environmentResources.cubemapSize + 7u) / 8u,
+            (m_environmentResources.cubemapSize + 7u) / 8u,
+            6u);
+
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = m_environmentResources.cubemap.image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 6;
+
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0, nullptr,
+            0, nullptr,
+            1,
+            &barrier);
+
+        m_environmentResources.cubemapLayout =
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        m_environmentResources.converted = true;
+        m_environmentResources.skyboxDescriptorsDirty = true;
+        m_pathTraceResources.pathTraceDescriptorsDirty = true;
+        spdlog::info("[Vulkan] Converted HDR environment to cubemap");
+        return true;
+    }
+
+    bool VulkanBackend::ensureEnvironmentResources(
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        VkCommandBuffer cmd)
+    {
+        (void)cmd;
+        if (scene.environment.enabled == 0u ||
+            !scene.environment.equirectTexture ||
+            !ctx.services ||
+            !ctx.services->assetManager)
+        {
+            return false;
+        }
+
+        const uint32_t cubemapSize =
+            std::max(1u, scene.environment.settings.cubemapSize);
+        if (m_environmentResources.source != scene.environment.equirectTexture ||
+            m_environmentResources.cubemapSize != cubemapSize)
+        {
+            if (m_device.device() != VK_NULL_HANDLE &&
+                (m_environmentResources.cubemap ||
+                    m_environmentResources.descriptorPool != VK_NULL_HANDLE))
+            {
+                vkDeviceWaitIdle(m_device.device());
+            }
+            destroyEnvironmentResources();
+            m_environmentResources.source = scene.environment.equirectTexture;
+            m_environmentResources.cubemapSize = cubemapSize;
+            m_pathTraceResources.accumulatedSampleCount = 0;
+            m_pathTraceResources.resetAccumulation = true;
+        }
+
+        if (!m_environmentResources.cubemap)
+        {
+            m_environmentResources.cubemap =
+                m_resourceAllocator.createTexture({
+                    .width = m_environmentResources.cubemapSize,
+                    .height = m_environmentResources.cubemapSize,
+                    .depth = 1,
+                    .mipLevels = 1,
+                    .arrayLayers = 6,
+                    .cubeCompatible = true,
+                    .format = TextureFormat::RGBA32_Float,
+                    .usage =
+                        TextureUsageFlags::Sampled |
+                        TextureUsageFlags::Storage,
+                    .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                    .debugName = "Vulkan environment cubemap"
+                });
+            m_environmentResources.cubemapLayout =
+                VK_IMAGE_LAYOUT_UNDEFINED;
+
+            VkImageViewCreateInfo cubeView{};
+            cubeView.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            cubeView.image = m_environmentResources.cubemap.image;
+            cubeView.viewType = VK_IMAGE_VIEW_TYPE_CUBE;
+            cubeView.format = m_environmentResources.cubemap.format;
+            cubeView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            cubeView.subresourceRange.levelCount = 1;
+            cubeView.subresourceRange.layerCount = 6;
+            throwIfFailed(
+                vkCreateImageView(
+                    m_device.device(),
+                    &cubeView,
+                    nullptr,
+                    &m_environmentResources.cubemapView),
+                "Failed to create Vulkan environment cubemap view.");
+
+            VkImageViewCreateInfo storageView = cubeView;
+            storageView.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            throwIfFailed(
+                vkCreateImageView(
+                    m_device.device(),
+                    &storageView,
+                    nullptr,
+                    &m_environmentResources.cubemapStorageView),
+                "Failed to create Vulkan environment storage view.");
+
+            VkSamplerCreateInfo sampler{};
+            sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            sampler.magFilter = VK_FILTER_LINEAR;
+            sampler.minFilter = VK_FILTER_LINEAR;
+            sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+            sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            sampler.maxLod = VK_LOD_CLAMP_NONE;
+            throwIfFailed(
+                vkCreateSampler(
+                    m_device.device(),
+                    &sampler,
+                    nullptr,
+                    &m_environmentResources.sampler),
+                "Failed to create Vulkan environment sampler.");
+
+            VkImageMemoryBarrier fallbackReadBarrier{};
+            fallbackReadBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            fallbackReadBarrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            fallbackReadBarrier.newLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            fallbackReadBarrier.srcAccessMask = 0;
+            fallbackReadBarrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            fallbackReadBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            fallbackReadBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            fallbackReadBarrier.image = m_environmentResources.cubemap.image;
+            fallbackReadBarrier.subresourceRange.aspectMask =
+                VK_IMAGE_ASPECT_COLOR_BIT;
+            fallbackReadBarrier.subresourceRange.levelCount = 1;
+            fallbackReadBarrier.subresourceRange.layerCount = 6;
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0,
+                nullptr,
+                0,
+                nullptr,
+                1,
+                &fallbackReadBarrier);
+            m_environmentResources.cubemapLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        if (m_environmentResources.skyboxConstants.empty())
+        {
+            const uint32_t frameCount =
+                static_cast<uint32_t>(
+                    std::max<size_t>(1, m_frameSync.size()));
+            m_environmentResources.skyboxConstants.resize(frameCount);
+            m_environmentResources.skyboxDescriptorSets.assign(
+                frameCount,
+                VK_NULL_HANDLE);
+            for (VulkanBuffer& buffer :
+                m_environmentResources.skyboxConstants)
+            {
+                buffer = m_resourceAllocator.createBuffer({
+                    .size = sizeof(SkyboxConstants),
+                    .usage = BufferUsageFlags::Constant,
+                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                    .mappedAtCreation = true,
+                    .debugName = "Vulkan skybox constants"
+                });
+            }
+        }
+
+        if (m_environmentResources.descriptorPool == VK_NULL_HANDLE)
+        {
+            const uint32_t frameCount =
+                static_cast<uint32_t>(
+                    std::max<size_t>(
+                        1,
+                        m_environmentResources.skyboxConstants.size()));
+            VkDescriptorPoolSize poolSizes[4]{};
+            poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            poolSizes[0].descriptorCount = frameCount;
+            poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            poolSizes[1].descriptorCount = frameCount + 1u;
+            poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            poolSizes[2].descriptorCount = 1;
+            poolSizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+            poolSizes[3].descriptorCount = frameCount + 1u;
+
+            VkDescriptorPoolCreateInfo poolInfo{};
+            poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            poolInfo.maxSets = frameCount + 1u;
+            poolInfo.poolSizeCount =
+                static_cast<uint32_t>(std::size(poolSizes));
+            poolInfo.pPoolSizes = poolSizes;
+            throwIfFailed(
+                vkCreateDescriptorPool(
+                    m_device.device(),
+                    &poolInfo,
+                    nullptr,
+                    &m_environmentResources.descriptorPool),
+                "Failed to create Vulkan environment descriptor pool.");
+        }
+
+        if (m_environmentResources.converted)
+        {
+            return true;
+        }
+
+        const ImageAsset* image =
+            ctx.services->assetManager->image(scene.environment.equirectTexture);
+        if (!image || !image->valid())
+        {
+            return true;
+        }
+
+        requestTexture(
+            scene.environment.equirectTexture,
+            0,
+            *image,
+            TextureTransferFunction::Linear);
+
+        return true;
+    }
+
+    void VulkanBackend::updateSkyboxDescriptors(
+        const VulkanGraphicsPipeline& pipeline)
+    {
+        if (!m_environmentResources.converted ||
+            m_environmentResources.descriptorPool == VK_NULL_HANDLE ||
+            m_environmentResources.skyboxConstants.empty())
+        {
+            return;
+        }
+
+        const bool needAllocate =
+            m_environmentResources.skyboxDescriptorSets.empty() ||
+            std::ranges::any_of(
+                m_environmentResources.skyboxDescriptorSets,
+                [](VkDescriptorSet set)
+                {
+                    return set == VK_NULL_HANDLE;
+                });
+
+        if (needAllocate)
+        {
+            const uint32_t setCount =
+                static_cast<uint32_t>(
+                    m_environmentResources.skyboxDescriptorSets.size());
+            std::vector<VkDescriptorSetLayout> layouts(
+                setCount,
+                pipeline.descriptorSetLayout);
+
+            VkDescriptorSetAllocateInfo allocateInfo{};
+            allocateInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            allocateInfo.descriptorPool =
+                m_environmentResources.descriptorPool;
+            allocateInfo.descriptorSetCount = setCount;
+            allocateInfo.pSetLayouts = layouts.data();
+            throwIfFailed(
+                vkAllocateDescriptorSets(
+                    m_device.device(),
+                    &allocateInfo,
+                    m_environmentResources.skyboxDescriptorSets.data()),
+                "Failed to allocate Vulkan skybox descriptor sets.");
+            m_environmentResources.skyboxDescriptorsDirty = true;
+        }
+
+        if (!m_environmentResources.skyboxDescriptorsDirty)
+        {
+            return;
+        }
+
+        VkDescriptorImageInfo cubemapInfo{};
+        cubemapInfo.imageView = m_environmentResources.cubemapView;
+        cubemapInfo.imageLayout =
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorImageInfo samplerInfo{};
+        samplerInfo.sampler = m_environmentResources.sampler;
+
+        std::vector<VkDescriptorBufferInfo> constantsInfos(
+            m_environmentResources.skyboxConstants.size());
+        std::vector<VkWriteDescriptorSet> writes;
+        writes.reserve(
+            m_environmentResources.skyboxDescriptorSets.size() * 3u);
+
+        for (size_t setIndex = 0;
+             setIndex < m_environmentResources.skyboxDescriptorSets.size();
+             ++setIndex)
+        {
+            constantsInfos[setIndex].buffer =
+                m_environmentResources.skyboxConstants[setIndex].buffer;
+            constantsInfos[setIndex].range = sizeof(SkyboxConstants);
+
+            VkWriteDescriptorSet constantsWrite{};
+            constantsWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            constantsWrite.dstSet =
+                m_environmentResources.skyboxDescriptorSets[setIndex];
+            constantsWrite.dstBinding = 0;
+            constantsWrite.descriptorCount = 1;
+            constantsWrite.descriptorType =
+                VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            constantsWrite.pBufferInfo = &constantsInfos[setIndex];
+            writes.push_back(constantsWrite);
+
+            VkWriteDescriptorSet cubemapWrite{};
+            cubemapWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            cubemapWrite.dstSet =
+                m_environmentResources.skyboxDescriptorSets[setIndex];
+            cubemapWrite.dstBinding = 1;
+            cubemapWrite.descriptorCount = 1;
+            cubemapWrite.descriptorType =
+                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            cubemapWrite.pImageInfo = &cubemapInfo;
+            writes.push_back(cubemapWrite);
+
+            VkWriteDescriptorSet samplerWrite{};
+            samplerWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            samplerWrite.dstSet =
+                m_environmentResources.skyboxDescriptorSets[setIndex];
+            samplerWrite.dstBinding = 100;
+            samplerWrite.descriptorCount = 1;
+            samplerWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            samplerWrite.pImageInfo = &samplerInfo;
+            writes.push_back(samplerWrite);
+        }
+
+        vkUpdateDescriptorSets(
+            m_device.device(),
+            static_cast<uint32_t>(writes.size()),
+            writes.data(),
+            0,
+            nullptr);
+
+        m_environmentResources.skyboxDescriptorsDirty = false;
+    }
+
+    void VulkanBackend::drawSkybox(
+        VulkanGraphicsPipeline& pipeline,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        VkCommandBuffer cmd)
+    {
+        if (!ensureEnvironmentResources(ctx, scene, cmd) ||
+            !m_environmentResources.converted ||
+            m_environmentResources.skyboxConstants.empty())
+        {
+            return;
+        }
+
+        updateSkyboxDescriptors(pipeline);
+
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(
+                ctx.frameIndex %
+                m_environmentResources.skyboxConstants.size());
+        if (frameSlot >= m_environmentResources.skyboxDescriptorSets.size())
+        {
+            return;
+        }
+
+        const VkDescriptorSet descriptorSet =
+            m_environmentResources.skyboxDescriptorSets[frameSlot];
+        if (descriptorSet == VK_NULL_HANDLE)
+        {
+            return;
+        }
+
+        const VkExtent2D extent = m_swapchain.extent();
+        SkyboxConstants constants{};
+        fillSkyboxConstants(
+            scene.camera,
+            extent.width,
+            extent.height,
+            scene.environment.settings,
+            constants);
+
+        VulkanBuffer& constantsBuffer =
+            m_environmentResources.skyboxConstants[frameSlot];
+        std::memcpy(
+            constantsBuffer.mapped,
+            &constants,
+            sizeof(constants));
+        m_resourceAllocator.flush(
+            constantsBuffer,
+            0,
+            sizeof(constants));
+
+        VkViewport viewport{};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = static_cast<float>(extent.width);
+        viewport.height = static_cast<float>(extent.height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+
+        VkRect2D scissor{};
+        scissor.offset = { 0, 0 };
+        scissor.extent = extent;
+
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        vkCmdBindPipeline(
+            cmd,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipeline.pipeline);
+        vkCmdBindDescriptorSets(
+            cmd,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipeline.pipelineLayout,
+            0,
+            1,
+            &descriptorSet,
+            0,
+            nullptr);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+    }
+
+    void VulkanBackend::destroyEnvironmentResources()
+    {
+        const VkDevice device = m_device.device();
+        if (device != VK_NULL_HANDLE)
+        {
+            if (m_environmentResources.cubemapView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_environmentResources.cubemapView,
+                    nullptr);
+            }
+            if (m_environmentResources.cubemapStorageView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_environmentResources.cubemapStorageView,
+                    nullptr);
+            }
+            if (m_environmentResources.equirectView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_environmentResources.equirectView,
+                    nullptr);
+            }
+            if (m_environmentResources.sampler != VK_NULL_HANDLE)
+            {
+                vkDestroySampler(
+                    device,
+                    m_environmentResources.sampler,
+                    nullptr);
+            }
+            if (m_environmentResources.descriptorPool != VK_NULL_HANDLE)
+            {
+                vkDestroyDescriptorPool(
+                    device,
+                    m_environmentResources.descriptorPool,
+                    nullptr);
+            }
+        }
+
+        for (VulkanBuffer& buffer :
+            m_environmentResources.skyboxConstants)
+        {
+            m_resourceAllocator.destroyBuffer(buffer);
+        }
+        m_resourceAllocator.destroyTexture(m_environmentResources.cubemap);
+        m_resourceAllocator.destroyTexture(m_environmentResources.equirect);
+        m_environmentResources = {};
+    }
+
+    void VulkanBackend::executePathTraceNode(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        VkCommandBuffer cmd)
+    {
+        const ComputePipelineHandle pathTracePipelineHandle =
+            computePipelineForNode(plan, node);
+
         ensurePathTraceResources();
         ensurePathTraceSceneResources(ctx, scene);
+        const bool environmentResourcesAvailable =
+            ensureEnvironmentResources(ctx, scene, cmd);
+        if (!environmentResourcesAvailable)
+        {
+            return;
+        }
+        if (!m_environmentResources.converted)
+        {
+            if (VulkanComputePipeline* convertPipeline =
+                    environmentConvertPipeline())
+            {
+                static_cast<void>(convertEnvironmentIfReady(
+                    *convertPipeline,
+                    ctx,
+                    scene,
+                    cmd));
+            }
+        }
+        const bool environmentReady = m_environmentResources.converted;
+
+        VulkanComputePipeline* pipeline =
+            m_pipelineManager.computePipeline(pathTracePipelineHandle);
+        if (!pipeline)
+        {
+            return;
+        }
         updatePathTraceDescriptors(pipeline, nullptr);
 
         if (!m_pathTraceResources.accumulation ||
@@ -1185,6 +1793,17 @@ namespace ic
             m_pathTraceResources.hasPreviousCamera = false;
         }
 
+        if (m_pathTraceResources.environmentVersion !=
+            scene.environment.version)
+        {
+            m_pathTraceResources.environmentVersion =
+                scene.environment.version;
+            m_pathTraceResources.accumulatedSampleCount = 0;
+            m_pathTraceResources.resetAccumulation = true;
+        }
+        m_pathTraceResources.tonemapExposure =
+            scene.environment.settings.tonemapExposure;
+
         if (m_pathTraceResources.accumulationLayout !=
             VK_IMAGE_LAYOUT_GENERAL)
         {
@@ -1213,7 +1832,7 @@ namespace ic
         constants.frameIndex = static_cast<uint32_t>(ctx.frameIndex);
         constants.accumulatedSampleCount =
             m_pathTraceResources.accumulatedSampleCount;
-        constants.exposure = 1.0f;
+        constants.exposure = m_pathTraceResources.tonemapExposure;
         constants.resetAccumulation =
             m_pathTraceResources.resetAccumulation ? 1u : 0u;
         constants.maxBounces = DefaultPathTraceMaxBounces;
@@ -1231,6 +1850,10 @@ namespace ic
             m_pathTraceResources.sceneBvhNodeCount != 0u
                 ? 1u
                 : 0u;
+        constants.environmentEnabled = environmentReady ? 1u : 0u;
+        constants.environmentIntensity = scene.environment.settings.intensity;
+        constants.environmentExposure =
+            scene.environment.settings.pathTraceExposure;
         fillPathTraceCameraConstants(
             scene.camera,
             m_pathTraceResources.width,
@@ -1355,7 +1978,7 @@ namespace ic
         TonemapConstants constants{};
         constants.renderWidth = m_pathTraceResources.width;
         constants.renderHeight = m_pathTraceResources.height;
-        constants.exposure = 1.0f;
+        constants.exposure = m_pathTraceResources.tonemapExposure;
 
         VulkanBuffer& tonemapConstants =
             m_pathTraceResources.tonemapConstants[frameSlot];
@@ -1559,6 +2182,33 @@ namespace ic
         }
         m_uploadedModels.clear();
 
+        for (auto& [key, texture] : m_uploadedTextures)
+        {
+            if (texture.view != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    m_device.device(),
+                    texture.view,
+                    nullptr);
+                texture.view = VK_NULL_HANDLE;
+            }
+            m_resourceAllocator.destroyTexture(texture.texture);
+        }
+        m_uploadedTextures.clear();
+
+        for (auto& [key, sampler] : m_uploadedSamplers)
+        {
+            if (sampler.sampler != VK_NULL_HANDLE)
+            {
+                vkDestroySampler(
+                    m_device.device(),
+                    sampler.sampler,
+                    nullptr);
+                sampler.sampler = VK_NULL_HANDLE;
+            }
+        }
+        m_uploadedSamplers.clear();
+
         for (FrameSceneResources& resources : m_sceneFrameResources)
         {
             m_resourceAllocator.destroyBuffer(resources.frameConstants);
@@ -1668,19 +2318,23 @@ namespace ic
                 });
         }
 
-        VkDescriptorPoolSize poolSizes[4]{};
+        const uint32_t descriptorSetCapacity = 4u * frameCount;
+
+        VkDescriptorPoolSize poolSizes[5]{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSizes[0].descriptorCount = 2 * frameCount;
+        poolSizes[0].descriptorCount = 4u * frameCount;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSizes[1].descriptorCount = 2 * frameCount;
+        poolSizes[1].descriptorCount = 4u * frameCount;
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        poolSizes[2].descriptorCount = frameCount;
+        poolSizes[2].descriptorCount = 4u * frameCount;
         poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSizes[3].descriptorCount = 4 * frameCount;
+        poolSizes[3].descriptorCount = 8u * frameCount;
+        poolSizes[4].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+        poolSizes[4].descriptorCount = 2u * frameCount;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.maxSets = 2 * frameCount;
+        poolInfo.maxSets = descriptorSetCapacity;
         poolInfo.poolSizeCount =
             static_cast<uint32_t>(std::size(poolSizes));
         poolInfo.pPoolSizes = poolSizes;
@@ -2039,6 +2693,13 @@ namespace ic
             return;
         }
 
+        if (!m_pathTraceResources.accumulation ||
+            m_pathTraceResources.pathTraceConstants.empty() ||
+            m_pathTraceResources.pathTraceDescriptorSets.empty())
+        {
+            return;
+        }
+
         if (pathTracePipeline)
         {
             bool updateDescriptors =
@@ -2055,9 +2716,31 @@ namespace ic
 
             if (needAllocate)
             {
+                if (tonemapPipeline == nullptr)
+                {
+                    vkResetDescriptorPool(
+                        m_device.device(),
+                        m_pathTraceResources.descriptorPool,
+                        0);
+                    std::ranges::fill(
+                        m_pathTraceResources.pathTraceDescriptorSets,
+                        VK_NULL_HANDLE);
+                    std::ranges::fill(
+                        m_pathTraceResources.tonemapDescriptorSets,
+                        VK_NULL_HANDLE);
+                    m_pathTraceResources.pathTraceDescriptorsDirty = true;
+                    m_pathTraceResources.tonemapDescriptorsDirty = true;
+                    updateDescriptors = true;
+                }
+
                 const uint32_t setCount =
                     static_cast<uint32_t>(
                         m_pathTraceResources.pathTraceDescriptorSets.size());
+                if (setCount == 0u)
+                {
+                    return;
+                }
+
                 std::vector<VkDescriptorSetLayout> layouts(
                     setCount,
                     pathTracePipeline->descriptorSetLayout);
@@ -2070,12 +2753,16 @@ namespace ic
                 allocateInfo.descriptorSetCount = setCount;
                 allocateInfo.pSetLayouts = layouts.data();
 
-                if (vkAllocateDescriptorSets(
+                const VkResult result = vkAllocateDescriptorSets(
                         m_device.device(),
                         &allocateInfo,
-                        m_pathTraceResources.pathTraceDescriptorSets.data()) !=
-                    VK_SUCCESS)
+                        m_pathTraceResources.pathTraceDescriptorSets.data());
+                if (result != VK_SUCCESS)
                 {
+                    spdlog::error(
+                        "Failed to allocate {} Vulkan path trace descriptor sets from pool (result={})",
+                        setCount,
+                        static_cast<int32_t>(result));
                     throw std::runtime_error(
                         "Failed to allocate Vulkan path trace descriptor set.");
                 }
@@ -2109,6 +2796,16 @@ namespace ic
                 m_pathTraceResources.accumulationView;
             accumulationInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
+            VkDescriptorImageInfo environmentInfo{};
+            environmentInfo.imageView =
+                m_environmentResources.cubemapView;
+            environmentInfo.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorImageInfo environmentSamplerInfo{};
+            environmentSamplerInfo.sampler =
+                m_environmentResources.sampler;
+
             VkDescriptorBufferInfo* sceneInfos[4] =
             {
                 &vertexInfo,
@@ -2121,7 +2818,7 @@ namespace ic
                 m_pathTraceResources.pathTraceConstants.size());
             std::vector<VkWriteDescriptorSet> writes;
             writes.reserve(
-                m_pathTraceResources.pathTraceDescriptorSets.size() * 6u);
+                m_pathTraceResources.pathTraceDescriptorSets.size() * 8u);
 
             for (size_t setIndex = 0;
                  setIndex < m_pathTraceResources.pathTraceDescriptorSets.size();
@@ -2168,6 +2865,34 @@ namespace ic
                     sceneWrite.pBufferInfo = sceneInfos[i];
                     writes.push_back(sceneWrite);
                 }
+
+                if (m_environmentResources.cubemapView != VK_NULL_HANDLE &&
+                    m_environmentResources.sampler != VK_NULL_HANDLE)
+                {
+                    VkWriteDescriptorSet environmentWrite{};
+                    environmentWrite.sType =
+                        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    environmentWrite.dstSet =
+                        m_pathTraceResources.pathTraceDescriptorSets[setIndex];
+                    environmentWrite.dstBinding = 6;
+                    environmentWrite.descriptorCount = 1;
+                    environmentWrite.descriptorType =
+                        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                    environmentWrite.pImageInfo = &environmentInfo;
+                    writes.push_back(environmentWrite);
+
+                    VkWriteDescriptorSet samplerWrite{};
+                    samplerWrite.sType =
+                        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    samplerWrite.dstSet =
+                        m_pathTraceResources.pathTraceDescriptorSets[setIndex];
+                    samplerWrite.dstBinding = 7;
+                    samplerWrite.descriptorCount = 1;
+                    samplerWrite.descriptorType =
+                        VK_DESCRIPTOR_TYPE_SAMPLER;
+                    samplerWrite.pImageInfo = &environmentSamplerInfo;
+                    writes.push_back(samplerWrite);
+                }
             }
 
             vkUpdateDescriptorSets(
@@ -2211,12 +2936,16 @@ namespace ic
                 allocateInfo.descriptorSetCount = setCount;
                 allocateInfo.pSetLayouts = layouts.data();
 
-                if (vkAllocateDescriptorSets(
+                const VkResult result = vkAllocateDescriptorSets(
                         m_device.device(),
                         &allocateInfo,
-                        m_pathTraceResources.tonemapDescriptorSets.data()) !=
-                    VK_SUCCESS)
+                        m_pathTraceResources.tonemapDescriptorSets.data());
+                if (result != VK_SUCCESS)
                 {
+                    spdlog::error(
+                        "Failed to allocate {} Vulkan path trace tonemap descriptor sets from pool (result={})",
+                        setCount,
+                        static_cast<int32_t>(result));
                     throw std::runtime_error(
                         "Failed to allocate Vulkan path trace tonemap descriptor set.");
                 }
@@ -2444,6 +3173,183 @@ namespace ic
         m_depthHeight = 0;
     }
 
+    uint32_t VulkanBackend::requestTexture(
+        AssetHandle modelHandle,
+        uint32_t imageIndex,
+        const ImageAsset& image,
+        TextureTransferFunction transfer)
+    {
+        const uint64_t key = uploadedTextureKey(modelHandle, imageIndex, transfer);
+        if (auto it = m_uploadedTextures.find(key);
+            it != m_uploadedTextures.end())
+        {
+            return it->second.descriptorIndex;
+        }
+
+        ImageAsset uploadImage = image;
+        if (transfer != TextureTransferFunction::Unknown &&
+            uploadImage.format == ImageFormat::RGBA8)
+        {
+            uploadImage.srgb = transfer == TextureTransferFunction::SRGB;
+        }
+
+        const uint64_t byteSize = imageByteSize(uploadImage);
+        VulkanBuffer staging =
+            m_resourceAllocator.createBuffer({
+                .size = byteSize,
+                .usage = BufferUsageFlags::TransferSrc,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = "Vulkan texture upload staging"
+            });
+
+        std::memcpy(
+            staging.mapped,
+            uploadImage.pixels.data(),
+            static_cast<size_t>(byteSize));
+        m_resourceAllocator.flush(staging, 0, byteSize);
+
+        UploadedTexture uploaded{};
+        uploaded.descriptorIndex =
+            static_cast<uint32_t>(m_uploadedTextures.size());
+        if (uploaded.descriptorIndex >= MaxBindlessTextures)
+        {
+            throw std::runtime_error("Vulkan bindless texture array exhausted.");
+        }
+        uploaded.texture =
+            m_resourceAllocator.createTexture(
+                uploadImage,
+                TextureUsageFlags::Sampled | TextureUsageFlags::TransferDst,
+                "Vulkan bindless model texture");
+
+        m_commandSystem.immediateSubmit(
+            m_device.graphicsQueue(),
+            [&](VkCommandBuffer cmd)
+            {
+                transitionImage(
+                    cmd,
+                    uploaded.texture.image,
+                    VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    0,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+
+                VkBufferImageCopy copy{};
+                copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                copy.imageSubresource.mipLevel = 0;
+                copy.imageSubresource.baseArrayLayer = 0;
+                copy.imageSubresource.layerCount = 1;
+                copy.imageExtent = uploaded.texture.extent;
+
+                vkCmdCopyBufferToImage(
+                    cmd,
+                    staging.buffer,
+                    uploaded.texture.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    1,
+                    &copy);
+
+                transitionImage(
+                    cmd,
+                    uploaded.texture.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            });
+
+        uploaded.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkImageViewCreateInfo viewInfo{};
+        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        viewInfo.image = uploaded.texture.image;
+        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        viewInfo.format = uploaded.texture.format;
+        viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.layerCount = 1;
+
+        throwIfFailed(
+            vkCreateImageView(
+                m_device.device(),
+                &viewInfo,
+                nullptr,
+                &uploaded.view),
+            "Failed to create Vulkan bindless texture view.");
+
+        m_resourceAllocator.destroyBuffer(staging);
+
+        m_uploadedTextures.emplace(key, std::move(uploaded));
+        return static_cast<uint32_t>(m_uploadedTextures.size() - 1u);
+    }
+
+    uint32_t VulkanBackend::requestSampler(const SamplerAsset* sampler)
+    {
+        const uint64_t key = samplerKey(sampler);
+        if (auto it = m_uploadedSamplers.find(key);
+            it != m_uploadedSamplers.end())
+        {
+            return it->second.descriptorIndex;
+        }
+
+        auto toFilter = [](TextureFilterMode mode)
+        {
+            return mode == TextureFilterMode::Nearest ||
+                mode == TextureFilterMode::NearestMipmapNearest ||
+                mode == TextureFilterMode::NearestMipmapLinear
+                    ? VK_FILTER_NEAREST
+                    : VK_FILTER_LINEAR;
+        };
+
+        auto toAddress = [](TextureWrapMode mode)
+        {
+            switch (mode)
+            {
+            case TextureWrapMode::MirroredRepeat:
+                return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+            case TextureWrapMode::ClampToEdge:
+                return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            case TextureWrapMode::Repeat:
+                break;
+            }
+            return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        };
+
+        UploadedSampler uploaded{};
+        uploaded.descriptorIndex =
+            static_cast<uint32_t>(m_uploadedSamplers.size());
+        if (uploaded.descriptorIndex >= MaxBindlessSamplers)
+        {
+            throw std::runtime_error("Vulkan bindless sampler array exhausted.");
+        }
+        VkSamplerCreateInfo info{};
+        info.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        info.magFilter = sampler ? toFilter(sampler->magFilter) : VK_FILTER_LINEAR;
+        info.minFilter = sampler ? toFilter(sampler->minFilter) : VK_FILTER_LINEAR;
+        info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        info.addressModeU = sampler ? toAddress(sampler->wrapU) : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        info.addressModeV = sampler ? toAddress(sampler->wrapV) : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        info.maxLod = VK_LOD_CLAMP_NONE;
+
+        throwIfFailed(
+            vkCreateSampler(
+                m_device.device(),
+                &info,
+                nullptr,
+                &uploaded.sampler),
+            "Failed to create Vulkan bindless sampler.");
+
+        const uint32_t descriptorIndex = uploaded.descriptorIndex;
+        m_uploadedSamplers.emplace(key, uploaded);
+        return descriptorIndex;
+    }
+
     VulkanBackend::UploadedModel* VulkanBackend::requestModel(
         AssetHandle handle,
         const AssetManager& assets)
@@ -2601,19 +3507,74 @@ namespace ic
         m_resourceAllocator.destroyBuffer(vertexStaging);
         m_resourceAllocator.destroyBuffer(indexStaging);
 
+        uploaded.samplerDescriptorIndices.assign(
+            model->samplers.size(),
+            UINT32_MAX);
+        for (size_t samplerIndex = 0;
+             samplerIndex < model->samplers.size();
+             ++samplerIndex)
+        {
+            uploaded.samplerDescriptorIndices[samplerIndex] =
+                requestSampler(&model->samplers[samplerIndex]);
+        }
+        const uint32_t defaultSampler = requestSampler(nullptr);
+
+        auto textureDescriptor = [&](const MaterialTextureSlot& slot)
+        {
+            if (slot.textureIndex < 0 ||
+                static_cast<size_t>(slot.textureIndex) >= model->textures.size())
+            {
+                return UINT32_MAX;
+            }
+
+            const TextureAsset& texture =
+                model->textures[static_cast<size_t>(slot.textureIndex)];
+            if (texture.imageIndex < 0 ||
+                static_cast<size_t>(texture.imageIndex) >= model->images.size())
+            {
+                return UINT32_MAX;
+            }
+
+            return requestTexture(
+                handle,
+                static_cast<uint32_t>(texture.imageIndex),
+                model->images[static_cast<size_t>(texture.imageIndex)],
+                slot.transfer);
+        };
+
+        auto samplerDescriptor = [&](const MaterialTextureSlot& slot)
+        {
+            if (slot.textureIndex < 0 ||
+                static_cast<size_t>(slot.textureIndex) >= model->textures.size())
+            {
+                return defaultSampler;
+            }
+
+            const TextureAsset& texture =
+                model->textures[static_cast<size_t>(slot.textureIndex)];
+            if (texture.samplerIndex < 0 ||
+                static_cast<size_t>(texture.samplerIndex) >=
+                    uploaded.samplerDescriptorIndices.size())
+            {
+                return defaultSampler;
+            }
+
+            const uint32_t descriptor =
+                uploaded.samplerDescriptorIndices[
+                    static_cast<size_t>(texture.samplerIndex)];
+            return descriptor != UINT32_MAX ? descriptor : defaultSampler;
+        };
+
         uploaded.materials.reserve(
             std::max<size_t>(1, model->materials.size()));
         for (const MaterialAsset& src : model->materials)
         {
-            GpuMaterialData dst{};
-            dst.baseColorFactor = src.baseColorFactor;
-            dst.metallicFactor = src.metallicFactor;
-            dst.roughnessFactor = src.roughnessFactor;
-            dst.alphaCutoff = src.alphaCutoff;
-            dst.flags =
-                (src.doubleSided ? 1u : 0u) |
-                (src.alphaBlend ? 2u : 0u) |
-                (src.alphaMask ? 4u : 0u);
+            GpuMaterialData dst = makeGpuMaterialData(src);
+            dst.baseColorTextureIndex = textureDescriptor(src.baseColorTexture);
+            dst.normalTextureIndex = textureDescriptor(src.normalTexture);
+            dst.metallicRoughnessTextureIndex =
+                textureDescriptor(src.metallicRoughnessTexture);
+            dst.samplerIndex = samplerDescriptor(src.baseColorTexture);
             uploaded.materials.push_back(dst);
         }
         if (uploaded.materials.empty())
@@ -2826,7 +3787,9 @@ namespace ic
         }
 
         if (descriptorsDirty ||
-            frameResources.descriptorSet == VK_NULL_HANDLE)
+            frameResources.descriptorSet == VK_NULL_HANDLE ||
+            frameResources.bindlessTextureCount != m_uploadedTextures.size() ||
+            frameResources.bindlessSamplerCount != m_uploadedSamplers.size())
         {
             updateFrameDescriptors(frameResources, pipelineHandle);
         }
@@ -2905,11 +3868,15 @@ namespace ic
             resources.descriptorSet = VK_NULL_HANDLE;
         }
 
-        VkDescriptorPoolSize poolSizes[2]{};
+        VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         poolSizes[0].descriptorCount = 1;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         poolSizes[1].descriptorCount = 2;
+        poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        poolSizes[2].descriptorCount = MaxBindlessTextures;
+        poolSizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+        poolSizes[3].descriptorCount = MaxBindlessSamplers;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -2959,7 +3926,34 @@ namespace ic
         materialInfo.offset = 0;
         materialInfo.range = resources.materials.size;
 
-        VkWriteDescriptorSet writes[3]{};
+        std::vector<VkDescriptorImageInfo> textureInfos(
+            m_uploadedTextures.size());
+        for (const auto& [key, texture] : m_uploadedTextures)
+        {
+            if (texture.descriptorIndex >= textureInfos.size())
+            {
+                continue;
+            }
+
+            textureInfos[texture.descriptorIndex].imageView = texture.view;
+            textureInfos[texture.descriptorIndex].imageLayout = texture.layout;
+        }
+
+        std::vector<VkDescriptorImageInfo> samplerInfos(
+            m_uploadedSamplers.size());
+        for (const auto& [key, sampler] : m_uploadedSamplers)
+        {
+            if (sampler.descriptorIndex >= samplerInfos.size())
+            {
+                continue;
+            }
+
+            samplerInfos[sampler.descriptorIndex].sampler = sampler.sampler;
+        }
+
+        std::vector<VkWriteDescriptorSet> writes;
+        writes.reserve(5);
+        writes.resize(3);
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = resources.descriptorSet;
         writes[0].dstBinding = 0;
@@ -2981,12 +3975,43 @@ namespace ic
         writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[2].pBufferInfo = &materialInfo;
 
+        if (!textureInfos.empty())
+        {
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = resources.descriptorSet;
+            write.dstBinding = 3;
+            write.descriptorCount =
+                static_cast<uint32_t>(textureInfos.size());
+            write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            write.pImageInfo = textureInfos.data();
+            writes.push_back(write);
+        }
+
+        if (!samplerInfos.empty())
+        {
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = resources.descriptorSet;
+            write.dstBinding = 100;
+            write.descriptorCount =
+                static_cast<uint32_t>(samplerInfos.size());
+            write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            write.pImageInfo = samplerInfos.data();
+            writes.push_back(write);
+        }
+
         vkUpdateDescriptorSets(
             m_device.device(),
-            static_cast<uint32_t>(std::size(writes)),
-            writes,
+            static_cast<uint32_t>(writes.size()),
+            writes.data(),
             0,
             nullptr);
+
+        resources.bindlessTextureCount =
+            static_cast<uint32_t>(m_uploadedTextures.size());
+        resources.bindlessSamplerCount =
+            static_cast<uint32_t>(m_uploadedSamplers.size());
     }
 
 

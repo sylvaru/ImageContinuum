@@ -106,6 +106,10 @@ namespace ic
 
         ID3D12DescriptorHeap* shaderResourceHeap() const;
         ID3D12DescriptorHeap* samplerHeap() const;
+        D3D12_CPU_DESCRIPTOR_HANDLE shaderResourceCpuStart() const;
+        D3D12_GPU_DESCRIPTOR_HANDLE shaderResourceGpuStart() const;
+        D3D12_CPU_DESCRIPTOR_HANDLE samplerCpuStart() const;
+        D3D12_GPU_DESCRIPTOR_HANDLE samplerGpuStart() const;
 
     private:
         Config m_config{};

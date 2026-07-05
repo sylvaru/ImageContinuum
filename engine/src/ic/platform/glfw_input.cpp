@@ -28,6 +28,18 @@ namespace ic
 			m_mousePressed[i] = false;
 			m_mouseReleased[i] = false;
 		}
+
+		const bool focused = isWindowFocused();
+		if (focused != m_windowFocused)
+		{
+			m_windowFocused = focused;
+			if (!m_windowFocused && m_cursorLocked)
+			{
+				lockCursor(false);
+			}
+
+			syncMousePosition();
+		}
 	}
 
 	void GLFWInput::onEvent(const Event& e)
@@ -82,8 +94,21 @@ namespace ic
 
 	void GLFWInput::onMouseMove(double x, double y)
 	{
-		if (!m_mouseInitialized)
+		const bool focused = isWindowFocused();
+		if (!focused)
 		{
+			m_windowFocused = false;
+			m_mouseX = x;
+			m_mouseY = y;
+			m_mouseInitialized = true;
+			m_mouseDX = 0.0;
+			m_mouseDY = 0.0;
+			return;
+		}
+
+		if (!m_windowFocused || !m_mouseInitialized)
+		{
+			m_windowFocused = true;
 			m_mouseX = x;
 			m_mouseY = y;
 			m_mouseInitialized = true;
@@ -132,15 +157,21 @@ namespace ic
 
 	void GLFWInput::lockCursor(bool lock)
 	{
-		m_cursorLocked = lock;
-
 		auto* window = static_cast<GLFWwindow*>(m_window.getNativeHandle());
+		if (lock && glfwGetWindowAttrib(window, GLFW_FOCUSED) != GLFW_TRUE)
+		{
+			lock = false;
+		}
+
+		m_cursorLocked = lock;
 
 		glfwSetInputMode(
 			window,
 			GLFW_CURSOR,
 			lock ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL
 		);
+
+		syncMousePosition();
 	}
 
 	bool GLFWInput::isCursorLocked() const
@@ -161,5 +192,26 @@ namespace ic
 	bool GLFWInput::isMouseButtonPressed(MouseButton button) const
 	{
 		return m_mouseButtons[static_cast<int>(button)];
+	}
+
+	void GLFWInput::syncMousePosition()
+	{
+		auto* window = static_cast<GLFWwindow*>(m_window.getNativeHandle());
+
+		double x = 0.0;
+		double y = 0.0;
+		glfwGetCursorPos(window, &x, &y);
+
+		m_mouseX = x;
+		m_mouseY = y;
+		m_mouseInitialized = true;
+		m_mouseDX = 0.0;
+		m_mouseDY = 0.0;
+	}
+
+	bool GLFWInput::isWindowFocused() const
+	{
+		auto* window = static_cast<GLFWwindow*>(m_window.getNativeHandle());
+		return glfwGetWindowAttrib(window, GLFW_FOCUSED) == GLFW_TRUE;
 	}
 }

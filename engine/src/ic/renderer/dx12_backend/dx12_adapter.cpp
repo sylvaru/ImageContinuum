@@ -1,7 +1,7 @@
 #include "ic/renderer/dx12_backend/dx12_adapter.h"
 
 #include "ic/renderer/dx12_backend/dx12_factory.h"
-
+#include "ic/util/util.h"
 #include <d3d12.h>
 #include <spdlog/spdlog.h>
 #include <Windows.h>
@@ -9,46 +9,6 @@
 #include <stdexcept>
 #include <string>
 
-namespace
-{
-    std::string narrow(const wchar_t* text)
-    {
-        if (!text || text[0] == L'\0')
-        {
-            return {};
-        }
-
-        const int required = WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            text,
-            -1,
-            nullptr,
-            0,
-            nullptr,
-            nullptr);
-
-        if (required <= 1)
-        {
-            return {};
-        }
-
-        std::string result(static_cast<size_t>(required), '\0');
-
-        WideCharToMultiByte(
-            CP_UTF8,
-            0,
-            text,
-            -1,
-            result.data(),
-            required,
-            nullptr,
-            nullptr);
-
-        result.pop_back();
-        return result;
-    }
-}
 
 namespace ic
 {

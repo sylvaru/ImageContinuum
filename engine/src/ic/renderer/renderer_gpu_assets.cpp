@@ -5,6 +5,30 @@
 
 namespace ic
 {
+    namespace
+    {
+        constexpr uint32_t MaterialFlagDoubleSided = 1u << 0u;
+        constexpr uint32_t MaterialFlagAlphaBlend = 1u << 1u;
+        constexpr uint32_t MaterialFlagAlphaMask = 1u << 2u;
+        constexpr uint32_t MaterialFlagUnlit = 1u << 3u;
+    }
+
+    GpuMaterialData makeGpuMaterialData(const MaterialAsset& src)
+    {
+        GpuMaterialData dst{};
+        dst.baseColorFactor = src.baseColorFactor;
+        dst.metallicFactor = src.metallicFactor;
+        dst.roughnessFactor = src.roughnessFactor;
+        dst.alphaCutoff = src.alphaCutoff;
+        dst.flags =
+            (src.doubleSided ? MaterialFlagDoubleSided : 0u) |
+            (src.alphaBlend ? MaterialFlagAlphaBlend : 0u) |
+            (src.alphaMask ? MaterialFlagAlphaMask : 0u) |
+            (src.unlit ? MaterialFlagUnlit : 0u);
+
+        return dst;
+    }
+
     GpuModelHandle RendererGpuAssetCache::requestModel(AssetHandle model)
     {
         if (!model)
@@ -51,17 +75,7 @@ namespace ic
 
             for (const MaterialAsset& src : modelAsset->materials)
             {
-                GpuMaterialData dst{};
-                dst.baseColorFactor = src.baseColorFactor;
-                dst.metallicFactor = src.metallicFactor;
-                dst.roughnessFactor = src.roughnessFactor;
-                dst.alphaCutoff = src.alphaCutoff;
-                dst.flags =
-                    (src.doubleSided ? 1u : 0u) |
-                    (src.alphaBlend ? 2u : 0u) |
-                    (src.alphaMask ? 4u : 0u);
-
-                gpuModel.materials.push_back(dst);
+                gpuModel.materials.push_back(makeGpuMaterialData(src));
             }
 
             if (gpuModel.materials.empty())

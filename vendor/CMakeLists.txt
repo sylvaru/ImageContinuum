@@ -98,7 +98,7 @@ target_include_directories(stb INTERFACE
 # =========================================================
 # Tracy
 # =========================================================
-set(TRACY_ENABLE OFF CACHE BOOL "" FORCE)
+set(TRACY_ENABLE ${IC_ENABLE_TRACY} CACHE BOOL "" FORCE)
 set(TRACY_ON_DEMAND OFF CACHE BOOL "" FORCE)
 set(TRACY_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(TRACY_BUILD_TOOLS OFF CACHE BOOL "" FORCE)

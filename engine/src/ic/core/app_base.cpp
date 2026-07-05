@@ -217,7 +217,11 @@ namespace ic
     {
         auto frameEnd = std::chrono::steady_clock::now();
         std::chrono::duration<float> frameTime = frameEnd - frameStart;
-        float sleepTime = kTargetFrameTime - frameTime.count();
+        const float targetFps =
+            m_spec.rendererSpec.settings.targetFps > 0.0f
+                ? m_spec.rendererSpec.settings.targetFps
+                : kFallbackTargetFPS;
+        float sleepTime = (1.0f / targetFps) - frameTime.count();
         if (sleepTime > 0.0f)
         {
             std::this_thread::sleep_for(
@@ -283,6 +287,7 @@ namespace ic
         SceneManagerDesc desc{};
         desc.enableAsyncSceneLoading = true;
         desc.modelRoot = m_spec.resourceRoots.modelRoot;
+        desc.defaultEnvironment = m_spec.rendererSpec.settings.environment;
 
         m_runtime->sceneManager->init(
             desc,

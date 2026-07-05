@@ -8,6 +8,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include "ic/core/asset_manager.h"
+#include "ic/renderer/renderer_specification.h"
 #include "ic/scene/scene_components.h"
 
 namespace ic
@@ -62,9 +63,19 @@ namespace ic
         float padding2 = 0.0f;
     };
 
+    struct SceneEnvironmentRenderItem
+    {
+        AssetHandle equirectTexture = {};
+        EnvironmentSettings settings = {};
+        uint64_t version = 0;
+        float intensity = 1.0f;
+        uint32_t enabled = 0;
+    };
+
     struct SceneRenderView
     {
         SceneCameraView camera = {};
+        SceneEnvironmentRenderItem environment = {};
 
         std::span<const SceneModelRenderItem> models;
         std::span<const SceneLightRenderItem> lights;

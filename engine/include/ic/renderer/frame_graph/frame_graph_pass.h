@@ -12,10 +12,27 @@ namespace ic
 {
     class FrameGraphBuilder;
 
+    enum class DrawListKind : uint8_t
+    {
+        None = 0,
+        SceneGeometry,
+        Skybox
+    };
+
+    enum class AttachmentLoadOp : uint8_t
+    {
+        Clear = 0,
+        Load,
+        DontCare
+    };
+
     struct GraphicsPassData
     {
         std::string name;
         PipelineId pipeline = {};
+        DrawListKind drawList = DrawListKind::None;
+        AttachmentLoadOp colorLoadOp = AttachmentLoadOp::Clear;
+        AttachmentLoadOp depthLoadOp = AttachmentLoadOp::Clear;
     };
 
     struct TransferPassData
@@ -32,6 +49,18 @@ namespace ic
         uint32_t groupCountX = 1;
         uint32_t groupCountY = 1;
         uint32_t groupCountZ = 1;
+    };
+
+    struct EnvironmentConvertPassData
+    {
+        uint32_t cubemapSize = 512;
+        uint32_t groupSizeX = 8;
+        uint32_t groupSizeY = 8;
+        uint32_t groupCountX = 64;
+        uint32_t groupCountY = 64;
+        uint32_t groupCountZ = 6;
+        GraphResourceId outputCubemap = InvalidGraphResourceId;
+        PipelineId pipeline = makePipelineId("equirect_to_cubemap");
     };
 
     struct ClearPassData {};
@@ -93,6 +122,7 @@ namespace ic
         GraphicsPassData,
         GeometryPassData,
         LightingPassData,
+        EnvironmentConvertPassData,
         ComputePassData,
         TransferPassData,
         PathTracePassData,

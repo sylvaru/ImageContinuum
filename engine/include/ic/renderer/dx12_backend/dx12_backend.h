@@ -74,7 +74,21 @@ namespace ic
             std::vector<GpuMesh> meshes;
             std::vector<glm::mat4> meshTransforms;
             std::vector<GpuMaterialData> materials;
+            std::vector<uint32_t> textureDescriptorIndices;
+            std::vector<uint32_t> samplerDescriptorIndices;
             bool uploaded = false;
+        };
+
+        struct UploadedTexture
+        {
+            DX12Texture texture;
+            DX12DescriptorAllocation srv;
+            D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+        };
+
+        struct UploadedSampler
+        {
+            DX12DescriptorAllocation descriptor;
         };
 
         struct FrameSceneResources
@@ -139,10 +153,25 @@ namespace ic
             uint32_t sceneBvhNodeCount = 0;
             uint32_t accumulatedSampleCount = 0;
             uint64_t sceneVersion = UINT64_MAX;
+            uint64_t environmentVersion = UINT64_MAX;
+            float tonemapExposure = 1.0f;
             glm::mat4 previousView = glm::mat4(1.0f);
             glm::mat4 previousProjection = glm::mat4(1.0f);
             bool resetAccumulation = true;
             bool hasPreviousCamera = false;
+        };
+
+        struct EnvironmentResources
+        {
+            AssetHandle source = {};
+            DX12Texture cubemap;
+            DX12DescriptorAllocation cubemapSrv;
+            DX12DescriptorAllocation cubemapUav;
+            DX12DescriptorAllocation sampler;
+            std::vector<DX12Buffer> skyboxConstants;
+            D3D12_RESOURCE_STATES cubemapState = D3D12_RESOURCE_STATE_COMMON;
+            uint32_t cubemapSize = 512;
+            bool converted = false;
         };
 
         void executeGraph(
@@ -201,6 +230,13 @@ namespace ic
             const SceneRenderView& scene,
             ID3D12GraphicsCommandList4* cmd);
 
+        void executeEnvironmentConvertNode(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd);
+
         void executeTonemapNode(
             const CompiledGraphPlan& plan,
             const ExecutionNode& node,
@@ -223,6 +259,22 @@ namespace ic
         void destroyPathTraceSceneResources();
         void uploadPathTraceScene(const PathTraceSceneData& sceneData);
         void updatePathTraceDescriptors();
+        bool ensureEnvironmentResources(
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd);
+        DX12ComputePipeline* environmentConvertPipeline();
+        bool convertEnvironmentIfReady(
+            DX12ComputePipeline& pipeline,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd);
+        void destroyEnvironmentResources();
+        void drawSkybox(
+            DX12GraphicsPipeline& pipeline,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd);
         void ensureDepthTarget();
         void destroyDepthTarget();
         void ensureComputeTestBuffer();
@@ -230,6 +282,14 @@ namespace ic
         UploadedModel* requestModel(
             AssetHandle handle,
             const AssetManager& assets);
+
+        uint32_t requestTexture(
+            AssetHandle modelHandle,
+            uint32_t imageIndex,
+            const ImageAsset& image,
+            TextureTransferFunction transfer);
+
+        uint32_t requestSampler(const SamplerAsset* sampler);
 
         bool prepareSceneResources(
             const FrameContext& ctx,
@@ -278,11 +338,14 @@ namespace ic
         D3D12_RESOURCE_STATES m_computeTestBufferState =
             D3D12_RESOURCE_STATE_COMMON;
         PathTraceResources m_pathTraceResources;
+        EnvironmentResources m_environmentResources;
 
         const PipelineLibrary* m_pipelineLibrary = nullptr;
         std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash> m_pipelineHandles;
         std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash> m_computePipelineHandles;
         std::unordered_map<AssetHandle, UploadedModel, AssetHandleHash> m_uploadedModels;
+        std::unordered_map<uint64_t, UploadedTexture> m_uploadedTextures;
+        std::unordered_map<uint64_t, UploadedSampler> m_uploadedSamplers;
         std::vector<FrameSceneResources> m_sceneFrameResources;
         PreparedSceneFrame m_preparedScene;
 

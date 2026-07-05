@@ -10,6 +10,7 @@ namespace ic
     public:
 
         GraphResourceId backBuffer;
+        GraphResourceId environmentCubemap;
         GraphResourceId accumulationTexture;
         GraphResourceId tonemapTexture;
         GraphNodeId pathTraceNode = InvalidGraphNodeId;
@@ -23,6 +24,32 @@ namespace ic
                 .type = ImportedResource::Swapchain,
                 .initialUsage = ResourceUsage::Present
                 });
+
+            environmentCubemap = builder.createTexture({
+                .width = 512,
+                .height = 512,
+                .depth = 1,
+                .mipLevels = 1,
+                .arrayLayers = 6,
+                .cubeCompatible = true,
+                .format = TextureFormat::RGBA32_Float,
+                .usage =
+                    TextureUsageFlags::Sampled |
+                    TextureUsageFlags::Storage,
+                .debugName = "Environment.PathTracerCubemap"
+                });
+
+            EnvironmentConvertPassData environmentConvert{};
+            environmentConvert.outputCubemap = environmentCubemap;
+            auto environmentNode =
+                builder.addGraphNode(
+                    environmentConvert,
+                    GraphNodeType::Compute,
+                    QueueType::Compute);
+            builder.write(
+                environmentNode,
+                environmentCubemap,
+                ResourceUsage::StorageTexture);
 
             accumulationTexture = builder.createTexture({
                 .width = 1,
@@ -58,6 +85,10 @@ namespace ic
                 pathTraceNode,
                 accumulationTexture,
                 ResourceUsage::StorageTexture);
+            builder.read(
+                pathTraceNode,
+                environmentCubemap,
+                ResourceUsage::SampledTexture);
 
             TonemapPassData tonemap{};
             tonemap.inputHDR = accumulationTexture;

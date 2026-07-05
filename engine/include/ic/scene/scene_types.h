@@ -5,6 +5,8 @@
 
 #include <entt/entt.hpp>
 
+#include "ic/renderer/renderer_specification.h"
+
 namespace ic
 {
     using SceneEntityHandle = entt::entity;
@@ -53,6 +55,7 @@ namespace ic
         bool enableAsyncSceneLoading = true;
         uint32_t maxQueuedSceneLoads = 4;
         std::filesystem::path modelRoot;
+        EnvironmentSettings defaultEnvironment;
     };
 
     struct SceneLoadOptions

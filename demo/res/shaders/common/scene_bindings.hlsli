@@ -18,9 +18,9 @@ struct PathTraceConstants
     uint sceneBvhNodeCount;
 
     uint useSceneGeometry;
-    uint padding0;
-    uint padding1;
-    uint padding2;
+    uint environmentEnabled;
+    float environmentIntensity;
+    float environmentExposure;
 
     float4 cameraPositionAndTanHalfFov;
     float4 cameraForwardAndAspect;
@@ -33,6 +33,17 @@ struct TonemapConstants
     uint2 renderSize;
     float exposure;
     uint padding0;
+};
+
+struct SkyboxConstants
+{
+    float4 cameraPositionAndTanHalfFov;
+    float4 cameraForwardAndAspect;
+    float4 cameraRightAndNear;
+    float4 cameraUpAndFar;
+    float intensity;
+    float exposure;
+    float2 padding0;
 };
 
 #endif

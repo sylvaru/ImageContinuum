@@ -13,6 +13,8 @@ StructuredBuffer<PathTraceVertex> gSceneVertices : register(t2, space0);
 StructuredBuffer<PathTraceMaterial> gSceneMaterials : register(t3, space0);
 StructuredBuffer<PathTraceTriangle> gSceneTriangles : register(t4, space0);
 StructuredBuffer<PathTraceBVHNode> gSceneBvhNodes : register(t5, space0);
+TextureCube<float4> gEnvironmentTexture : register(t6, space0);
+SamplerState gEnvironmentSampler : register(s7, space0);
 
 static const uint MaterialDiffuse = 0;
 static const uint MaterialEmissive = 1;
@@ -477,6 +479,22 @@ float3 clampLuminance(float3 value, float maxLuminance)
     return value * (maxLuminance / max(luminance, 1.0e-4f));
 }
 
+float3 environmentRadiance(float3 direction)
+{
+    if (gConstants.environmentEnabled != 0u)
+    {
+        return max(
+            gEnvironmentTexture.SampleLevel(
+                gEnvironmentSampler,
+                direction,
+                0.0f).rgb,
+            0.0f) *
+            (gConstants.environmentIntensity * gConstants.environmentExposure);
+    }
+
+    return skyColor(direction) * 0.015f;
+}
+
 Ray makeCameraRay(uint2 pixel, uint rngSeed)
 {
     uint localSeed = rngSeed;
@@ -518,7 +536,7 @@ float3 tracePath(Ray ray, inout uint rngState)
         Hit hit = traceScene(ray);
         if (hit.t >= 1.0e19f)
         {
-            radiance += throughput * skyColor(ray.direction) * 0.015f;
+            radiance += throughput * environmentRadiance(ray.direction);
             break;
         }
 

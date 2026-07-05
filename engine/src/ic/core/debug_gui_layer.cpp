@@ -4,6 +4,8 @@
 #include "ic/core/app_base.h"
 #include "ic/core/frame_context.h"
 #include "ic/renderer/renderer.h"
+#include "ic/scene/scene.h"
+#include "ic/scene/scene_manager.h"
 
 #include <imgui.h>
 
@@ -33,6 +35,7 @@ namespace ic
         }
 
         m_renderer = ctx.services ? ctx.services->renderer : nullptr;
+        m_sceneManager = ctx.services ? ctx.services->sceneManager : nullptr;
     }
 
     void DebugGuiLayer::onRender([[maybe_unused]] float alpha)
@@ -55,6 +58,51 @@ namespace ic
                 if (ImGui::Checkbox("VSync", &vsync))
                 {
                     m_renderer->setVsyncEnabled(vsync);
+                }
+            }
+
+            if (m_sceneManager)
+            {
+                if (Scene* scene = m_sceneManager->activeScene())
+                {
+                    EnvironmentSettings settings =
+                        scene->environmentSettings();
+                    bool changed = false;
+
+                    ImGui::Separator();
+                    changed |=
+                        ImGui::Checkbox(
+                            "Environment",
+                            &settings.enabled);
+                    changed |=
+                        ImGui::SliderFloat(
+                            "Env Intensity",
+                            &settings.intensity,
+                            0.0f,
+                            8.0f);
+                    changed |=
+                        ImGui::SliderFloat(
+                            "Skybox Exposure",
+                            &settings.skyboxExposure,
+                            0.0f,
+                            4.0f);
+                    changed |=
+                        ImGui::SliderFloat(
+                            "Path Env Exposure",
+                            &settings.pathTraceExposure,
+                            0.0f,
+                            4.0f);
+                    changed |=
+                        ImGui::SliderFloat(
+                            "Tonemap Exposure",
+                            &settings.tonemapExposure,
+                            0.0f,
+                            4.0f);
+
+                    if (changed)
+                    {
+                        scene->setEnvironmentSettings(settings);
+                    }
                 }
             }
         }

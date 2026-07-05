@@ -8,6 +8,8 @@
 
 #include <entt/entt.hpp>
 
+#include "ic/core/asset_manager.h"
+#include "ic/renderer/renderer_specification.h"
 #include "ic/scene/scene_components.h"
 #include "ic/scene/scene_types.h"
 
@@ -63,6 +65,57 @@ namespace ic
             return m_version;
         }
 
+        AssetHandle environmentTexture() const
+        {
+            return m_environmentTexture;
+        }
+
+        void setEnvironmentTexture(AssetHandle handle)
+        {
+            m_environmentTexture = handle;
+            incrementEnvironmentVersion();
+            incrementVersion();
+        }
+
+        const EnvironmentSettings& environmentSettings() const
+        {
+            return m_environmentSettings;
+        }
+
+        uint64_t environmentVersion() const
+        {
+            return m_environmentVersion;
+        }
+
+        float environmentIntensity() const
+        {
+            return m_environmentSettings.intensity;
+        }
+
+        void setEnvironmentIntensity(float intensity)
+        {
+            m_environmentSettings.intensity = intensity;
+            incrementEnvironmentVersion();
+        }
+
+        void setEnvironmentSettings(const EnvironmentSettings& settings)
+        {
+            const bool resourceDirty =
+                m_environmentSettings.enabled != settings.enabled ||
+                m_environmentSettings.cubemapSize != settings.cubemapSize;
+            m_environmentSettings = settings;
+            incrementEnvironmentVersion();
+            if (resourceDirty)
+            {
+                incrementVersion();
+            }
+        }
+
+        void incrementEnvironmentVersion()
+        {
+            ++m_environmentVersion;
+        }
+
         void incrementVersion()
         {
             ++m_version;
@@ -85,6 +138,9 @@ namespace ic
 
         std::string m_name = "Untitled Scene";
         std::filesystem::path m_sourcePath;
+        AssetHandle m_environmentTexture = {};
+        EnvironmentSettings m_environmentSettings = {};
+        uint64_t m_environmentVersion = 1;
 
         uint64_t m_nextEntityId = 1;
         uint64_t m_version = 1;

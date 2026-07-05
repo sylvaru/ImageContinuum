@@ -77,9 +77,6 @@ namespace ic
         D3D12_COMPARISON_FUNC toDx12CompareOp(CompareOp compare) const;
         DXGI_FORMAT toDxgiFormat(TextureFormat format) const;
 
-        static std::vector<std::byte> readBinaryFile(
-            const std::filesystem::path& path);
-
         ID3D12Device5* m_device = nullptr;
         std::vector<DX12GraphicsPipeline> m_graphicsPipelines;
         std::vector<DX12ComputePipeline> m_computePipelines;

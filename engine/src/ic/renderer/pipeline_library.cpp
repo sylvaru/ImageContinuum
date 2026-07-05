@@ -376,6 +376,10 @@ namespace ic
             return PipelineBindingLayoutKind::ForwardBindless;
         if (value == "ComputeStorageBuffer")
             return PipelineBindingLayoutKind::ComputeStorageBuffer;
+        if (value == "EnvironmentConvert")
+            return PipelineBindingLayoutKind::EnvironmentConvert;
+        if (value == "Skybox")
+            return PipelineBindingLayoutKind::Skybox;
         if (value == "PathTrace")
             return PipelineBindingLayoutKind::PathTrace;
         if (value == "PathTraceTonemap")

@@ -1,5 +1,4 @@
 // demo/include/sandbox_app.h
-#include "ic/core/app_base.h"
 #include "ic/core/app_config.h"
 #include "game_layer.h"
 

@@ -61,6 +61,8 @@ namespace ic
         Empty,
         ForwardBindless,
         ComputeStorageBuffer,
+        EnvironmentConvert,
+        Skybox,
         PathTrace,
         PathTraceTonemap
     };
