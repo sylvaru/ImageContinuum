@@ -168,6 +168,26 @@ namespace ic
         const D3D12_RESOURCE_STATES initialState =
             initialTextureState(desc.memoryUsage);
 
+        D3D12_CLEAR_VALUE clearValue{};
+        D3D12_CLEAR_VALUE* optimizedClearValue = nullptr;
+
+        if (hasFlag(desc.usage, TextureUsageFlags::DepthAttachment))
+        {
+            clearValue.Format = resourceDesc.Format;
+            clearValue.DepthStencil.Depth = 1.0f;
+            clearValue.DepthStencil.Stencil = 0;
+            optimizedClearValue = &clearValue;
+        }
+        else if (hasFlag(desc.usage, TextureUsageFlags::ColorAttachment))
+        {
+            clearValue.Format = resourceDesc.Format;
+            clearValue.Color[0] = 0.02f;
+            clearValue.Color[1] = 0.02f;
+            clearValue.Color[2] = 0.025f;
+            clearValue.Color[3] = 1.0f;
+            optimizedClearValue = &clearValue;
+        }
+
         DX12Texture texture{};
         texture.initialState = initialState;
         texture.desc = resourceDesc;
@@ -181,7 +201,7 @@ namespace ic
                     D3D12_HEAP_FLAG_NONE,
                     &resourceDesc,
                     initialState,
-                    nullptr,
+                    optimizedClearValue,
                     IID_PPV_ARGS(&texture.resource)),
                 "Failed to create DX12 texture.");
         }

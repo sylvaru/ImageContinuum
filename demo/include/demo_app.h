@@ -27,8 +27,8 @@ private:
         AppConfigLoadDesc desc{};
         desc.defaultConfigPath =
             //"demo/res/configs/forward.toml";
-            //"demo/res/configs/clustered_forward.toml";
-            "demo/res/configs/path_traced.toml";
+            "demo/res/configs/clustered_forward.toml";
+            //"demo/res/configs/path_traced.toml";
         desc.fallbackApp = createFallbackSpecification();
         desc.fallbackStartupScenePath =
             "demo/res/scene_files/demo_scene.toml";

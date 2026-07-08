@@ -2552,12 +2552,22 @@ namespace ic
             {
                 BufferDesc desc = resource.bufferDesc;
 
+                const bool missingBuffer = !entry.buffer;
+                const bool sizeMismatch =
+                    entry.buffer && entry.buffer.size != desc.size;
+                const bool usageMismatch =
+                    entry.buffer && entry.buffer.usage != desc.usage;
+                const bool memoryMismatch =
+                    entry.buffer && entry.buffer.memoryUsage != desc.memoryUsage;
+                const bool mappedMismatch =
+                    entry.buffer && entry.buffer.mappedAtCreation != desc.mappedAtCreation;
+
                 const bool recreate =
-                    !entry.buffer ||
-                    entry.buffer.size != desc.size ||
-                    entry.buffer.usage != desc.usage ||
-                    entry.buffer.memoryUsage != desc.memoryUsage ||
-                    entry.buffer.mappedAtCreation != desc.mappedAtCreation;
+                    missingBuffer ||
+                    sizeMismatch ||
+                    usageMismatch ||
+                    memoryMismatch ||
+                    mappedMismatch;
 
                 if (!recreate)
                 {
@@ -2570,6 +2580,15 @@ namespace ic
 
                 entry.buffer = m_resourceAllocator.createBuffer(desc);
                 entry.state = entry.buffer.initialState;
+                spdlog::warn(
+                    "[DX12Backend] Stored graph buffer '{}' id={} valid={} size={} usage={} memory={} mapped={}",
+                    desc.debugName,
+                    static_cast<uint32_t>(resource.id),
+                    static_cast<bool>(entry.buffer),
+                    entry.buffer.size,
+                    static_cast<uint32_t>(entry.buffer.usage),
+                    static_cast<uint32_t>(entry.buffer.memoryUsage),
+                    entry.buffer.mappedAtCreation);
             }
         }
     }

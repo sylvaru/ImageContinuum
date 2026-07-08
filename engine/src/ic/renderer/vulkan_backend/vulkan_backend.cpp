@@ -3569,6 +3569,7 @@ namespace ic
         [[maybe_unused]] VkImage swapchainImage)
     {
         const VkExtent2D extent = m_swapchain.extent();
+        
         for (const GraphResource& resource : plan.resources)
         {
             GraphResourceEntry& entry = m_graphResources[resource.id];
@@ -3599,7 +3600,7 @@ namespace ic
                 {
                     continue;
                 }
-
+                
                 if (entry.view != VK_NULL_HANDLE)
                 {
                     vkDestroyImageView(m_device.device(), entry.view, nullptr);

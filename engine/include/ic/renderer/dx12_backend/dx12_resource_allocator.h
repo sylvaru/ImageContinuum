@@ -53,6 +53,9 @@ namespace ic
         {
             resource = nullptr;
             size = 0;
+            usage = BufferUsageFlags::None;
+            memoryUsage = ResourceMemoryUsage::GpuOnly;
+            mappedAtCreation = false;
             initialState = D3D12_RESOURCE_STATE_COMMON;
             gpuAddress = 0;
             mapped = nullptr;
@@ -63,6 +66,9 @@ namespace ic
         {
             resource = std::exchange(other.resource, nullptr);
             size = std::exchange(other.size, 0);
+            usage = std::exchange(other.usage, BufferUsageFlags::None);
+            memoryUsage = std::exchange(other.memoryUsage, ResourceMemoryUsage::GpuOnly);
+            mappedAtCreation = std::exchange(other.mappedAtCreation, false);
             initialState = std::exchange(other.initialState, D3D12_RESOURCE_STATE_COMMON);
             gpuAddress = std::exchange(other.gpuAddress, 0);
             mapped = std::exchange(other.mapped, nullptr);
