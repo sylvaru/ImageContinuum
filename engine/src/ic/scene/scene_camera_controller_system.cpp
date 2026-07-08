@@ -52,8 +52,7 @@ namespace ic
                 }
             }
             else if (!controller.captureMouse &&
-                (input.isMouseButtonPressed(MouseButton::Right) ||
-                 input.isMouseButtonPressed(MouseButton::Left)))
+                input.isMouseButtonPressed(MouseButton::Right))
             {
                 controller.captureMouse = true;
             }
@@ -65,7 +64,7 @@ namespace ic
 
             bool changed = false;
 
-            if (controller.captureMouse)
+            if (controller.captureMouse && input.isCursorLocked())
             {
                 controller.yaw -= static_cast<float>(mouseDx) *
                     controller.mouseSensitivity;

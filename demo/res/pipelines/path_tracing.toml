@@ -27,3 +27,33 @@ compute = "demo/res/compiled_shaders/dx12/equirect_to_cubemap.cs.dxil"
 
 [pipelines.equirect_to_cubemap.shaders.vulkan]
 compute = "demo/res/compiled_shaders/vulkan/equirect_to_cubemap.comp.spv"
+
+[pipelines.ibl_irradiance]
+type = "Compute"
+bindingLayout = "EnvironmentConvert"
+
+[pipelines.ibl_irradiance.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/ibl_irradiance.cs.dxil"
+
+[pipelines.ibl_irradiance.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/ibl_irradiance.comp.spv"
+
+[pipelines.ibl_prefilter]
+type = "Compute"
+bindingLayout = "EnvironmentConvert"
+
+[pipelines.ibl_prefilter.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/ibl_prefilter.cs.dxil"
+
+[pipelines.ibl_prefilter.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/ibl_prefilter.comp.spv"
+
+[pipelines.ibl_brdf_lut]
+type = "Compute"
+bindingLayout = "EnvironmentConvert"
+
+[pipelines.ibl_brdf_lut.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/ibl_brdf_lut.cs.dxil"
+
+[pipelines.ibl_brdf_lut.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/ibl_brdf_lut.comp.spv"

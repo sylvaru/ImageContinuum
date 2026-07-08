@@ -59,6 +59,19 @@ namespace ic
                 {
                     m_renderer->setVsyncEnabled(vsync);
                 }
+
+                if (m_renderer->renderPathType() ==
+                    RenderPathType::ClusteredForward)
+                {
+                    bool heatmap =
+                        m_renderer->clusteredForwardHeatmapEnabled();
+                    ImGui::Separator();
+                    if (ImGui::Checkbox("Cluster Heatmap", &heatmap))
+                    {
+                        m_renderer->setClusteredForwardHeatmapEnabled(
+                            heatmap);
+                    }
+                }
             }
 
             if (m_sceneManager)

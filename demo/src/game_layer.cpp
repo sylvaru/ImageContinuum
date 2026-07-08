@@ -34,11 +34,13 @@ void GameLayer::onAttach(ic::AppServices& services)
 }
 
 void GameLayer::onUpdate(
-	[[maybe_unused]] ic::FrameContext& ctx) {
-    // Gameplay systems will move here as the demo scene grows.
+	[[maybe_unused]] ic::FrameContext& ctx) 
+{
+    // Gameplay systems will move here as the demo scene grows
 }
 
-void GameLayer::onRender([[maybe_unused]] float alpha) {
-	/* Submit flat data buffers */ 
+void GameLayer::onRender([[maybe_unused]] float alpha)
+{
+
 }
 

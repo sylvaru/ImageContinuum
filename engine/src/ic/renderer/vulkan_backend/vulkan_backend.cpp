@@ -33,9 +33,20 @@ namespace ic
                 throw std::runtime_error(message);
             }
         }
+
+        uint32_t mipCountForSize(uint32_t size)
+        {
+            uint32_t levels = 1;
+            while (size > 1)
+            {
+                size >>= 1u;
+                ++levels;
+            }
+            return levels;
+        }
     }
 
-	void VulkanBackend::initialize(
+	void VulkanBackend::init(
 		const RendererSpecification& spec,
         const PipelineLibrary& pipelineLibrary,
 		Window& window,
@@ -98,8 +109,8 @@ namespace ic
         }
 	}
 
-	void VulkanBackend::shutdown()
-	{
+    void VulkanBackend::shutdown()
+    {
         if (m_device.device() != VK_NULL_HANDLE)
         {
             vkDeviceWaitIdle(m_device.device());
@@ -108,7 +119,9 @@ namespace ic
         shutdownImGui();
         destroySceneResources();
         destroyEnvironmentResources();
+        destroyClusteredForwardResources();
         destroyPathTraceResources();
+        destroyGraphResources();
         m_pipelineManager.shutdown();
 
         destroySwapchainSync();
@@ -122,8 +135,8 @@ namespace ic
         m_platform.shutdown();
         m_instance.shutdown();
 
-		spdlog::info("[VulkanBackend] Shutdown");
-	}
+        spdlog::info("[VulkanBackend] Shutdown");
+    }
 
     void VulkanBackend::execute(
         const CompiledGraphPlan& plan,
@@ -142,7 +155,6 @@ namespace ic
         auto& frameSync =
             m_frameSync[frameSlot];
 
-        // CPU/GPU sync (frame pacing)
         vkWaitForFences(
             m_device.device(),
             1,
@@ -166,10 +178,12 @@ namespace ic
         VkImage swapchainImage =
             m_swapchain.image(imageIndex);
 
+        materializeGraphResources(plan, swapchainImage);
+
         const VkImageLayout swapchainInitialLayout =
             imageIndex < m_swapchainImageLayouts.size()
-                ? m_swapchainImageLayouts[imageIndex]
-                : VK_IMAGE_LAYOUT_UNDEFINED;
+            ? m_swapchainImageLayouts[imageIndex]
+            : VK_IMAGE_LAYOUT_UNDEFINED;
 
         if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE)
         {
@@ -222,9 +236,9 @@ namespace ic
         // Present
         const bool presented =
             m_swapchain.present(
-            m_device.presentQueue(),
-            imageIndex,
-            renderFinished);
+                m_device.presentQueue(),
+                imageIndex,
+                renderFinished);
 
         if (!presented)
         {
@@ -232,202 +246,6 @@ namespace ic
         }
     }
 
-    bool VulkanBackend::beginDebugGuiFrame()
-    {
-        if (!m_imguiEnabled || m_imguiFrameActive)
-        {
-            return false;
-        }
-
-        ImGui_ImplVulkan_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
-
-        m_imguiFrameActive = true;
-        return true;
-    }
-
-    void VulkanBackend::endDebugGuiFrame()
-    {
-        if (!m_imguiFrameActive)
-        {
-            return;
-        }
-
-        ImGui::Render();
-        m_imguiFrameActive = false;
-    }
-
-    bool VulkanBackend::vsyncEnabled() const
-    {
-        return m_swapchain.vsyncEnabled();
-    }
-
-    void VulkanBackend::setVsyncEnabled(bool enabled)
-    {
-        if (m_swapchain.setVsyncEnabled(enabled))
-        {
-            onSwapchainRecreated();
-        }
-    }
-
-    void VulkanBackend::initImGui(Window& window)
-    {
-        if (m_imguiEnabled)
-        {
-            return;
-        }
-
-        IMGUI_CHECKVERSION();
-        ImGui::CreateContext();
-
-        ImGuiIO& io = ImGui::GetIO();
-        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-        io.IniFilename = nullptr;
-
-        ImGui::StyleColorsDark();
-
-        auto* glfwWindow =
-            static_cast<GLFWwindow*>(window.getNativeHandle());
-        if (!ImGui_ImplGlfw_InitForVulkan(glfwWindow, true))
-        {
-            throw std::runtime_error(
-                "Failed to initialize ImGui GLFW backend.");
-        }
-
-        const VkFormat colorFormat = m_swapchain.format();
-        VkPipelineRenderingCreateInfoKHR renderingInfo{};
-        renderingInfo.sType =
-            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
-        renderingInfo.colorAttachmentCount = 1;
-        renderingInfo.pColorAttachmentFormats = &colorFormat;
-
-        const uint32_t imageCount =
-            std::max(2u, static_cast<uint32_t>(m_swapchain.images().size()));
-
-        ImGui_ImplVulkan_InitInfo initInfo{};
-        initInfo.ApiVersion = VK_API_VERSION_1_3;
-        initInfo.Instance = m_instance.instance();
-        initInfo.PhysicalDevice = m_adapter.device();
-        initInfo.Device = m_device.device();
-        initInfo.QueueFamily = m_adapter.info().queueFamilies.graphics;
-        initInfo.Queue = m_device.graphicsQueue();
-        initInfo.DescriptorPoolSize = 64;
-        initInfo.MinImageCount = imageCount;
-        initInfo.ImageCount = imageCount;
-        initInfo.UseDynamicRendering = true;
-        initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
-        initInfo.PipelineInfoMain.PipelineRenderingCreateInfo = renderingInfo;
-
-        if (!ImGui_ImplVulkan_Init(&initInfo))
-        {
-            ImGui_ImplGlfw_Shutdown();
-            ImGui::DestroyContext();
-            throw std::runtime_error(
-                "Failed to initialize ImGui Vulkan backend.");
-        }
-
-        m_imguiEnabled = true;
-    }
-
-    void VulkanBackend::shutdownImGui()
-    {
-        if (!m_imguiEnabled)
-        {
-            return;
-        }
-
-        ImGui_ImplVulkan_Shutdown();
-        ImGui_ImplGlfw_Shutdown();
-        ImGui::DestroyContext();
-        m_imguiIniPath.clear();
-
-        m_imguiEnabled = false;
-        m_imguiFrameActive = false;
-    }
-
-    void VulkanBackend::recordImGui(
-        const FrameContext& ctx,
-        VkImage swapchainImage,
-        std::vector<VkCommandBuffer>& commandBuffers)
-    {
-        if (!m_imguiEnabled)
-        {
-            return;
-        }
-
-        ImDrawData* drawData = ImGui::GetDrawData();
-        if (!drawData || drawData->TotalVtxCount == 0)
-        {
-            return;
-        }
-
-        auto lease =
-            m_commandSystem.acquireFrameCommandBuffer(
-                static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size()),
-                0);
-
-        VkCommandBuffer cmd = lease.commandBuffer();
-
-        VkCommandBufferBeginInfo beginInfo{};
-        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-        if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS)
-        {
-            throw std::runtime_error(
-                "Failed to begin Vulkan ImGui command buffer.");
-        }
-
-        transitionImage(
-            cmd,
-            swapchainImage,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            0,
-            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-
-        VkRenderingAttachmentInfo colorAttachment{};
-        colorAttachment.sType =
-            VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        colorAttachment.imageView =
-            m_swapchain.imageView(m_currentSwapchainImage);
-        colorAttachment.imageLayout =
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-        VkRenderingInfo renderingInfo{};
-        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-        renderingInfo.renderArea = { {0, 0}, m_swapchain.extent() };
-        renderingInfo.layerCount = 1;
-        renderingInfo.colorAttachmentCount = 1;
-        renderingInfo.pColorAttachments = &colorAttachment;
-
-        vkCmdBeginRendering(cmd, &renderingInfo);
-        ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
-        vkCmdEndRendering(cmd);
-
-        transitionImage(
-            cmd,
-            swapchainImage,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            0,
-            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
-
-        if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
-        {
-            throw std::runtime_error(
-                "Failed to end Vulkan ImGui command buffer.");
-        }
-
-        commandBuffers.push_back(cmd);
-    }
 
     void VulkanBackend::submitFrame(
         std::span<const VkCommandBuffer> commandBuffers,
@@ -453,10 +271,10 @@ namespace ic
 
         VkResult result =
             vkQueueSubmit(
-            m_device.graphicsQueue(),
-            1,
-            &submit,
-            sync.inFlightFence);
+                m_device.graphicsQueue(),
+                1,
+                &submit,
+                sync.inFlightFence);
 
         if (result != VK_SUCCESS)
         {
@@ -608,6 +426,40 @@ namespace ic
         const GraphResource& resource =
             resources[barrier.resource];
 
+        if (resource.type == GraphResourceType::Buffer)
+        {
+            const GraphResourceEntry* entry = graphResource(barrier.resource);
+            if (!entry || !entry->buffer)
+            {
+                spdlog::error(
+                    "[VulkanBackend] Missing transient graph buffer for barrier resource {}",
+                    barrier.resource);
+                return;
+            }
+
+            VkBufferMemoryBarrier bufferBarrier{};
+            bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            bufferBarrier.srcAccessMask =
+                accessMaskFor(barrier.oldUsage, barrier.fromAccess);
+            bufferBarrier.dstAccessMask =
+                accessMaskFor(barrier.newUsage, barrier.toAccess);
+            bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            bufferBarrier.buffer = entry->buffer.buffer;
+            bufferBarrier.offset = 0;
+            bufferBarrier.size = entry->buffer.size;
+
+            vkCmdPipelineBarrier(
+                cmd,
+                pipelineStageFor(barrier.oldUsage, barrier.fromAccess),
+                pipelineStageFor(barrier.newUsage, barrier.toAccess),
+                0,
+                0, nullptr,
+                1, &bufferBarrier,
+                0, nullptr);
+            return;
+        }
+
         VkImage image = VK_NULL_HANDLE;
 
         bool isSwapchainImage = false;
@@ -624,8 +476,16 @@ namespace ic
         }
         else
         {
-            // TODO
-            return;
+            const GraphResourceEntry* entry = graphResource(barrier.resource);
+            if (!entry || entry->type != GraphResourceType::Texture ||
+                !entry->texture)
+            {
+                spdlog::error(
+                    "[VulkanBackend] Missing transient graph texture for barrier resource {}",
+                    barrier.resource);
+                return;
+            }
+            image = entry->texture.image;
         }
         vkBarrier.image = image;
 
@@ -635,7 +495,9 @@ namespace ic
 
         vkBarrier.oldLayout = isExternalFirstUse
             ? swapchainInitialLayout
-            : usageToLayout(barrier.oldUsage);
+            : (!isSwapchainImage && graphResource(barrier.resource)
+                ? graphResource(barrier.resource)->layout
+                : usageToLayout(barrier.oldUsage));
 
         vkBarrier.newLayout = usageToLayout(barrier.newUsage);
 
@@ -661,7 +523,9 @@ namespace ic
             VK_QUEUE_FAMILY_IGNORED;
 
         vkBarrier.subresourceRange.aspectMask =
-            VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.newUsage == ResourceUsage::DepthAttachment
+                ? VK_IMAGE_ASPECT_DEPTH_BIT
+                : VK_IMAGE_ASPECT_COLOR_BIT;
 
         vkBarrier.subresourceRange.baseMipLevel = 0;
         vkBarrier.subresourceRange.levelCount = 1;
@@ -696,6 +560,14 @@ namespace ic
             0, nullptr,
             0, nullptr,
             1, &vkBarrier);
+
+        if (!isSwapchainImage)
+        {
+            if (GraphResourceEntry* entry = graphResource(barrier.resource))
+            {
+                entry->layout = vkBarrier.newLayout;
+            }
+        }
     }
 
     void VulkanBackend::dispatchNode(
@@ -733,8 +605,6 @@ namespace ic
         VkCommandBuffer cmd,
         [[maybe_unused]] VkImage swapchainImage)
     {
-        ensureDepthTarget();
-
         const GraphicsPipelineHandle pipelineHandle =
             pipelineForNode(plan, node);
         VulkanGraphicsPipeline* pipeline =
@@ -752,6 +622,21 @@ namespace ic
 
         const bool hasColorTarget =
             pipeline->desc.colorAttachmentCount > 0;
+        const GraphResourceId colorResource =
+            findGraphAttachment(plan, node.nodeId, ResourceUsage::ColorAttachment);
+        const GraphResourceId depthResource =
+            findGraphAttachment(plan, node.nodeId, ResourceUsage::DepthAttachment);
+        const GraphResourceEntry* colorEntry =
+            colorResource != InvalidGraphResourceId
+                ? graphResource(colorResource)
+                : nullptr;
+        const GraphResourceEntry* depthEntry =
+            depthResource != InvalidGraphResourceId
+                ? graphResource(depthResource)
+                : nullptr;
+
+        constexpr bool useGraphAttachments = false;
+        ensureDepthTarget();
 
         if (pass && pass->drawList == DrawListKind::Skybox &&
             !m_environmentResources.converted)
@@ -770,27 +655,23 @@ namespace ic
         VkClearValue clear{};
         clear.color = { { 0.02f, 0.02f, 0.025f, 1.0f } };
 
-        VkImageMemoryBarrier depthBarrier{};
-        depthBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        depthBarrier.oldLayout = m_depthLayout;
-        depthBarrier.newLayout =
-            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        depthBarrier.srcAccessMask = 0;
-        depthBarrier.dstAccessMask =
-            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        depthBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        depthBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        depthBarrier.image = m_depthTexture.image;
-        depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        depthBarrier.subresourceRange.baseMipLevel = 0;
-        depthBarrier.subresourceRange.levelCount = 1;
-        depthBarrier.subresourceRange.baseArrayLayer = 0;
-        depthBarrier.subresourceRange.layerCount = 1;
-
-        if (m_depthLayout !=
-            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
+        if (!useGraphAttachments &&
+            m_depthLayout != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
         {
+            VkImageMemoryBarrier depthBarrier{};
+            depthBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            depthBarrier.oldLayout = m_depthLayout;
+            depthBarrier.newLayout =
+                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depthBarrier.dstAccessMask =
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            depthBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            depthBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            depthBarrier.image = m_depthTexture.image;
+            depthBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            depthBarrier.subresourceRange.levelCount = 1;
+            depthBarrier.subresourceRange.layerCount = 1;
             vkCmdPipelineBarrier(
                 cmd,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -805,7 +686,11 @@ namespace ic
 
         VkRenderingAttachmentInfo colorAttachment{};
         colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        colorAttachment.imageView = m_swapchain.imageView(m_currentSwapchainImage);
+        colorAttachment.imageView =
+            useGraphAttachments &&
+                colorEntry && colorEntry->ownership == ResourceOwnership::Transient
+                ? colorEntry->view
+                : m_swapchain.imageView(m_currentSwapchainImage);
         colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         colorAttachment.loadOp =
             pass && pass->colorLoadOp == AttachmentLoadOp::Load
@@ -821,7 +706,11 @@ namespace ic
 
         VkRenderingAttachmentInfo depthAttachment{};
         depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        depthAttachment.imageView = m_depthImageView;
+        depthAttachment.imageView =
+            useGraphAttachments &&
+                depthEntry && depthEntry->ownership == ResourceOwnership::Transient
+                ? depthEntry->view
+                : m_depthImageView;
         depthAttachment.imageLayout =
             VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         depthAttachment.loadOp =
@@ -841,6 +730,21 @@ namespace ic
         renderingInfo.pColorAttachments =
             hasColorTarget ? &colorAttachment : nullptr;
         renderingInfo.pDepthAttachment = &depthAttachment;
+
+        if (pass &&
+            pass->drawList == DrawListKind::SceneGeometry &&
+            !m_environmentResources.converted)
+        {
+            if (VulkanComputePipeline* convertPipeline =
+                    environmentConvertPipeline())
+            {
+                static_cast<void>(convertEnvironmentIfReady(
+                    *convertPipeline,
+                    ctx,
+                    scene,
+                    cmd));
+            }
+        }
 
         vkCmdBeginRendering(cmd, &renderingInfo);
 
@@ -1019,6 +923,14 @@ namespace ic
                 0,
                 nullptr);
         }
+        else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::ClusteredForward)
+        {
+            if (!bindClusteredForwardCompute(*pipeline, ctx, scene, cmd))
+            {
+                return;
+            }
+        }
 
         vkCmdDispatch(
             cmd,
@@ -1047,6 +959,47 @@ namespace ic
                 0,
                 0, nullptr,
                 1, &barrier,
+                0, nullptr);
+        }
+        else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::ClusteredForward)
+        {
+            VkBufferMemoryBarrier barriers[4]{};
+            VkBuffer buffers[] =
+            {
+                m_clusteredForwardResources.clusterBounds.buffer,
+                m_clusteredForwardResources.clusterLightGrid.buffer,
+                m_clusteredForwardResources.clusterLightIndices.buffer,
+                m_clusteredForwardResources.clusterLightCounter.buffer
+            };
+            VkDeviceSize sizes[] =
+            {
+                m_clusteredForwardResources.clusterBounds.size,
+                m_clusteredForwardResources.clusterLightGrid.size,
+                m_clusteredForwardResources.clusterLightIndices.size,
+                m_clusteredForwardResources.clusterLightCounter.size
+            };
+            for (uint32_t i = 0; i < static_cast<uint32_t>(std::size(barriers)); ++i)
+            {
+                barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[i].dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].buffer = buffers[i];
+                barriers[i].offset = 0;
+                barriers[i].size = sizes[i];
+            }
+
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0, nullptr,
+                static_cast<uint32_t>(std::size(barriers)), barriers,
                 0, nullptr);
         }
     }
@@ -1127,11 +1080,37 @@ namespace ic
 
         if (m_environmentResources.convertDescriptorSet == VK_NULL_HANDLE)
         {
+            if (m_environmentResources.bakeDescriptorPool == VK_NULL_HANDLE)
+            {
+                VkDescriptorPoolSize bakePoolSizes[3]{};
+                bakePoolSizes[0].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                bakePoolSizes[0].descriptorCount = 64;
+                bakePoolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                bakePoolSizes[1].descriptorCount = 64;
+                bakePoolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLER;
+                bakePoolSizes[2].descriptorCount = 64;
+
+                VkDescriptorPoolCreateInfo bakePoolInfo{};
+                bakePoolInfo.sType =
+                    VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+                bakePoolInfo.maxSets = 64;
+                bakePoolInfo.poolSizeCount =
+                    static_cast<uint32_t>(std::size(bakePoolSizes));
+                bakePoolInfo.pPoolSizes = bakePoolSizes;
+                throwIfFailed(
+                    vkCreateDescriptorPool(
+                        m_device.device(),
+                        &bakePoolInfo,
+                        nullptr,
+                        &m_environmentResources.bakeDescriptorPool),
+                    "Failed to create Vulkan IBL bake descriptor pool.");
+            }
+
             VkDescriptorSetAllocateInfo allocateInfo{};
             allocateInfo.sType =
                 VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
             allocateInfo.descriptorPool =
-                m_environmentResources.descriptorPool;
+                m_environmentResources.bakeDescriptorPool;
             allocateInfo.descriptorSetCount = 1;
             allocateInfo.pSetLayouts = &pipeline.descriptorSetLayout;
             throwIfFailed(
@@ -1425,15 +1404,15 @@ namespace ic
             poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             poolSizes[0].descriptorCount = frameCount;
             poolSizes[1].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-            poolSizes[1].descriptorCount = frameCount + 1u;
+            poolSizes[1].descriptorCount = frameCount + 64u;
             poolSizes[2].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-            poolSizes[2].descriptorCount = 1;
+            poolSizes[2].descriptorCount = 64u;
             poolSizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-            poolSizes[3].descriptorCount = frameCount + 1u;
+            poolSizes[3].descriptorCount = frameCount + 64u;
 
             VkDescriptorPoolCreateInfo poolInfo{};
             poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-            poolInfo.maxSets = frameCount + 1u;
+            poolInfo.maxSets = frameCount + 64u;
             poolInfo.poolSizeCount =
                 static_cast<uint32_t>(std::size(poolSizes));
             poolInfo.pPoolSizes = poolSizes;
@@ -1681,6 +1660,49 @@ namespace ic
                     m_environmentResources.cubemapStorageView,
                     nullptr);
             }
+            if (m_environmentResources.irradianceView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_environmentResources.irradianceView,
+                    nullptr);
+            }
+            if (m_environmentResources.irradianceStorageView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_environmentResources.irradianceStorageView,
+                    nullptr);
+            }
+            if (m_environmentResources.prefilteredView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_environmentResources.prefilteredView,
+                    nullptr);
+            }
+            for (VkImageView view :
+                m_environmentResources.prefilteredStorageViews)
+            {
+                if (view != VK_NULL_HANDLE)
+                {
+                    vkDestroyImageView(device, view, nullptr);
+                }
+            }
+            if (m_environmentResources.brdfLutView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_environmentResources.brdfLutView,
+                    nullptr);
+            }
+            if (m_environmentResources.brdfLutStorageView != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(
+                    device,
+                    m_environmentResources.brdfLutStorageView,
+                    nullptr);
+            }
             if (m_environmentResources.equirectView != VK_NULL_HANDLE)
             {
                 vkDestroyImageView(
@@ -1702,6 +1724,13 @@ namespace ic
                     m_environmentResources.descriptorPool,
                     nullptr);
             }
+            if (m_environmentResources.bakeDescriptorPool != VK_NULL_HANDLE)
+            {
+                vkDestroyDescriptorPool(
+                    device,
+                    m_environmentResources.bakeDescriptorPool,
+                    nullptr);
+            }
         }
 
         for (VulkanBuffer& buffer :
@@ -1711,6 +1740,9 @@ namespace ic
         }
         m_resourceAllocator.destroyTexture(m_environmentResources.cubemap);
         m_resourceAllocator.destroyTexture(m_environmentResources.equirect);
+        m_resourceAllocator.destroyTexture(m_environmentResources.irradiance);
+        m_resourceAllocator.destroyTexture(m_environmentResources.prefiltered);
+        m_resourceAllocator.destroyTexture(m_environmentResources.brdfLut);
         m_environmentResources = {};
     }
 
@@ -1845,6 +1877,8 @@ namespace ic
             m_pathTraceResources.sceneTriangleCount;
         constants.sceneBvhNodeCount =
             m_pathTraceResources.sceneBvhNodeCount;
+        constants.sceneEmissiveTriangleIndex =
+            m_pathTraceResources.firstEmissiveTriangleIndex;
         constants.useSceneGeometry =
             m_pathTraceResources.sceneTriangleCount != 0u &&
             m_pathTraceResources.sceneBvhNodeCount != 0u
@@ -1859,6 +1893,20 @@ namespace ic
             m_pathTraceResources.width,
             m_pathTraceResources.height,
             constants);
+        for (const SceneLightRenderItem& light : scene.lights)
+        {
+            if (light.type != LightType::Point ||
+                constants.pointLightCount >= MaxPathTracePointLights)
+            {
+                continue;
+            }
+
+            const uint32_t lightIndex = constants.pointLightCount++;
+            constants.pointLightPositionRange[lightIndex] =
+                glm::vec4(light.position, light.range);
+            constants.pointLightColorIntensity[lightIndex] =
+                glm::vec4(light.color, light.intensity);
+        }
 
         VulkanBuffer& pathTraceConstants =
             m_pathTraceResources.pathTraceConstants[frameSlot];
@@ -2163,6 +2211,7 @@ namespace ic
     {
         destroyDepthTarget();
         destroyPathTraceResources();
+        destroyClusteredForwardResources();
 
         if (m_computeTestDescriptorPool != VK_NULL_HANDLE)
         {
@@ -2214,6 +2263,7 @@ namespace ic
             m_resourceAllocator.destroyBuffer(resources.frameConstants);
             m_resourceAllocator.destroyBuffer(resources.objects);
             m_resourceAllocator.destroyBuffer(resources.materials);
+            m_resourceAllocator.destroyBuffer(resources.visibleLights);
 
             if (resources.descriptorPool != VK_NULL_HANDLE)
             {
@@ -2326,11 +2376,13 @@ namespace ic
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         poolSizes[1].descriptorCount = 4u * frameCount;
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        poolSizes[2].descriptorCount = 4u * frameCount;
+        poolSizes[2].descriptorCount =
+            (4u + MaxBindlessTextures) * frameCount;
         poolSizes[3].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         poolSizes[3].descriptorCount = 8u * frameCount;
         poolSizes[4].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-        poolSizes[4].descriptorCount = 2u * frameCount;
+        poolSizes[4].descriptorCount =
+            (2u + MaxBindlessSamplers) * frameCount;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -2366,11 +2418,19 @@ namespace ic
             return;
         }
 
-        const bool retryPendingScene =
-            m_pathTraceResources.sceneTriangleCount == 0u &&
-            !scene.models.empty();
+        AssetManager& assets = *ctx.services->assetManager;
+        const bool hasPendingModels =
+            std::ranges::any_of(
+                scene.models,
+                [&assets](const SceneModelRenderItem& item)
+                {
+                    return !assets.model(item.model);
+                });
         const bool retryThisFrame =
-            retryPendingScene &&
+            (hasPendingModels ||
+                m_pathTraceResources.sceneHadPendingModels ||
+                (m_pathTraceResources.sceneTriangleCount == 0u &&
+                    !scene.models.empty())) &&
             (m_pathTraceResources.lastSceneBuildFrame == UINT64_MAX ||
                 ctx.frameIndex - m_pathTraceResources.lastSceneBuildFrame >=
                     30u);
@@ -2386,7 +2446,50 @@ namespace ic
         PathTraceSceneData sceneData =
             buildPathTraceSceneData(
                 scene,
-                *ctx.services->assetManager);
+                assets,
+                [this, &assets](
+                    AssetHandle modelHandle,
+                    const MaterialTextureSlot& slot)
+                {
+                    PathTraceMaterialTextureIndices indices{};
+                    indices.samplerIndex = requestSampler(nullptr);
+
+                    const ModelAsset* model = assets.model(modelHandle);
+                    if (!model ||
+                        slot.textureIndex < 0 ||
+                        static_cast<size_t>(slot.textureIndex) >=
+                            model->textures.size())
+                    {
+                        return indices;
+                    }
+
+                    const TextureAsset& texture =
+                        model->textures[static_cast<size_t>(slot.textureIndex)];
+                    if (texture.samplerIndex >= 0 &&
+                        static_cast<size_t>(texture.samplerIndex) <
+                            model->samplers.size())
+                    {
+                        indices.samplerIndex =
+                            requestSampler(
+                                &model->samplers[
+                                    static_cast<size_t>(texture.samplerIndex)]);
+                    }
+
+                    if (texture.imageIndex < 0 ||
+                        static_cast<size_t>(texture.imageIndex) >=
+                            model->images.size())
+                    {
+                        return indices;
+                    }
+
+                    indices.textureIndex =
+                        requestTexture(
+                            modelHandle,
+                            static_cast<uint32_t>(texture.imageIndex),
+                            model->images[static_cast<size_t>(texture.imageIndex)],
+                            slot.transfer);
+                    return indices;
+                });
         if (sceneData.triangles.empty() &&
             m_pathTraceResources.sceneVertices)
         {
@@ -2396,6 +2499,7 @@ namespace ic
         uploadPathTraceScene(sceneData);
 
         m_pathTraceResources.sceneVersion = scene.sceneVersion;
+        m_pathTraceResources.sceneHadPendingModels = hasPendingModels;
         m_pathTraceResources.accumulatedSampleCount = 0;
         m_pathTraceResources.resetAccumulation = true;
     }
@@ -2425,6 +2529,16 @@ namespace ic
             static_cast<uint32_t>(sceneData.triangles.size());
         m_pathTraceResources.sceneBvhNodeCount =
             static_cast<uint32_t>(sceneData.bvhNodes.size());
+        m_pathTraceResources.firstEmissiveTriangleIndex =
+            sceneData.firstEmissiveTriangleIndex;
+
+        spdlog::info(
+            "[Vulkan] Path trace scene upload: vertices={} materials={} triangles={} bvhNodes={} firstEmissiveTriangle={}",
+            m_pathTraceResources.sceneVertexCount,
+            m_pathTraceResources.sceneMaterialCount,
+            m_pathTraceResources.sceneTriangleCount,
+            m_pathTraceResources.sceneBvhNodeCount,
+            m_pathTraceResources.firstEmissiveTriangleIndex);
 
         struct PendingSceneUpload
         {
@@ -2607,6 +2721,7 @@ namespace ic
         m_pathTraceResources.sceneMaterialCount = 0;
         m_pathTraceResources.sceneTriangleCount = 0;
         m_pathTraceResources.sceneBvhNodeCount = 0;
+        m_pathTraceResources.firstEmissiveTriangleIndex = UINT32_MAX;
     }
 
     void VulkanBackend::destroyPathTraceResources()
@@ -2657,6 +2772,8 @@ namespace ic
 
         m_pathTraceResources = {};
     }
+
+
 
     VkImageView VulkanBackend::createTextureView(
         const VulkanTexture& texture) const
@@ -2814,11 +2931,38 @@ namespace ic
                 &bvhInfo
             };
 
+            std::vector<VkDescriptorImageInfo> textureInfos(
+                m_uploadedTextures.size());
+            for (const auto& [key, texture] : m_uploadedTextures)
+            {
+                if (texture.descriptorIndex >= textureInfos.size())
+                {
+                    continue;
+                }
+
+                textureInfos[texture.descriptorIndex].imageView = texture.view;
+                textureInfos[texture.descriptorIndex].imageLayout =
+                    texture.layout;
+            }
+
+            std::vector<VkDescriptorImageInfo> samplerInfos(
+                m_uploadedSamplers.size());
+            for (const auto& [key, sampler] : m_uploadedSamplers)
+            {
+                if (sampler.descriptorIndex >= samplerInfos.size())
+                {
+                    continue;
+                }
+
+                samplerInfos[sampler.descriptorIndex].sampler =
+                    sampler.sampler;
+            }
+
             std::vector<VkDescriptorBufferInfo> constantsInfos(
                 m_pathTraceResources.pathTraceConstants.size());
             std::vector<VkWriteDescriptorSet> writes;
             writes.reserve(
-                m_pathTraceResources.pathTraceDescriptorSets.size() * 8u);
+                m_pathTraceResources.pathTraceDescriptorSets.size() * 10u);
 
             for (size_t setIndex = 0;
                  setIndex < m_pathTraceResources.pathTraceDescriptorSets.size();
@@ -2892,6 +3036,38 @@ namespace ic
                         VK_DESCRIPTOR_TYPE_SAMPLER;
                     samplerWrite.pImageInfo = &environmentSamplerInfo;
                     writes.push_back(samplerWrite);
+                }
+
+                if (!textureInfos.empty())
+                {
+                    VkWriteDescriptorSet texturesWrite{};
+                    texturesWrite.sType =
+                        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    texturesWrite.dstSet =
+                        m_pathTraceResources.pathTraceDescriptorSets[setIndex];
+                    texturesWrite.dstBinding = MaxBindlessTextures + 2u;
+                    texturesWrite.descriptorCount =
+                        static_cast<uint32_t>(textureInfos.size());
+                    texturesWrite.descriptorType =
+                        VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                    texturesWrite.pImageInfo = textureInfos.data();
+                    writes.push_back(texturesWrite);
+                }
+
+                if (!samplerInfos.empty())
+                {
+                    VkWriteDescriptorSet samplersWrite{};
+                    samplersWrite.sType =
+                        VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                    samplersWrite.dstSet =
+                        m_pathTraceResources.pathTraceDescriptorSets[setIndex];
+                    samplersWrite.dstBinding = MaxBindlessSamplers;
+                    samplersWrite.descriptorCount =
+                        static_cast<uint32_t>(samplerInfos.size());
+                    samplersWrite.descriptorType =
+                        VK_DESCRIPTOR_TYPE_SAMPLER;
+                    samplersWrite.pImageInfo = samplerInfos.data();
+                    writes.push_back(samplersWrite);
                 }
             }
 
@@ -3108,6 +3284,177 @@ namespace ic
             nullptr);
     }
 
+    void VulkanBackend::ensureClusteredForwardResources()
+    {
+        const VkExtent2D extent = m_swapchain.extent();
+        if (extent.width == 0 || extent.height == 0)
+        {
+            return;
+        }
+
+        const uint32_t clusterCountX =
+            (extent.width + ClusteredForwardTileSizeX - 1u) /
+            ClusteredForwardTileSizeX;
+        const uint32_t clusterCountY =
+            (extent.height + ClusteredForwardTileSizeY - 1u) /
+            ClusteredForwardTileSizeY;
+        const uint32_t clusterCountZ = ClusteredForwardSliceCountZ;
+        const uint32_t clusterCount =
+            clusterCountX * clusterCountY * clusterCountZ;
+
+        if (m_clusteredForwardResources.clusterBounds &&
+            m_clusteredForwardResources.width == extent.width &&
+            m_clusteredForwardResources.height == extent.height)
+        {
+            return;
+        }
+
+        destroyClusteredForwardResources();
+
+        m_clusteredForwardResources.width = extent.width;
+        m_clusteredForwardResources.height = extent.height;
+        m_clusteredForwardResources.clusterCountX = clusterCountX;
+        m_clusteredForwardResources.clusterCountY = clusterCountY;
+        m_clusteredForwardResources.clusterCountZ = clusterCountZ;
+        m_clusteredForwardResources.clusterCount = clusterCount;
+
+        const uint64_t maxClusterLightRefs =
+            static_cast<uint64_t>(clusterCount) *
+            ClusteredForwardMaxLightsPerCluster;
+
+        m_clusteredForwardResources.clusterBounds =
+            m_resourceAllocator.createBuffer({
+                .size = clusterCount * sizeof(GpuClusterBounds),
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "Vulkan clustered cluster bounds"
+            });
+        m_clusteredForwardResources.clusterLightGrid =
+            m_resourceAllocator.createBuffer({
+                .size = clusterCount * sizeof(GpuClusterLightGrid),
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "Vulkan clustered light grid"
+            });
+        m_clusteredForwardResources.clusterLightIndices =
+            m_resourceAllocator.createBuffer({
+                .size = maxClusterLightRefs * sizeof(uint32_t),
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "Vulkan clustered light indices"
+            });
+        m_clusteredForwardResources.clusterLightCounter =
+            m_resourceAllocator.createBuffer({
+                .size = sizeof(uint32_t),
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "Vulkan clustered light counter"
+            });
+
+        spdlog::info(
+            "[VulkanBackend] Clustered forward resources: {}x{}x{} clusters",
+            clusterCountX,
+            clusterCountY,
+            clusterCountZ);
+    }
+
+    bool VulkanBackend::bindClusteredForwardCompute(
+        const VulkanComputePipeline& pipeline,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        VkCommandBuffer cmd)
+    {
+        const PipelineId graphicsPipelineId =
+            makePipelineId("clustered_forward_opaque");
+        GraphicsPipelineHandle graphicsHandle{};
+        if (auto it = m_pipelineHandles.find(graphicsPipelineId);
+            it != m_pipelineHandles.end())
+        {
+            graphicsHandle = it->second;
+        }
+        else if (m_pipelineLibrary)
+        {
+            GraphicsPipelineDesc desc =
+                m_pipelineLibrary->resolveGraphics(
+                    graphicsPipelineId,
+                    RendererBackendType::Vulkan,
+                    swapchainTextureFormat());
+            graphicsHandle = m_pipelineManager.requestGraphicsPipeline(desc);
+            m_pipelineHandles.emplace(graphicsPipelineId, graphicsHandle);
+        }
+
+        if (!graphicsHandle ||
+            !prepareSceneResources(ctx, scene, graphicsHandle))
+        {
+            return false;
+        }
+
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(
+                ctx.frameIndex % m_sceneFrameResources.size());
+        VkDescriptorSet descriptorSet =
+            m_sceneFrameResources[frameSlot].descriptorSet;
+        if (descriptorSet == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        vkCmdBindDescriptorSets(
+            cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipelineLayout,
+            0,
+            1,
+            &descriptorSet,
+            0,
+            nullptr);
+        return true;
+    }
+
+    void VulkanBackend::bindClusteredForwardGraphics(
+        const VulkanGraphicsPipeline& pipeline,
+        const FrameContext& ctx,
+        VkCommandBuffer cmd)
+    {
+        if (m_sceneFrameResources.empty())
+        {
+            return;
+        }
+
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(
+                ctx.frameIndex % m_sceneFrameResources.size());
+        VkDescriptorSet descriptorSet =
+            m_sceneFrameResources[frameSlot].descriptorSet;
+        if (descriptorSet == VK_NULL_HANDLE)
+        {
+            return;
+        }
+
+        vkCmdBindDescriptorSets(
+            cmd,
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipeline.pipelineLayout,
+            0,
+            1,
+            &descriptorSet,
+            0,
+            nullptr);
+    }
+
+    void VulkanBackend::destroyClusteredForwardResources()
+    {
+        m_resourceAllocator.destroyBuffer(
+            m_clusteredForwardResources.clusterBounds);
+        m_resourceAllocator.destroyBuffer(
+            m_clusteredForwardResources.clusterLightGrid);
+        m_resourceAllocator.destroyBuffer(
+            m_clusteredForwardResources.clusterLightIndices);
+        m_resourceAllocator.destroyBuffer(
+            m_clusteredForwardResources.clusterLightCounter);
+        m_clusteredForwardResources = {};
+    }
+
     void VulkanBackend::ensureDepthTarget()
     {
         const VkExtent2D extent = m_swapchain.extent();
@@ -3171,6 +3518,743 @@ namespace ic
         m_depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         m_depthWidth = 0;
         m_depthHeight = 0;
+    }
+
+    VulkanBackend::GraphResourceEntry* VulkanBackend::graphResource(
+        GraphResourceId id)
+    {
+        auto it = m_graphResources.find(id);
+        return it != m_graphResources.end() ? &it->second : nullptr;
+    }
+
+    const VulkanBackend::GraphResourceEntry* VulkanBackend::graphResource(
+        GraphResourceId id) const
+    {
+        auto it = m_graphResources.find(id);
+        return it != m_graphResources.end() ? &it->second : nullptr;
+    }
+
+    GraphResourceId VulkanBackend::findGraphAttachment(
+        const CompiledGraphPlan& plan,
+        GraphNodeId node,
+        ResourceUsage usage) const
+    {
+        for (const ResourceBarrier& barrier : plan.barriers)
+        {
+            if (barrier.toNode == node && barrier.newUsage == usage)
+            {
+                return barrier.resource;
+            }
+        }
+        return InvalidGraphResourceId;
+    }
+
+    void VulkanBackend::destroyGraphResources()
+    {
+        for (auto& [id, entry] : m_graphResources)
+        {
+            if (entry.view != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(m_device.device(), entry.view, nullptr);
+                entry.view = VK_NULL_HANDLE;
+            }
+            m_resourceAllocator.destroyTexture(entry.texture);
+            m_resourceAllocator.destroyBuffer(entry.buffer);
+        }
+        m_graphResources.clear();
+    }
+
+    void VulkanBackend::materializeGraphResources(
+        const CompiledGraphPlan& plan,
+        [[maybe_unused]] VkImage swapchainImage)
+    {
+        const VkExtent2D extent = m_swapchain.extent();
+        for (const GraphResource& resource : plan.resources)
+        {
+            GraphResourceEntry& entry = m_graphResources[resource.id];
+            entry.type = resource.type;
+            entry.ownership = resource.ownership;
+            entry.imported = resource.imported;
+
+            if (resource.ownership == ResourceOwnership::Imported)
+            {
+                entry.width = extent.width;
+                entry.height = extent.height;
+                continue;
+            }
+
+            if (resource.type == GraphResourceType::Texture)
+            {
+                TextureDesc desc = resource.textureDesc;
+                if (desc.width == 0) desc.width = extent.width;
+                if (desc.height == 0) desc.height = extent.height;
+
+                const bool recreate =
+                    !entry.texture ||
+                    entry.width != desc.width ||
+                    entry.height != desc.height ||
+                    entry.mipLevels != desc.mipLevels ||
+                    entry.arrayLayers != desc.arrayLayers;
+                if (!recreate)
+                {
+                    continue;
+                }
+
+                if (entry.view != VK_NULL_HANDLE)
+                {
+                    vkDestroyImageView(m_device.device(), entry.view, nullptr);
+                    entry.view = VK_NULL_HANDLE;
+                }
+                m_resourceAllocator.destroyTexture(entry.texture);
+                entry.texture = m_resourceAllocator.createTexture(desc);
+                entry.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                entry.width = desc.width;
+                entry.height = desc.height;
+                entry.mipLevels = desc.mipLevels;
+                entry.arrayLayers = desc.arrayLayers;
+
+                VkImageViewCreateInfo viewInfo{};
+                viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                viewInfo.image = entry.texture.image;
+                viewInfo.viewType = desc.arrayLayers > 1
+                    ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                    : VK_IMAGE_VIEW_TYPE_2D;
+                viewInfo.format = entry.texture.format;
+                viewInfo.subresourceRange.aspectMask =
+                    hasFlag(desc.usage, TextureUsageFlags::DepthAttachment)
+                        ? VK_IMAGE_ASPECT_DEPTH_BIT
+                        : VK_IMAGE_ASPECT_COLOR_BIT;
+                viewInfo.subresourceRange.levelCount = desc.mipLevels;
+                viewInfo.subresourceRange.layerCount = desc.arrayLayers;
+                throwIfFailed(
+                    vkCreateImageView(
+                        m_device.device(),
+                        &viewInfo,
+                        nullptr,
+                        &entry.view),
+                    "Failed to create Vulkan graph texture view.");
+            }
+            else
+            {
+                BufferDesc desc = resource.bufferDesc;
+                if (entry.buffer && entry.buffer.size == desc.size)
+                {
+                    continue;
+                }
+                m_resourceAllocator.destroyBuffer(entry.buffer);
+                entry.buffer = m_resourceAllocator.createBuffer(desc);
+            }
+        }
+    }
+
+    std::vector<IBLBakeResult> VulkanBackend::executeIBLBakeRequests(
+        std::span<const IBLBakeRequest> requests,
+        const FrameContext& ctx)
+    {
+        std::vector<IBLBakeResult> results;
+        results.reserve(requests.size());
+
+        for (const IBLBakeRequest& request : requests)
+        {
+            IBLBakeResult result{};
+            result.requestId = request.requestId;
+            result.handle = request.handle;
+
+            if (!ctx.services || !ctx.services->assetManager)
+            {
+                result.error = "SourceNotReady";
+                results.push_back(std::move(result));
+                continue;
+            }
+
+            const ImageAsset* image =
+                ctx.services->assetManager->image(
+                    request.desc.sourceEnvironment);
+            if (!image || !image->valid())
+            {
+                result.error = "SourceNotReady";
+                results.push_back(std::move(result));
+                continue;
+            }
+
+            auto computePipeline = [&](const char* name) -> VulkanComputePipeline*
+                {
+                    const PipelineId pipelineId = makePipelineId(name);
+                    auto it = m_computePipelineHandles.find(pipelineId);
+                    ComputePipelineHandle handle{};
+                    if (it != m_computePipelineHandles.end())
+                    {
+                        handle = it->second;
+                    }
+                    else
+                    {
+                        ComputePipelineDesc desc =
+                            m_pipelineLibrary->resolveCompute(
+                                pipelineId,
+                                RendererBackendType::Vulkan);
+                        handle = m_pipelineManager.requestComputePipeline(desc);
+                        m_computePipelineHandles.emplace(pipelineId, handle);
+                    }
+                    return m_pipelineManager.computePipeline(handle);
+                };
+
+            VulkanComputePipeline* convertPipeline =
+                computePipeline("equirect_to_cubemap");
+            VulkanComputePipeline* irradiancePipeline =
+                computePipeline("ibl_irradiance");
+            VulkanComputePipeline* prefilterPipeline =
+                computePipeline("ibl_prefilter");
+            VulkanComputePipeline* brdfPipeline =
+                computePipeline("ibl_brdf_lut");
+
+            convertPipeline =
+                m_pipelineManager.computePipeline(
+                    m_computePipelineHandles.at(
+                        makePipelineId("equirect_to_cubemap")));
+            irradiancePipeline =
+                m_pipelineManager.computePipeline(
+                    m_computePipelineHandles.at(
+                        makePipelineId("ibl_irradiance")));
+            prefilterPipeline =
+                m_pipelineManager.computePipeline(
+                    m_computePipelineHandles.at(
+                        makePipelineId("ibl_prefilter")));
+            brdfPipeline =
+                m_pipelineManager.computePipeline(
+                    m_computePipelineHandles.at(
+                        makePipelineId("ibl_brdf_lut")));
+
+            if (!convertPipeline ||
+                !irradiancePipeline ||
+                !prefilterPipeline ||
+                !brdfPipeline)
+            {
+                result.error = "Missing Vulkan IBL compute pipeline";
+                results.push_back(std::move(result));
+                continue;
+            }
+
+            try
+            {
+                (void)requestTexture(
+                    request.desc.sourceEnvironment,
+                    0,
+                    *image,
+                    TextureTransferFunction::Linear);
+
+                SceneRenderView bakeScene{};
+                bakeScene.environment.equirectTexture =
+                    request.desc.sourceEnvironment;
+                bakeScene.environment.settings.cubemapSize =
+                    std::max(1u, request.desc.environmentSize);
+                bakeScene.environment.settings.intensity = 1.0f;
+                bakeScene.environment.version = request.requestId;
+                bakeScene.environment.enabled = 1u;
+
+                m_environmentResources.irradianceSize =
+                    std::max(1u, request.desc.irradianceSize);
+                m_environmentResources.prefilterSize =
+                    std::max(1u, request.desc.prefilterSize);
+                m_environmentResources.prefilterMipCount =
+                    mipCountForSize(m_environmentResources.prefilterSize);
+                m_environmentResources.brdfLutSize =
+                    std::max(1u, request.desc.brdfLutSize);
+
+                m_commandSystem.immediateSubmit(
+                    m_device.graphicsQueue(),
+                    [&](VkCommandBuffer cmd)
+                    {
+                        (void)ensureEnvironmentResources(
+                            ctx,
+                            bakeScene,
+                            cmd);
+                        (void)convertEnvironmentIfReady(
+                            *convertPipeline,
+                            ctx,
+                            bakeScene,
+                            cmd);
+
+                        if (m_environmentResources.bakeDescriptorPool ==
+                            VK_NULL_HANDLE)
+                        {
+                            VkDescriptorPoolSize bakePoolSizes[3]{};
+                            bakePoolSizes[0].type =
+                                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                            bakePoolSizes[0].descriptorCount = 64;
+                            bakePoolSizes[1].type =
+                                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                            bakePoolSizes[1].descriptorCount = 64;
+                            bakePoolSizes[2].type =
+                                VK_DESCRIPTOR_TYPE_SAMPLER;
+                            bakePoolSizes[2].descriptorCount = 64;
+
+                            VkDescriptorPoolCreateInfo bakePoolInfo{};
+                            bakePoolInfo.sType =
+                                VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+                            bakePoolInfo.maxSets = 64;
+                            bakePoolInfo.poolSizeCount =
+                                static_cast<uint32_t>(
+                                    std::size(bakePoolSizes));
+                            bakePoolInfo.pPoolSizes = bakePoolSizes;
+                            throwIfFailed(
+                                vkCreateDescriptorPool(
+                                    m_device.device(),
+                                    &bakePoolInfo,
+                                    nullptr,
+                                    &m_environmentResources.bakeDescriptorPool),
+                                "Failed to create Vulkan IBL bake descriptor pool.");
+                        }
+
+                        auto createView =
+                            [&](const VulkanTexture& texture,
+                                VkImageViewType type,
+                                uint32_t baseMip,
+                                uint32_t levelCount,
+                                uint32_t layerCount)
+                            {
+                                VkImageViewCreateInfo viewInfo{};
+                                viewInfo.sType =
+                                    VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                                viewInfo.image = texture.image;
+                                viewInfo.viewType = type;
+                                viewInfo.format = texture.format;
+                                viewInfo.subresourceRange.aspectMask =
+                                    VK_IMAGE_ASPECT_COLOR_BIT;
+                                viewInfo.subresourceRange.baseMipLevel =
+                                    baseMip;
+                                viewInfo.subresourceRange.levelCount =
+                                    levelCount;
+                                viewInfo.subresourceRange.layerCount =
+                                    layerCount;
+
+                                VkImageView view = VK_NULL_HANDLE;
+                                throwIfFailed(
+                                    vkCreateImageView(
+                                        m_device.device(),
+                                        &viewInfo,
+                                        nullptr,
+                                        &view),
+                                    "Failed to create Vulkan IBL image view.");
+                                return view;
+                            };
+
+                        auto transitionTexture =
+                            [&](const VulkanTexture& texture,
+                                VkImageLayout oldLayout,
+                                VkImageLayout newLayout,
+                                VkAccessFlags srcAccess,
+                                VkAccessFlags dstAccess,
+                                VkPipelineStageFlags srcStage,
+                                VkPipelineStageFlags dstStage)
+                            {
+                                VkImageMemoryBarrier barrier{};
+                                barrier.sType =
+                                    VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                                barrier.oldLayout = oldLayout;
+                                barrier.newLayout = newLayout;
+                                barrier.srcAccessMask = srcAccess;
+                                barrier.dstAccessMask = dstAccess;
+                                barrier.srcQueueFamilyIndex =
+                                    VK_QUEUE_FAMILY_IGNORED;
+                                barrier.dstQueueFamilyIndex =
+                                    VK_QUEUE_FAMILY_IGNORED;
+                                barrier.image = texture.image;
+                                barrier.subresourceRange.aspectMask =
+                                    VK_IMAGE_ASPECT_COLOR_BIT;
+                                barrier.subresourceRange.levelCount =
+                                    texture.mipLevels;
+                                barrier.subresourceRange.layerCount =
+                                    texture.arrayLayers;
+                                vkCmdPipelineBarrier(
+                                    cmd,
+                                    srcStage,
+                                    dstStage,
+                                    0,
+                                    0,
+                                    nullptr,
+                                    0,
+                                    nullptr,
+                                    1,
+                                    &barrier);
+                            };
+
+                        auto allocateSet =
+                            [&](VkDescriptorSetLayout layout)
+                            {
+                                VkDescriptorSet set = VK_NULL_HANDLE;
+                                VkDescriptorSetAllocateInfo info{};
+                                info.sType =
+                                    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                                info.descriptorPool =
+                                    m_environmentResources.bakeDescriptorPool;
+                                info.descriptorSetCount = 1;
+                                info.pSetLayouts = &layout;
+                                throwIfFailed(
+                                    vkAllocateDescriptorSets(
+                                        m_device.device(),
+                                        &info,
+                                        &set),
+                                    "Failed to allocate Vulkan IBL descriptor set.");
+                                return set;
+                            };
+
+                        auto updateSet =
+                            [&](VkDescriptorSet set,
+                                VkImageView source,
+                                VkImageView output)
+                            {
+                                VkDescriptorImageInfo sourceInfo{};
+                                sourceInfo.imageView = source;
+                                sourceInfo.imageLayout =
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                                VkDescriptorImageInfo outputInfo{};
+                                outputInfo.imageView = output;
+                                outputInfo.imageLayout =
+                                    VK_IMAGE_LAYOUT_GENERAL;
+
+                                VkDescriptorImageInfo samplerInfo{};
+                                samplerInfo.sampler =
+                                    m_environmentResources.sampler;
+
+                                VkWriteDescriptorSet writes[3]{};
+                                writes[0].sType =
+                                    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                                writes[0].dstSet = set;
+                                writes[0].dstBinding = 0;
+                                writes[0].descriptorCount = 1;
+                                writes[0].descriptorType =
+                                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                                writes[0].pImageInfo = &sourceInfo;
+
+                                writes[1].sType =
+                                    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                                writes[1].dstSet = set;
+                                writes[1].dstBinding = 1;
+                                writes[1].descriptorCount = 1;
+                                writes[1].descriptorType =
+                                    VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+                                writes[1].pImageInfo = &outputInfo;
+
+                                writes[2].sType =
+                                    VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                                writes[2].dstSet = set;
+                                writes[2].dstBinding = 2;
+                                writes[2].descriptorCount = 1;
+                                writes[2].descriptorType =
+                                    VK_DESCRIPTOR_TYPE_SAMPLER;
+                                writes[2].pImageInfo = &samplerInfo;
+
+                                vkUpdateDescriptorSets(
+                                    m_device.device(),
+                                    static_cast<uint32_t>(std::size(writes)),
+                                    writes,
+                                    0,
+                                    nullptr);
+                            };
+
+                        auto dispatch =
+                            [&](VulkanComputePipeline& pipeline,
+                                VkDescriptorSet set,
+                                uint32_t groupsX,
+                                uint32_t groupsY,
+                                uint32_t groupsZ)
+                            {
+                                vkCmdBindPipeline(
+                                    cmd,
+                                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipeline.pipeline);
+                                vkCmdBindDescriptorSets(
+                                    cmd,
+                                    VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    pipeline.pipelineLayout,
+                                    0,
+                                    1,
+                                    &set,
+                                    0,
+                                    nullptr);
+                                vkCmdDispatch(
+                                    cmd,
+                                    groupsX,
+                                    groupsY,
+                                    groupsZ);
+                            };
+
+                        if (!m_environmentResources.irradiance)
+                        {
+                            m_environmentResources.irradiance =
+                                m_resourceAllocator.createTexture({
+                                    .width = m_environmentResources.irradianceSize,
+                                    .height = m_environmentResources.irradianceSize,
+                                    .depth = 1,
+                                    .mipLevels = 1,
+                                    .arrayLayers = 6,
+                                    .cubeCompatible = true,
+                                    .format = request.desc.format,
+                                    .usage =
+                                        TextureUsageFlags::Sampled |
+                                        TextureUsageFlags::Storage,
+                                    .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                                    .debugName = "Vulkan IBL irradiance cubemap"
+                                    });
+                            m_environmentResources.irradianceLayout =
+                                VK_IMAGE_LAYOUT_UNDEFINED;
+                            m_environmentResources.irradianceView =
+                                createView(
+                                    m_environmentResources.irradiance,
+                                    VK_IMAGE_VIEW_TYPE_CUBE,
+                                    0,
+                                    1,
+                                    6);
+                            m_environmentResources.irradianceStorageView =
+                                createView(
+                                    m_environmentResources.irradiance,
+                                    VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                    0,
+                                    1,
+                                    6);
+                            m_environmentResources.irradianceDescriptorSet =
+                                allocateSet(
+                                    irradiancePipeline->descriptorSetLayout);
+                            updateSet(
+                                m_environmentResources.irradianceDescriptorSet,
+                                m_environmentResources.cubemapView,
+                                m_environmentResources.irradianceStorageView);
+                        }
+
+                        if (!m_environmentResources.prefiltered)
+                        {
+                            m_environmentResources.prefiltered =
+                                m_resourceAllocator.createTexture({
+                                    .width = m_environmentResources.prefilterSize,
+                                    .height = m_environmentResources.prefilterSize,
+                                    .depth = 1,
+                                    .mipLevels =
+                                        m_environmentResources.prefilterMipCount,
+                                    .arrayLayers = 6,
+                                    .cubeCompatible = true,
+                                    .format = request.desc.format,
+                                    .usage =
+                                        TextureUsageFlags::Sampled |
+                                        TextureUsageFlags::Storage,
+                                    .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                                    .debugName = "Vulkan IBL prefiltered cubemap"
+                                    });
+                            m_environmentResources.prefilteredLayout =
+                                VK_IMAGE_LAYOUT_UNDEFINED;
+                            m_environmentResources.prefilteredView =
+                                createView(
+                                    m_environmentResources.prefiltered,
+                                    VK_IMAGE_VIEW_TYPE_CUBE,
+                                    0,
+                                    m_environmentResources.prefilterMipCount,
+                                    6);
+                            m_environmentResources.prefilteredStorageViews.clear();
+                            m_environmentResources.prefilterDescriptorSets.clear();
+                            for (uint32_t mip = 0;
+                                mip < m_environmentResources.prefilterMipCount;
+                                ++mip)
+                            {
+                                VkImageView view =
+                                    createView(
+                                        m_environmentResources.prefiltered,
+                                        VK_IMAGE_VIEW_TYPE_2D_ARRAY,
+                                        mip,
+                                        1,
+                                        6);
+                                m_environmentResources.prefilteredStorageViews
+                                    .push_back(view);
+                                VkDescriptorSet set =
+                                    allocateSet(
+                                        prefilterPipeline->descriptorSetLayout);
+                                updateSet(
+                                    set,
+                                    m_environmentResources.cubemapView,
+                                    view);
+                                m_environmentResources.prefilterDescriptorSets
+                                    .push_back(set);
+                            }
+                        }
+
+                        if (!m_environmentResources.brdfLut)
+                        {
+                            m_environmentResources.brdfLut =
+                                m_resourceAllocator.createTexture({
+                                    .width = m_environmentResources.brdfLutSize,
+                                    .height = m_environmentResources.brdfLutSize,
+                                    .depth = 1,
+                                    .mipLevels = 1,
+                                    .arrayLayers = 1,
+                                    .format = request.desc.format,
+                                    .usage =
+                                        TextureUsageFlags::Sampled |
+                                        TextureUsageFlags::Storage,
+                                    .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                                    .debugName = "Vulkan IBL BRDF LUT"
+                                    });
+                            m_environmentResources.brdfLutLayout =
+                                VK_IMAGE_LAYOUT_UNDEFINED;
+                            m_environmentResources.brdfLutView =
+                                createView(
+                                    m_environmentResources.brdfLut,
+                                    VK_IMAGE_VIEW_TYPE_2D,
+                                    0,
+                                    1,
+                                    1);
+                            m_environmentResources.brdfLutStorageView =
+                                createView(
+                                    m_environmentResources.brdfLut,
+                                    VK_IMAGE_VIEW_TYPE_2D,
+                                    0,
+                                    1,
+                                    1);
+                            m_environmentResources.brdfLutDescriptorSet =
+                                allocateSet(brdfPipeline->descriptorSetLayout);
+                            updateSet(
+                                m_environmentResources.brdfLutDescriptorSet,
+                                m_environmentResources.cubemapView,
+                                m_environmentResources.brdfLutStorageView);
+                        }
+
+                        transitionTexture(
+                            m_environmentResources.irradiance,
+                            m_environmentResources.irradianceLayout,
+                            VK_IMAGE_LAYOUT_GENERAL,
+                            0,
+                            VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                        m_environmentResources.irradianceLayout =
+                            VK_IMAGE_LAYOUT_GENERAL;
+                        dispatch(
+                            *irradiancePipeline,
+                            m_environmentResources.irradianceDescriptorSet,
+                            (m_environmentResources.irradianceSize + 7u) / 8u,
+                            (m_environmentResources.irradianceSize + 7u) / 8u,
+                            6u);
+                        transitionTexture(
+                            m_environmentResources.irradiance,
+                            VK_IMAGE_LAYOUT_GENERAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                        m_environmentResources.irradianceLayout =
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                        transitionTexture(
+                            m_environmentResources.prefiltered,
+                            m_environmentResources.prefilteredLayout,
+                            VK_IMAGE_LAYOUT_GENERAL,
+                            0,
+                            VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                        m_environmentResources.prefilteredLayout =
+                            VK_IMAGE_LAYOUT_GENERAL;
+                        for (uint32_t mip = 0;
+                            mip < m_environmentResources.prefilterMipCount;
+                            ++mip)
+                        {
+                            const uint32_t mipSize =
+                                std::max(
+                                    m_environmentResources.prefilterSize >> mip,
+                                    1u);
+                            dispatch(
+                                *prefilterPipeline,
+                                m_environmentResources
+                                .prefilterDescriptorSets[mip],
+                                (mipSize + 7u) / 8u,
+                                (mipSize + 7u) / 8u,
+                                6u);
+                        }
+                        transitionTexture(
+                            m_environmentResources.prefiltered,
+                            VK_IMAGE_LAYOUT_GENERAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                        m_environmentResources.prefilteredLayout =
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                        transitionTexture(
+                            m_environmentResources.brdfLut,
+                            m_environmentResources.brdfLutLayout,
+                            VK_IMAGE_LAYOUT_GENERAL,
+                            0,
+                            VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                        m_environmentResources.brdfLutLayout =
+                            VK_IMAGE_LAYOUT_GENERAL;
+                        dispatch(
+                            *brdfPipeline,
+                            m_environmentResources.brdfLutDescriptorSet,
+                            (m_environmentResources.brdfLutSize + 7u) / 8u,
+                            (m_environmentResources.brdfLutSize + 7u) / 8u,
+                            1u);
+                        transitionTexture(
+                            m_environmentResources.brdfLut,
+                            VK_IMAGE_LAYOUT_GENERAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_ACCESS_SHADER_WRITE_BIT,
+                            VK_ACCESS_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                        m_environmentResources.brdfLutLayout =
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        m_environmentResources.iblBaked = true;
+
+                    });
+
+                if (!m_environmentResources.converted)
+                {
+                    result.error = "SourceNotReady";
+                    results.push_back(std::move(result));
+                    continue;
+                }
+
+                result.success = true;
+                result.resources.environmentCubemap =
+                    TextureHandle{ request.handle.index };
+                result.resources.irradianceCubemap =
+                    TextureHandle{ request.handle.index + 1u };
+                result.resources.prefilteredCubemap =
+                    TextureHandle{ request.handle.index + 2u };
+                result.resources.brdfLut =
+                    TextureHandle{ request.handle.index + 3u };
+                result.resources.environmentBindlessIndex = UINT32_MAX;
+                result.resources.irradianceBindlessIndex = UINT32_MAX;
+                result.resources.prefilteredBindlessIndex = UINT32_MAX;
+                result.resources.brdfLutBindlessIndex = UINT32_MAX;
+                result.resources.prefilteredMipCount =
+                    m_environmentResources.prefilterMipCount;
+
+                spdlog::info(
+                    "[Vulkan] IBL bake request={} produced env={} irradiance={} prefilter={} mips={} brdf={}",
+                    request.requestId,
+                    m_environmentResources.cubemapSize,
+                    m_environmentResources.irradianceSize,
+                    m_environmentResources.prefilterSize,
+                    m_environmentResources.prefilterMipCount,
+                    m_environmentResources.brdfLutSize);
+            }
+            catch (const std::exception& e)
+            {
+                result.success = false;
+                result.error = e.what();
+            }
+
+            results.push_back(std::move(result));
+        }
+
+        return results;
     }
 
     uint32_t VulkanBackend::requestTexture(
@@ -3574,7 +4658,20 @@ namespace ic
             dst.normalTextureIndex = textureDescriptor(src.normalTexture);
             dst.metallicRoughnessTextureIndex =
                 textureDescriptor(src.metallicRoughnessTexture);
-            dst.samplerIndex = samplerDescriptor(src.baseColorTexture);
+            dst.occlusionTextureIndex =
+                textureDescriptor(src.occlusionTexture);
+            dst.emissiveTextureIndex =
+                textureDescriptor(src.emissiveTexture);
+            dst.baseColorSamplerIndex =
+                samplerDescriptor(src.baseColorTexture);
+            dst.normalSamplerIndex =
+                samplerDescriptor(src.normalTexture);
+            dst.metallicRoughnessSamplerIndex =
+                samplerDescriptor(src.metallicRoughnessTexture);
+            dst.occlusionSamplerIndex =
+                samplerDescriptor(src.occlusionTexture);
+            dst.emissiveSamplerIndex =
+                samplerDescriptor(src.emissiveTexture);
             uploaded.materials.push_back(dst);
         }
         if (uploaded.materials.empty())
@@ -3640,7 +4737,12 @@ namespace ic
                     ctx.frameIndex % m_sceneFrameResources.size());
             FrameSceneResources& frameResources =
                 m_sceneFrameResources[frameSlot];
-            if (frameResources.descriptorSet == VK_NULL_HANDLE)
+            VulkanGraphicsPipeline* pipeline =
+                m_pipelineManager.graphicsPipeline(pipelineHandle);
+            if (frameResources.descriptorSet == VK_NULL_HANDLE ||
+                (pipeline &&
+                    frameResources.descriptorLayout !=
+                    pipeline->desc.bindingLayout))
             {
                 updateFrameDescriptors(frameResources, pipelineHandle);
             }
@@ -3666,6 +4768,7 @@ namespace ic
         std::vector<DrawItem>& draws = m_preparedScene.draws;
         std::vector<GpuObjectData>& objects = m_preparedScene.objects;
         std::vector<GpuMaterialData>& materials = m_preparedScene.materials;
+        std::vector<GpuVisibleLight> visibleLights;
         auto& materialOffsets = m_preparedScene.materialOffsets;
 
         m_uploadedModels.reserve(
@@ -3735,6 +4838,28 @@ namespace ic
             materials.push_back(GpuMaterialData{});
         }
 
+        visibleLights.reserve(
+            std::min<size_t>(
+                scene.lights.size(),
+                ClusteredForwardMaxVisibleLights));
+        for (const SceneLightRenderItem& light : scene.lights)
+        {
+            if (light.type != LightType::Point ||
+                visibleLights.size() >= ClusteredForwardMaxVisibleLights)
+            {
+                continue;
+            }
+
+            GpuVisibleLight gpuLight{};
+            gpuLight.positionRange = glm::vec4(light.position, light.range);
+            gpuLight.colorIntensity = glm::vec4(light.color, light.intensity);
+            visibleLights.push_back(gpuLight);
+        }
+        if (visibleLights.empty())
+        {
+            visibleLights.push_back(GpuVisibleLight{});
+        }
+
         const uint32_t frameSlot =
             static_cast<uint32_t>(
                 ctx.frameIndex % m_sceneFrameResources.size());
@@ -3786,12 +4911,39 @@ namespace ic
             descriptorsDirty = true;
         }
 
+        if (visibleLights.size() > frameResources.visibleLightCapacity)
+        {
+            m_resourceAllocator.destroyBuffer(frameResources.visibleLights);
+            frameResources.visibleLights =
+                m_resourceAllocator.createBuffer({
+                    .size = visibleLights.size() * sizeof(GpuVisibleLight),
+                    .usage = BufferUsageFlags::Storage,
+                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                    .mappedAtCreation = true,
+                    .debugName = "Vulkan clustered visible lights"
+                });
+            frameResources.visibleLightCapacity =
+                static_cast<uint32_t>(visibleLights.size());
+            descriptorsDirty = true;
+        }
+
+        ensureClusteredForwardResources();
+
+        VulkanGraphicsPipeline* pipeline =
+            m_pipelineManager.graphicsPipeline(pipelineHandle);
         if (descriptorsDirty ||
             frameResources.descriptorSet == VK_NULL_HANDLE ||
+            (pipeline &&
+                frameResources.descriptorLayout !=
+                pipeline->desc.bindingLayout) ||
             frameResources.bindlessTextureCount != m_uploadedTextures.size() ||
-            frameResources.bindlessSamplerCount != m_uploadedSamplers.size())
+            frameResources.bindlessSamplerCount != m_uploadedSamplers.size() ||
+            frameResources.environmentVersion != scene.environment.version ||
+            frameResources.iblBaked != m_environmentResources.iblBaked)
         {
             updateFrameDescriptors(frameResources, pipelineHandle);
+            frameResources.environmentVersion = scene.environment.version;
+            frameResources.iblBaked = m_environmentResources.iblBaked;
         }
 
         GpuFrameData frameData{};
@@ -3805,6 +4957,14 @@ namespace ic
         frameData.viewProjection = frameData.projection * frameData.view;
         frameData.cameraPosition = scene.camera.position;
         frameData.time = ctx.timeSinceStart;
+        frameData.environmentEnabled =
+            m_environmentResources.iblBaked ? 1u : 0u;
+        frameData.prefilteredMipCount =
+            m_environmentResources.prefilterMipCount;
+        frameData.environmentIntensity =
+            scene.environment.settings.intensity;
+        frameData.environmentExposure =
+            scene.environment.settings.skyboxExposure;
 
         for (const SceneLightRenderItem& light : scene.lights)
         {
@@ -3816,6 +4976,35 @@ namespace ic
                 break;
             }
         }
+        for (const SceneLightRenderItem& light : scene.lights)
+        {
+            if (light.type != LightType::Point ||
+                frameData.pointLightCount >= MaxGpuPointLights)
+            {
+                continue;
+            }
+
+            const uint32_t lightIndex = frameData.pointLightCount++;
+            frameData.pointLightPositionRange[lightIndex] =
+                glm::vec4(light.position, light.range);
+            frameData.pointLightColorIntensity[lightIndex] =
+                glm::vec4(light.color, light.intensity);
+        }
+        frameData.pointLightCount =
+            static_cast<uint32_t>(
+                std::min<size_t>(
+                    visibleLights.size(),
+                    ClusteredForwardMaxVisibleLights));
+        frameData.clusterDimensions = glm::uvec4(
+            m_clusteredForwardResources.clusterCountX,
+            m_clusteredForwardResources.clusterCountY,
+            m_clusteredForwardResources.clusterCountZ,
+            m_clusteredForwardResources.clusterCount);
+        frameData.clusterConfig = glm::uvec4(
+            ClusteredForwardTileSizeX,
+            ClusteredForwardTileSizeY,
+            ClusteredForwardMaxLightsPerCluster,
+            m_clusteredForwardHeatmapEnabled ? 1u : 0u);
 
         std::memcpy(
             frameResources.frameConstants.mapped,
@@ -3829,6 +5018,10 @@ namespace ic
             frameResources.materials.mapped,
             materials.data(),
             materials.size() * sizeof(GpuMaterialData));
+        std::memcpy(
+            frameResources.visibleLights.mapped,
+            visibleLights.data(),
+            visibleLights.size() * sizeof(GpuVisibleLight));
 
         m_resourceAllocator.flush(
             frameResources.frameConstants,
@@ -3842,6 +5035,10 @@ namespace ic
             frameResources.materials,
             0,
             materials.size() * sizeof(GpuMaterialData));
+        m_resourceAllocator.flush(
+            frameResources.visibleLights,
+            0,
+            visibleLights.size() * sizeof(GpuVisibleLight));
 
         m_preparedScene.valid = true;
         return true;
@@ -3868,15 +5065,19 @@ namespace ic
             resources.descriptorSet = VK_NULL_HANDLE;
         }
 
+        const bool clusteredLayout =
+            pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::ClusteredForward;
+
         VkDescriptorPoolSize poolSizes[4]{};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         poolSizes[0].descriptorCount = 1;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSizes[1].descriptorCount = 2;
+        poolSizes[1].descriptorCount = clusteredLayout ? 7u : 2u;
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        poolSizes[2].descriptorCount = MaxBindlessTextures;
+        poolSizes[2].descriptorCount = MaxBindlessTextures + 3u;
         poolSizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
-        poolSizes[3].descriptorCount = MaxBindlessSamplers;
+        poolSizes[3].descriptorCount = MaxBindlessSamplers + 1u;
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -3952,7 +5153,7 @@ namespace ic
         }
 
         std::vector<VkWriteDescriptorSet> writes;
-        writes.reserve(5);
+        writes.reserve(clusteredLayout ? 10u : 5u);
         writes.resize(3);
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = resources.descriptorSet;
@@ -3974,6 +5175,53 @@ namespace ic
         writes[2].descriptorCount = 1;
         writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[2].pBufferInfo = &materialInfo;
+
+        VkDescriptorBufferInfo clusterBoundsInfo{};
+        VkDescriptorBufferInfo clusterGridInfo{};
+        VkDescriptorBufferInfo clusterIndicesInfo{};
+        VkDescriptorBufferInfo visibleLightsInfo{};
+        VkDescriptorBufferInfo clusterCounterInfo{};
+        if (clusteredLayout)
+        {
+            clusterBoundsInfo.buffer =
+                m_clusteredForwardResources.clusterBounds.buffer;
+            clusterBoundsInfo.range =
+                m_clusteredForwardResources.clusterBounds.size;
+            clusterGridInfo.buffer =
+                m_clusteredForwardResources.clusterLightGrid.buffer;
+            clusterGridInfo.range =
+                m_clusteredForwardResources.clusterLightGrid.size;
+            clusterIndicesInfo.buffer =
+                m_clusteredForwardResources.clusterLightIndices.buffer;
+            clusterIndicesInfo.range =
+                m_clusteredForwardResources.clusterLightIndices.size;
+            visibleLightsInfo.buffer = resources.visibleLights.buffer;
+            visibleLightsInfo.range = resources.visibleLights.size;
+            clusterCounterInfo.buffer =
+                m_clusteredForwardResources.clusterLightCounter.buffer;
+            clusterCounterInfo.range =
+                m_clusteredForwardResources.clusterLightCounter.size;
+
+            const VkDescriptorBufferInfo* infos[] =
+            {
+                &clusterBoundsInfo,
+                &clusterGridInfo,
+                &clusterIndicesInfo,
+                &visibleLightsInfo,
+                &clusterCounterInfo
+            };
+            for (uint32_t i = 0; i < static_cast<uint32_t>(std::size(infos)); ++i)
+            {
+                VkWriteDescriptorSet write{};
+                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet = resources.descriptorSet;
+                write.dstBinding = 10u + i;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                write.pBufferInfo = infos[i];
+                writes.push_back(write);
+            }
+        }
 
         if (!textureInfos.empty())
         {
@@ -4001,6 +5249,58 @@ namespace ic
             writes.push_back(write);
         }
 
+        if (m_environmentResources.iblBaked &&
+            m_environmentResources.irradianceView != VK_NULL_HANDLE &&
+            m_environmentResources.prefilteredView != VK_NULL_HANDLE &&
+            m_environmentResources.brdfLutView != VK_NULL_HANDLE &&
+            m_environmentResources.sampler != VK_NULL_HANDLE)
+        {
+            VkDescriptorImageInfo irradianceInfo{};
+            irradianceInfo.imageView = m_environmentResources.irradianceView;
+            irradianceInfo.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorImageInfo prefilteredInfo{};
+            prefilteredInfo.imageView = m_environmentResources.prefilteredView;
+            prefilteredInfo.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorImageInfo brdfLutInfo{};
+            brdfLutInfo.imageView = m_environmentResources.brdfLutView;
+            brdfLutInfo.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            VkDescriptorImageInfo iblSamplerInfo{};
+            iblSamplerInfo.sampler = m_environmentResources.sampler;
+
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = resources.descriptorSet;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+
+            write.dstBinding = MaxBindlessTextures + 2u;
+            write.pImageInfo = &irradianceInfo;
+            writes.push_back(write);
+
+            write.dstBinding = MaxBindlessTextures + 3u;
+            write.pImageInfo = &prefilteredInfo;
+            writes.push_back(write);
+
+            write.dstBinding = MaxBindlessTextures + 4u;
+            write.pImageInfo = &brdfLutInfo;
+            writes.push_back(write);
+
+            VkWriteDescriptorSet samplerWrite{};
+            samplerWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            samplerWrite.dstSet = resources.descriptorSet;
+            samplerWrite.dstBinding = MaxBindlessSamplers;
+            samplerWrite.descriptorCount = 1;
+            samplerWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            samplerWrite.pImageInfo = &iblSamplerInfo;
+            writes.push_back(samplerWrite);
+        }
+
         vkUpdateDescriptorSets(
             m_device.device(),
             static_cast<uint32_t>(writes.size()),
@@ -4012,6 +5312,218 @@ namespace ic
             static_cast<uint32_t>(m_uploadedTextures.size());
         resources.bindlessSamplerCount =
             static_cast<uint32_t>(m_uploadedSamplers.size());
+        resources.environmentVersion = UINT64_MAX;
+        resources.iblBaked = m_environmentResources.iblBaked;
+        resources.descriptorLayout = pipeline->desc.bindingLayout;
+    }
+
+    void VulkanBackend::initImGui(Window& window)
+    {
+        if (m_imguiEnabled)
+        {
+            return;
+        }
+
+        IMGUI_CHECKVERSION();
+        ImGui::CreateContext();
+
+        ImGuiIO& io = ImGui::GetIO();
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+        io.IniFilename = nullptr;
+
+        ImGui::StyleColorsDark();
+
+        auto* glfwWindow =
+            static_cast<GLFWwindow*>(window.getNativeHandle());
+        if (!ImGui_ImplGlfw_InitForVulkan(glfwWindow, true))
+        {
+            throw std::runtime_error(
+                "Failed to initialize ImGui GLFW backend.");
+        }
+
+        const VkFormat colorFormat = m_swapchain.format();
+        VkPipelineRenderingCreateInfoKHR renderingInfo{};
+        renderingInfo.sType =
+            VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachmentFormats = &colorFormat;
+
+        const uint32_t imageCount =
+            std::max(2u, static_cast<uint32_t>(m_swapchain.images().size()));
+
+        ImGui_ImplVulkan_InitInfo initInfo{};
+        initInfo.ApiVersion = VK_API_VERSION_1_3;
+        initInfo.Instance = m_instance.instance();
+        initInfo.PhysicalDevice = m_adapter.device();
+        initInfo.Device = m_device.device();
+        initInfo.QueueFamily = m_adapter.info().queueFamilies.graphics;
+        initInfo.Queue = m_device.graphicsQueue();
+        initInfo.DescriptorPoolSize = 64;
+        initInfo.MinImageCount = imageCount;
+        initInfo.ImageCount = imageCount;
+        initInfo.UseDynamicRendering = true;
+        initInfo.PipelineInfoMain.MSAASamples = VK_SAMPLE_COUNT_1_BIT;
+        initInfo.PipelineInfoMain.PipelineRenderingCreateInfo = renderingInfo;
+
+        if (!ImGui_ImplVulkan_Init(&initInfo))
+        {
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+            throw std::runtime_error(
+                "Failed to initialize ImGui Vulkan backend.");
+        }
+
+        m_imguiEnabled = true;
+    }
+
+    void VulkanBackend::shutdownImGui()
+    {
+        if (!m_imguiEnabled)
+        {
+            return;
+        }
+
+        ImGui_ImplVulkan_Shutdown();
+        ImGui_ImplGlfw_Shutdown();
+        ImGui::DestroyContext();
+        m_imguiIniPath.clear();
+
+        m_imguiEnabled = false;
+        m_imguiFrameActive = false;
+    }
+
+    bool VulkanBackend::beginDebugGuiFrame()
+    {
+        if (!m_imguiEnabled || m_imguiFrameActive)
+        {
+            return false;
+        }
+
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        m_imguiFrameActive = true;
+        return true;
+    }
+
+    void VulkanBackend::endDebugGuiFrame()
+    {
+        if (!m_imguiFrameActive)
+        {
+            return;
+        }
+
+        ImGui::Render();
+        m_imguiFrameActive = false;
+    }
+
+
+    void VulkanBackend::recordImGui(
+        const FrameContext& ctx,
+        VkImage swapchainImage,
+        std::vector<VkCommandBuffer>& commandBuffers)
+    {
+        if (!m_imguiEnabled)
+        {
+            return;
+        }
+
+        ImDrawData* drawData = ImGui::GetDrawData();
+        if (!drawData || drawData->TotalVtxCount == 0)
+        {
+            return;
+        }
+
+        auto lease =
+            m_commandSystem.acquireFrameCommandBuffer(
+                static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size()),
+                0);
+
+        VkCommandBuffer cmd = lease.commandBuffer();
+
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+        if (vkBeginCommandBuffer(cmd, &beginInfo) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to begin Vulkan ImGui command buffer.");
+        }
+
+        transitionImage(
+            cmd,
+            swapchainImage,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            0,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+
+        VkRenderingAttachmentInfo colorAttachment{};
+        colorAttachment.sType =
+            VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAttachment.imageView =
+            m_swapchain.imageView(m_currentSwapchainImage);
+        colorAttachment.imageLayout =
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+        VkRenderingInfo renderingInfo{};
+        renderingInfo.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        renderingInfo.renderArea = { {0, 0}, m_swapchain.extent() };
+        renderingInfo.layerCount = 1;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments = &colorAttachment;
+
+        vkCmdBeginRendering(cmd, &renderingInfo);
+        ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
+        vkCmdEndRendering(cmd);
+
+        transitionImage(
+            cmd,
+            swapchainImage,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            0,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+
+        if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
+        {
+            throw std::runtime_error(
+                "Failed to end Vulkan ImGui command buffer.");
+        }
+
+        commandBuffers.push_back(cmd);
+    }
+
+
+    bool VulkanBackend::vsyncEnabled() const
+    {
+        return m_swapchain.vsyncEnabled();
+    }
+
+    void VulkanBackend::setVsyncEnabled(bool enabled)
+    {
+        if (m_swapchain.setVsyncEnabled(enabled))
+        {
+            onSwapchainRecreated();
+        }
+    }
+
+    bool VulkanBackend::clusteredForwardHeatmapEnabled() const
+    {
+        return m_clusteredForwardHeatmapEnabled;
+    }
+
+    void VulkanBackend::setClusteredForwardHeatmapEnabled(bool enabled)
+    {
+        m_clusteredForwardHeatmapEnabled = enabled;
     }
 
 
@@ -4361,6 +5873,7 @@ namespace ic
     {
         vkDeviceWaitIdle(m_device.device());
         destroySceneResources();
+        destroyGraphResources();
         m_pipelineManager.shutdown();
 
         m_swapchain.recreate();

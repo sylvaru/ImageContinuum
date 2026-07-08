@@ -219,35 +219,31 @@ namespace
     ic::RenderPathType parseRenderPath(std::string value)
     {
         value = lower(std::move(value));
-        if (value == "forward" ||
-            value == "Forward")
+        if (value == "forward")
         {
             return ic::RenderPathType::Forward;
         }
 
-        if (value == "deferred" ||
-            value == "Deferred")
+        if (value == "deferred")
         {
             throw std::runtime_error(
                 "Deferred render path is not implemented yet.");
         }
 
         if (value == "forward_plus" ||
-            value == "ForwardPlus" ||
-            value == "forwardplus")
+            value == "forwardplus" ||
+            value == "forward-plus" ||
+            value == "clusteredforward" ||
+            value == "clustered_forward" ||
+            value == "clustered-forward")
         {
-            throw std::runtime_error(
-                "ForwardPlus render path is not implemented yet.");
+            return ic::RenderPathType::ClusteredForward;
         }
 
         if (value == "pathtraced" ||
             value == "path_traced" ||
             value == "path_tracer" ||
             value == "path_trace" ||
-            value == "PathTrace" ||
-            value == "PathTracer" ||
-            value == "PathTracing" ||
-            value == "PathTraced" ||
             value == "pathtrace" ||
             value == "path-trace" ||
             value == "path-traced" ||

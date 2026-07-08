@@ -26,7 +26,7 @@ namespace ic
     {
     public:
 
-        void initialize(
+        void init(
             const RendererSpecification& spec,
             const PipelineLibrary& pipelineLibrary,
             Window& window,
@@ -39,10 +39,18 @@ namespace ic
             const FrameContext& ctx,
             const SceneRenderView& scene) override;
 
+        //SwapchainInfo swapchainInfo() const override;
+
+        std::vector<IBLBakeResult> executeIBLBakeRequests(
+            std::span<const IBLBakeRequest> requests,
+            const FrameContext& ctx) override;
+
         bool beginDebugGuiFrame() override;
         void endDebugGuiFrame() override;
         bool vsyncEnabled() const override;
         void setVsyncEnabled(bool enabled) override;
+        bool clusteredForwardHeatmapEnabled() const override;
+        void setClusteredForwardHeatmapEnabled(bool enabled) override;
 
         VulkanResourceAllocator& resourceAllocator()
         {
@@ -65,6 +73,29 @@ namespace ic
             VkImage image;
             VkBuffer buffer;
             VkImageLayout currentLayout;
+        };
+
+        struct GraphResourceEntry
+        {
+            GraphResourceType type = GraphResourceType::Texture;
+            ResourceOwnership ownership = ResourceOwnership::Transient;
+            ImportedResource imported = ImportedResource::None;
+            VulkanTexture texture;
+            VulkanBuffer buffer;
+            VkImageView view = VK_NULL_HANDLE;
+            VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t mipLevels = 1;
+            uint32_t arrayLayers = 1;
+
+            GraphResourceEntry() = default;
+
+            GraphResourceEntry(const GraphResourceEntry&) = delete;
+            GraphResourceEntry& operator=(const GraphResourceEntry&) = delete;
+
+            GraphResourceEntry(GraphResourceEntry&&) noexcept = default;
+            GraphResourceEntry& operator=(GraphResourceEntry&&) noexcept = default;
         };
 
         struct ImageState
@@ -104,14 +135,20 @@ namespace ic
             VulkanBuffer frameConstants;
             VulkanBuffer objects;
             VulkanBuffer materials;
+            VulkanBuffer visibleLights;
 
             VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
             VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 
             uint32_t objectCapacity = 0;
             uint32_t materialCapacity = 0;
+            uint32_t visibleLightCapacity = 0;
             uint32_t bindlessTextureCount = 0;
             uint32_t bindlessSamplerCount = 0;
+            uint64_t environmentVersion = UINT64_MAX;
+            bool iblBaked = false;
+            PipelineBindingLayoutKind descriptorLayout =
+                PipelineBindingLayoutKind::Unknown;
         };
 
         struct DrawItem
@@ -161,10 +198,12 @@ namespace ic
             uint32_t sceneMaterialCount = 0;
             uint32_t sceneTriangleCount = 0;
             uint32_t sceneBvhNodeCount = 0;
+            uint32_t firstEmissiveTriangleIndex = UINT32_MAX;
             uint32_t accumulatedSampleCount = 0;
             uint64_t sceneVersion = UINT64_MAX;
             uint64_t environmentVersion = UINT64_MAX;
             uint64_t lastSceneBuildFrame = UINT64_MAX;
+            bool sceneHadPendingModels = false;
             float tonemapExposure = 1.0f;
             glm::mat4 previousView = glm::mat4(1.0f);
             glm::mat4 previousProjection = glm::mat4(1.0f);
@@ -179,19 +218,54 @@ namespace ic
             AssetHandle source = {};
             VulkanTexture cubemap;
             VulkanTexture equirect;
+            VulkanTexture irradiance;
+            VulkanTexture prefiltered;
+            VulkanTexture brdfLut;
             VkImageView cubemapView = VK_NULL_HANDLE;
             VkImageView cubemapStorageView = VK_NULL_HANDLE;
             VkImageView equirectView = VK_NULL_HANDLE;
+            VkImageView irradianceView = VK_NULL_HANDLE;
+            VkImageView irradianceStorageView = VK_NULL_HANDLE;
+            VkImageView prefilteredView = VK_NULL_HANDLE;
+            std::vector<VkImageView> prefilteredStorageViews;
+            VkImageView brdfLutView = VK_NULL_HANDLE;
+            VkImageView brdfLutStorageView = VK_NULL_HANDLE;
             VkSampler sampler = VK_NULL_HANDLE;
             VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
+            VkDescriptorPool bakeDescriptorPool = VK_NULL_HANDLE;
             VkDescriptorSet convertDescriptorSet = VK_NULL_HANDLE;
+            VkDescriptorSet irradianceDescriptorSet = VK_NULL_HANDLE;
+            std::vector<VkDescriptorSet> prefilterDescriptorSets;
+            VkDescriptorSet brdfLutDescriptorSet = VK_NULL_HANDLE;
             std::vector<VulkanBuffer> skyboxConstants;
             std::vector<VkDescriptorSet> skyboxDescriptorSets;
             VkImageLayout cubemapLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             VkImageLayout equirectLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImageLayout irradianceLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImageLayout prefilteredLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            VkImageLayout brdfLutLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             uint32_t cubemapSize = 512;
+            uint32_t irradianceSize = 64;
+            uint32_t prefilterSize = 256;
+            uint32_t prefilterMipCount = 1;
+            uint32_t brdfLutSize = 512;
             bool converted = false;
+            bool iblBaked = false;
             bool skyboxDescriptorsDirty = true;
+        };
+
+        struct ClusteredForwardResources
+        {
+            VulkanBuffer clusterBounds;
+            VulkanBuffer clusterLightGrid;
+            VulkanBuffer clusterLightIndices;
+            VulkanBuffer clusterLightCounter;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t clusterCountX = 0;
+            uint32_t clusterCountY = 0;
+            uint32_t clusterCountZ = 0;
+            uint32_t clusterCount = 0;
         };
 
     private:
@@ -311,8 +385,29 @@ namespace ic
             VkCommandBuffer cmd);
         void ensureDepthTarget();
         void destroyDepthTarget();
+        void materializeGraphResources(
+            const CompiledGraphPlan& plan,
+            VkImage swapchainImage);
+        void destroyGraphResources();
+        GraphResourceEntry* graphResource(GraphResourceId id);
+        const GraphResourceEntry* graphResource(GraphResourceId id) const;
+        GraphResourceId findGraphAttachment(
+            const CompiledGraphPlan& plan,
+            GraphNodeId node,
+            ResourceUsage usage) const;
         void ensureComputeTestResources(
             const VulkanComputePipeline& pipeline);
+        void ensureClusteredForwardResources();
+        bool bindClusteredForwardCompute(
+            const VulkanComputePipeline& pipeline,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            VkCommandBuffer cmd);
+        void bindClusteredForwardGraphics(
+            const VulkanGraphicsPipeline& pipeline,
+            const FrameContext& ctx,
+            VkCommandBuffer cmd);
+        void destroyClusteredForwardResources();
 
         UploadedModel* requestModel(
             AssetHandle handle,
@@ -373,6 +468,8 @@ namespace ic
             VkPipelineStageFlags dstStage);
 
         std::unordered_map<GraphResourceId, VulkanResource> m_resources;
+        std::unordered_map<GraphResourceId, GraphResourceEntry>
+            m_graphResources;
         std::unordered_map<VkImage, ImageState> m_imageStates;
 
         std::vector<FrameSync> m_frameSync;
@@ -399,6 +496,7 @@ namespace ic
         VulkanBuffer m_computeTestBuffer;
         VkDescriptorPool m_computeTestDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_computeTestDescriptorSet = VK_NULL_HANDLE;
+        ClusteredForwardResources m_clusteredForwardResources;
         PathTraceResources m_pathTraceResources;
         EnvironmentResources m_environmentResources;
 
@@ -413,6 +511,7 @@ namespace ic
         uint32_t m_workerSlots = 1;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;
+        bool m_clusteredForwardHeatmapEnabled = false;
         std::string m_imguiIniPath;
     };
 }

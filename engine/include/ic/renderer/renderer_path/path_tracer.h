@@ -18,7 +18,9 @@ namespace ic
         GraphNodeId copyNode = InvalidGraphNodeId;
         GraphNodeId presentNode = InvalidGraphNodeId;
 
-        void buildFrameGraph(FrameGraphBuilder& builder) override
+        void buildFrameGraph(
+            [[maybe_unused]] RendererPathContext& ctx,
+            FrameGraphBuilder& builder) override
         {
             backBuffer = builder.importTexture({
                 .type = ImportedResource::Swapchain,

@@ -7,4 +7,3 @@ demo/res/compiled_shaders/vulkan/*.spv
 demo/res/compiled_shaders/dx12/*.dxil
 
 .agents
-

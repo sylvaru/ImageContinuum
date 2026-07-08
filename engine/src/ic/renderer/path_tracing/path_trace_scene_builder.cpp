@@ -26,7 +26,14 @@ namespace ic
             PathTraceTriangle triangle;
             Bounds bounds;
             glm::vec3 centroid = glm::vec3(0.0f);
+            bool emissive = false;
         };
+
+        bool materialIsEmissive(const PathTraceMaterial& material)
+        {
+            const glm::vec3 emission(material.emissive);
+            return glm::dot(emission, emission) > 0.0f;
+        }
 
         void expand(Bounds& bounds, const glm::vec3& p)
         {
@@ -125,7 +132,8 @@ namespace ic
 
     PathTraceSceneData buildPathTraceSceneData(
         const SceneRenderView& scene,
-        const AssetManager& assets)
+        const AssetManager& assets,
+        const PathTraceMaterialTextureResolver& resolveTexture)
     {
         PathTraceSceneData data{};
         std::vector<BuildTriangle> buildTriangles;
@@ -149,7 +157,7 @@ namespace ic
                 PathTraceMaterial dst{};
                 dst.baseColor = src.baseColorFactor;
                 dst.emissive =
-                    glm::vec4(src.emissiveFactor, 0.0f);
+                    glm::vec4(src.emissiveFactor * src.emissiveStrength, 0.0f);
                 if (src.name.find("Light") != std::string::npos ||
                     src.name.find("light") != std::string::npos)
                 {
@@ -158,8 +166,38 @@ namespace ic
                     dst.emissive =
                         glm::vec4(glm::max(color, glm::vec3(1.0f)) * 18.0f, 0.0f);
                 }
-                dst.roughness = src.roughnessFactor;
-                dst.metallic = src.metallicFactor;
+                dst.roughnessFactor = src.roughnessFactor;
+                dst.metallicFactor = src.metallicFactor;
+                dst.occlusionStrength = src.occlusionTexture.strength;
+                dst.materialType =
+                    static_cast<uint32_t>(PathTraceMaterialType::Diffuse);
+
+                if (resolveTexture)
+                {
+                    const PathTraceMaterialTextureIndices baseColor =
+                        resolveTexture(item.model, src.baseColorTexture);
+                    const PathTraceMaterialTextureIndices normal =
+                        resolveTexture(item.model, src.normalTexture);
+                    const PathTraceMaterialTextureIndices metallicRoughness =
+                        resolveTexture(item.model, src.metallicRoughnessTexture);
+                    const PathTraceMaterialTextureIndices occlusion =
+                        resolveTexture(item.model, src.occlusionTexture);
+                    const PathTraceMaterialTextureIndices emissive =
+                        resolveTexture(item.model, src.emissiveTexture);
+
+                    dst.baseColorTextureIndex = baseColor.textureIndex;
+                    dst.baseColorSamplerIndex = baseColor.samplerIndex;
+                    dst.normalTextureIndex = normal.textureIndex;
+                    dst.normalSamplerIndex = normal.samplerIndex;
+                    dst.metallicRoughnessTextureIndex =
+                        metallicRoughness.textureIndex;
+                    dst.metallicRoughnessSamplerIndex =
+                        metallicRoughness.samplerIndex;
+                    dst.occlusionTextureIndex = occlusion.textureIndex;
+                    dst.occlusionSamplerIndex = occlusion.samplerIndex;
+                    dst.emissiveTextureIndex = emissive.textureIndex;
+                    dst.emissiveSamplerIndex = emissive.samplerIndex;
+                }
                 data.materials.push_back(dst);
             }
 
@@ -167,8 +205,10 @@ namespace ic
             {
                 PathTraceMaterial material{};
                 material.baseColor = glm::vec4(0.8f, 0.8f, 0.8f, 1.0f);
-                material.roughness = 1.0f;
-                material.metallic = 0.0f;
+                material.roughnessFactor = 1.0f;
+                material.metallicFactor = 0.0f;
+                material.materialType =
+                    static_cast<uint32_t>(PathTraceMaterialType::Diffuse);
                 data.materials.push_back(material);
             }
 
@@ -252,8 +292,22 @@ namespace ic
                                 normal = glm::vec3(0.0f, 1.0f, 0.0f);
                             }
 
+                            glm::vec3 tangent =
+                                glm::mat3(world) * glm::vec3(src.tangent);
+                            if (glm::dot(tangent, tangent) > 1.0e-8f)
+                            {
+                                tangent = glm::normalize(tangent);
+                            }
+                            else
+                            {
+                                tangent = glm::vec3(1.0f, 0.0f, 0.0f);
+                            }
+
                             dst.position = glm::vec4(position, 1.0f);
                             dst.normal = glm::vec4(normal, 0.0f);
+                            dst.tangent = glm::vec4(tangent, src.tangent.w);
+                            dst.texCoord =
+                                glm::vec4(src.uv0, src.uv1);
 
                             data.vertices.push_back(dst);
                             expand(triBounds, position);
@@ -267,6 +321,9 @@ namespace ic
                         tri.triangle.materialIndex = materialIndex;
                         tri.bounds = triBounds;
                         tri.centroid = centroid / 3.0f;
+                        tri.emissive =
+                            materialIndex < data.materials.size() &&
+                            materialIsEmissive(data.materials[materialIndex]);
                         buildTriangles.push_back(tri);
                     }
                 }
@@ -292,6 +349,12 @@ namespace ic
         data.triangles.reserve(buildTriangles.size());
         for (const BuildTriangle& tri : buildTriangles)
         {
+            if (tri.emissive &&
+                data.firstEmissiveTriangleIndex == UINT32_MAX)
+            {
+                data.firstEmissiveTriangleIndex =
+                    static_cast<uint32_t>(data.triangles.size());
+            }
             data.triangles.push_back(tri.triangle);
         }
 

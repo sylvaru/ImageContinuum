@@ -12,18 +12,34 @@ namespace ic
 
         GraphResourceId backBuffer;
         GraphResourceId sceneDepth;
-        GraphResourceId visibilityBuffer;
+        //GraphResourceId visibilityBuffer;
         GraphResourceId environmentCubemap;
 
-        void buildFrameGraph(FrameGraphBuilder& builder) override
+        void buildFrameGraph(
+            RendererPathContext& ctx,
+            FrameGraphBuilder& builder) override
         {
+            uint32_t renderWidth = ctx.renderExtent.width;
+            uint32_t renderHeight = ctx.renderExtent.height;
+
             // Resources
             backBuffer = builder.importTexture({
                 .type = ImportedResource::Swapchain,
                 .initialUsage = ResourceUsage::Present
                 });
-            sceneDepth = builder.createTexture();
-            visibilityBuffer = builder.createBuffer();
+            sceneDepth = builder.createTexture({
+                .width = renderWidth,
+                .height = renderHeight,
+                .depth = 1,
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .format = TextureFormat::D32_Float,
+                .usage =
+                    TextureUsageFlags::DepthAttachment |
+                    TextureUsageFlags::Sampled,
+                    .debugName = "Forward.SceneDepth"
+                });
+
             environmentCubemap = builder.createTexture({
                 .width = 512,
                 .height = 512,
@@ -37,16 +53,6 @@ namespace ic
                     TextureUsageFlags::Storage,
                 .debugName = "Environment.SkyboxCubemap"
                 });
-
-            builder.addComputePass("Visibility")
-                .pipeline("visibility_test")
-                .dispatch(64)
-                .write(visibilityBuffer, ResourceUsage::StorageBuffer);
-
-            builder.addComputePass("IndependentCompute")
-                .pipeline("independent_compute_test")
-                .dispatch(64)
-                .write(visibilityBuffer, ResourceUsage::StorageBuffer);
 
             EnvironmentConvertPassData environmentConvert{};
             environmentConvert.outputCubemap = environmentCubemap;
@@ -72,10 +78,10 @@ namespace ic
                 .color(backBuffer)
                 .depth(sceneDepth);
 
-            builder.read(
-                forwardNode,
-                visibilityBuffer,
-                ResourceUsage::StorageBuffer);
+            //builder.read(
+            //    forwardNode,
+            //    visibilityBuffer,
+            //    ResourceUsage::StorageBuffer);
 
             auto skyboxNode = builder.addGraphicsPass("Skybox")
                 .pipeline("skybox")

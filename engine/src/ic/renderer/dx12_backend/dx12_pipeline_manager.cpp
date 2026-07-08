@@ -308,7 +308,7 @@ namespace ic
         if (layout == PipelineBindingLayoutKind::PathTrace ||
             layout == PipelineBindingLayoutKind::PathTraceTonemap)
         {
-            D3D12_ROOT_PARAMETER rootParameters[4]{};
+            D3D12_ROOT_PARAMETER rootParameters[6]{};
 
             rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             rootParameters[0].Descriptor.ShaderRegister = 0;
@@ -360,9 +360,39 @@ namespace ic
             rootParameters[3].DescriptorTable.pDescriptorRanges = &samplerRange;
             rootParameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+            D3D12_DESCRIPTOR_RANGE bindlessTextureRange{};
+            bindlessTextureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            bindlessTextureRange.NumDescriptors = MaxBindlessTextures;
+            bindlessTextureRange.BaseShaderRegister = MaxBindlessTextures + 2;
+            bindlessTextureRange.RegisterSpace = 0;
+            bindlessTextureRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[4].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[4].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[4].DescriptorTable.pDescriptorRanges =
+                &bindlessTextureRange;
+            rootParameters[4].ShaderVisibility =
+                D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_DESCRIPTOR_RANGE bindlessSamplerRange{};
+            bindlessSamplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            bindlessSamplerRange.NumDescriptors = MaxBindlessSamplers;
+            bindlessSamplerRange.BaseShaderRegister = MaxBindlessSamplers;
+            bindlessSamplerRange.RegisterSpace = 0;
+            bindlessSamplerRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[5].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[5].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[5].DescriptorTable.pDescriptorRanges =
+                &bindlessSamplerRange;
+            rootParameters[5].ShaderVisibility =
+                D3D12_SHADER_VISIBILITY_ALL;
+
             D3D12_ROOT_SIGNATURE_DESC rootDesc{};
             rootDesc.NumParameters =
-                layout == PipelineBindingLayoutKind::PathTrace ? 4u : 3u;
+                layout == PipelineBindingLayoutKind::PathTrace ? 6u : 3u;
             rootDesc.pParameters = rootParameters;
             rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
 
@@ -530,13 +560,232 @@ namespace ic
             return rootSignature;
         }
 
+        if (layout == PipelineBindingLayoutKind::ClusteredForward)
+        {
+            D3D12_ROOT_PARAMETER rootParameters[18]{};
+
+            // 0: Frame constants, b0 space0
+            rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rootParameters[0].Descriptor.ShaderRegister = 0;
+            rootParameters[0].Descriptor.RegisterSpace = 0;
+            rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 1: Objects, t0 space0
+            D3D12_DESCRIPTOR_RANGE objectRange{};
+            objectRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            objectRange.NumDescriptors = 1;
+            objectRange.BaseShaderRegister = 0;
+            objectRange.RegisterSpace = 0;
+            objectRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[1].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[1].DescriptorTable.pDescriptorRanges = &objectRange;
+            rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 2: Materials, t1 space0
+            D3D12_DESCRIPTOR_RANGE materialRange{};
+            materialRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            materialRange.NumDescriptors = 1;
+            materialRange.BaseShaderRegister = 1;
+            materialRange.RegisterSpace = 0;
+            materialRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[2].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[2].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[2].DescriptorTable.pDescriptorRanges = &materialRange;
+            rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 3: Draw constants, b1/root constants space0
+            rootParameters[3].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rootParameters[3].Constants.ShaderRegister = 1;
+            rootParameters[3].Constants.RegisterSpace = 0;
+            rootParameters[3].Constants.Num32BitValues = 4;
+            rootParameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 4: Bindless textures, t2+ space0
+            D3D12_DESCRIPTOR_RANGE bindlessTextureRange{};
+            bindlessTextureRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            bindlessTextureRange.NumDescriptors = MaxBindlessTextures;
+            bindlessTextureRange.BaseShaderRegister = 2;
+            bindlessTextureRange.RegisterSpace = 0;
+            bindlessTextureRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[4].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[4].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[4].DescriptorTable.pDescriptorRanges =
+                &bindlessTextureRange;
+            rootParameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+            // 5: Bindless samplers, s0+ space0
+            D3D12_DESCRIPTOR_RANGE bindlessSamplerRange{};
+            bindlessSamplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            bindlessSamplerRange.NumDescriptors = MaxBindlessSamplers;
+            bindlessSamplerRange.BaseShaderRegister = 0;
+            bindlessSamplerRange.RegisterSpace = 0;
+            bindlessSamplerRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[5].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[5].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[5].DescriptorTable.pDescriptorRanges =
+                &bindlessSamplerRange;
+            rootParameters[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+            // 6: IBL irradiance, t0 space1
+            D3D12_DESCRIPTOR_RANGE irradianceRange{};
+            irradianceRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            irradianceRange.NumDescriptors = 1;
+            irradianceRange.BaseShaderRegister = 0;
+            irradianceRange.RegisterSpace = 1;
+            irradianceRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[6].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[6].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[6].DescriptorTable.pDescriptorRanges =
+                &irradianceRange;
+            rootParameters[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+            // 7: IBL prefiltered environment, t1 space1
+            D3D12_DESCRIPTOR_RANGE prefilteredRange{};
+            prefilteredRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            prefilteredRange.NumDescriptors = 1;
+            prefilteredRange.BaseShaderRegister = 1;
+            prefilteredRange.RegisterSpace = 1;
+            prefilteredRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[7].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[7].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[7].DescriptorTable.pDescriptorRanges =
+                &prefilteredRange;
+            rootParameters[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+            // 8: BRDF LUT, t2 space1
+            D3D12_DESCRIPTOR_RANGE brdfLutRange{};
+            brdfLutRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            brdfLutRange.NumDescriptors = 1;
+            brdfLutRange.BaseShaderRegister = 2;
+            brdfLutRange.RegisterSpace = 1;
+            brdfLutRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[8].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[8].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[8].DescriptorTable.pDescriptorRanges =
+                &brdfLutRange;
+            rootParameters[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+            // 9: IBL sampler, s0 space1
+            D3D12_DESCRIPTOR_RANGE iblSamplerRange{};
+            iblSamplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+            iblSamplerRange.NumDescriptors = 1;
+            iblSamplerRange.BaseShaderRegister = 0;
+            iblSamplerRange.RegisterSpace = 1;
+            iblSamplerRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[9].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[9].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[9].DescriptorTable.pDescriptorRanges =
+                &iblSamplerRange;
+            rootParameters[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+            // 10: Cluster bounds UAV, u10 space2
+            rootParameters[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameters[10].Descriptor.ShaderRegister = 10;
+            rootParameters[10].Descriptor.RegisterSpace = 2;
+            rootParameters[10].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 11: Cluster light grid UAV, u11 space2
+            rootParameters[11].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameters[11].Descriptor.ShaderRegister = 11;
+            rootParameters[11].Descriptor.RegisterSpace = 2;
+            rootParameters[11].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 12: Cluster light indices UAV, u12 space2
+            rootParameters[12].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameters[12].Descriptor.ShaderRegister = 12;
+            rootParameters[12].Descriptor.RegisterSpace = 2;
+            rootParameters[12].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 13: Visible lights SRV, t13 space2
+            rootParameters[13].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParameters[13].Descriptor.ShaderRegister = 13;
+            rootParameters[13].Descriptor.RegisterSpace = 2;
+            rootParameters[13].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 14: Cluster light counter UAV, u14 space2
+            rootParameters[14].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameters[14].Descriptor.ShaderRegister = 14;
+            rootParameters[14].Descriptor.RegisterSpace = 2;
+            rootParameters[14].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 15: Cluster bounds SRV, t10 space2
+            rootParameters[15].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParameters[15].Descriptor.ShaderRegister = 10;
+            rootParameters[15].Descriptor.RegisterSpace = 2;
+            rootParameters[15].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 16: Cluster light grid SRV, t11 space2
+            rootParameters[16].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParameters[16].Descriptor.ShaderRegister = 11;
+            rootParameters[16].Descriptor.RegisterSpace = 2;
+            rootParameters[16].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 17: Cluster light indices SRV, t12 space2
+            rootParameters[17].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParameters[17].Descriptor.ShaderRegister = 12;
+            rootParameters[17].Descriptor.RegisterSpace = 2;
+            rootParameters[17].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+            rootDesc.NumParameters =
+                static_cast<UINT>(std::size(rootParameters));
+            rootDesc.pParameters = rootParameters;
+            rootDesc.Flags =
+                D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+            Microsoft::WRL::ComPtr<ID3DBlob> signature;
+            Microsoft::WRL::ComPtr<ID3DBlob> error;
+            HRESULT hr = D3D12SerializeRootSignature(
+                &rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &signature,
+                &error);
+
+            if (FAILED(hr))
+            {
+                const char* message = error
+                    ? static_cast<const char*>(error->GetBufferPointer())
+                    : "Failed to serialize DX12 clustered forward root signature.";
+                throw std::runtime_error(message);
+            }
+
+            Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+            throwIfFailed(
+                m_device->CreateRootSignature(
+                    0,
+                    signature->GetBufferPointer(),
+                    signature->GetBufferSize(),
+                    IID_PPV_ARGS(&rootSignature)),
+                "Failed to create DX12 clustered forward root signature.");
+
+            return rootSignature;
+        }
+
         if (layout != PipelineBindingLayoutKind::ForwardBindless)
         {
             throw std::runtime_error(
                 "Unsupported DX12 pipeline binding layout.");
         }
 
-        D3D12_ROOT_PARAMETER rootParameters[6]{};
+        D3D12_ROOT_PARAMETER rootParameters[10]{};
 
         rootParameters[0].ParameterType =
             D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -609,6 +858,66 @@ namespace ic
         rootParameters[5].DescriptorTable.pDescriptorRanges =
             &bindlessSamplerRange;
         rootParameters[5].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_DESCRIPTOR_RANGE irradianceRange{};
+        irradianceRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        irradianceRange.NumDescriptors = 1;
+        irradianceRange.BaseShaderRegister = 0;
+        irradianceRange.RegisterSpace = 1;
+        irradianceRange.OffsetInDescriptorsFromTableStart = 0;
+
+        rootParameters[6].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParameters[6].DescriptorTable.NumDescriptorRanges = 1;
+        rootParameters[6].DescriptorTable.pDescriptorRanges =
+            &irradianceRange;
+        rootParameters[6].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_DESCRIPTOR_RANGE prefilteredRange{};
+        prefilteredRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        prefilteredRange.NumDescriptors = 1;
+        prefilteredRange.BaseShaderRegister = 1;
+        prefilteredRange.RegisterSpace = 1;
+        prefilteredRange.OffsetInDescriptorsFromTableStart = 0;
+
+        rootParameters[7].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParameters[7].DescriptorTable.NumDescriptorRanges = 1;
+        rootParameters[7].DescriptorTable.pDescriptorRanges =
+            &prefilteredRange;
+        rootParameters[7].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_DESCRIPTOR_RANGE brdfLutRange{};
+        brdfLutRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        brdfLutRange.NumDescriptors = 1;
+        brdfLutRange.BaseShaderRegister = 2;
+        brdfLutRange.RegisterSpace = 1;
+        brdfLutRange.OffsetInDescriptorsFromTableStart = 0;
+
+        rootParameters[8].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParameters[8].DescriptorTable.NumDescriptorRanges = 1;
+        rootParameters[8].DescriptorTable.pDescriptorRanges =
+            &brdfLutRange;
+        rootParameters[8].ShaderVisibility =
+            D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_DESCRIPTOR_RANGE iblSamplerRange{};
+        iblSamplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+        iblSamplerRange.NumDescriptors = 1;
+        iblSamplerRange.BaseShaderRegister = 0;
+        iblSamplerRange.RegisterSpace = 1;
+        iblSamplerRange.OffsetInDescriptorsFromTableStart = 0;
+
+        rootParameters[9].ParameterType =
+            D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParameters[9].DescriptorTable.NumDescriptorRanges = 1;
+        rootParameters[9].DescriptorTable.pDescriptorRanges =
+            &iblSamplerRange;
+        rootParameters[9].ShaderVisibility =
             D3D12_SHADER_VISIBILITY_PIXEL;
 
         D3D12_ROOT_SIGNATURE_DESC rootDesc{};

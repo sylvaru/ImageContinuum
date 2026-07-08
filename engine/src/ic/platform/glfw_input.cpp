@@ -47,29 +47,59 @@ namespace ic
 		switch (e.type)
 		{
 		case EventType::KeyPressed:
-			onKeyPressed(e.key.key);
+		{
+			const KeyEvent* key = getPayload<KeyEvent>(e);
+			assert(key);
+
+			onKeyPressed(key->key);
 			break;
+		}
 
 		case EventType::KeyReleased:
-			onKeyReleased(e.key.key);
+		{
+			const KeyEvent* key = getPayload<KeyEvent>(e);
+			assert(key);
+
+			onKeyReleased(key->key);
 			break;
+		}
 
 		case EventType::MouseMoved:
-			onMouseMove(e.mouseMove.x, e.mouseMove.y);
+		{
+			const MouseMoveEvent* mouseMove = getPayload<MouseMoveEvent>(e);
+			assert(mouseMove);
+
+			onMouseMove(mouseMove->x, mouseMove->y);
 			break;
+		}
 
 		case EventType::MouseButtonPressed:
-			onMouseButtonPressed(e.mouseButton.button);
+		{
+			const MouseButtonEvent* mouseButton = getPayload<MouseButtonEvent>(e);
+			assert(mouseButton);
+
+			onMouseButtonPressed(mouseButton->button);
 			break;
+		}
 
 		case EventType::MouseButtonReleased:
-			onMouseButtonReleased(e.mouseButton.button);
+		{
+			const MouseButtonEvent* mouseButton = getPayload<MouseButtonEvent>(e);
+			assert(mouseButton);
+
+			onMouseButtonReleased(mouseButton->button);
 			break;
+		}
 
 		case EventType::MouseScrolled:
-			m_scrollX += e.scroll.dx;
-			m_scrollY += e.scroll.dy;
+		{
+			const ScrollEvent* scroll = getPayload<ScrollEvent>(e);
+			assert(scroll);
+
+			m_scrollX += scroll->dx;
+			m_scrollY += scroll->dy;
 			break;
+		}
 
 		default:
 			break;

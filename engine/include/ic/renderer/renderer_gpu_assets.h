@@ -8,9 +8,12 @@
 
 #include "ic/core/asset_manager.h"
 #include "ic/renderer/render_handles.h"
+#include "ic/renderer/render_types.h"
 
 namespace ic
 {
+    inline constexpr uint32_t MaxGpuPointLights = 8;
+
     struct FrameContext;
 
     struct GpuFrameData
@@ -27,6 +30,20 @@ namespace ic
 
         glm::vec3 lightColor = glm::vec3(1.0f);
         float padding0 = 0.0f;
+
+        uint32_t environmentEnabled = 0;
+        uint32_t prefilteredMipCount = 1;
+        float environmentIntensity = 1.0f;
+        float environmentExposure = 1.0f;
+
+        uint32_t pointLightCount = 0;
+        glm::vec3 padding1 = glm::vec3(0.0f);
+
+        glm::vec4 pointLightPositionRange[MaxGpuPointLights] = {};
+        glm::vec4 pointLightColorIntensity[MaxGpuPointLights] = {};
+
+        glm::uvec4 clusterDimensions = glm::uvec4(0);
+        glm::uvec4 clusterConfig = glm::uvec4(0);
     };
 
     struct GpuObjectData
@@ -38,16 +55,27 @@ namespace ic
     struct GpuMaterialData
     {
         glm::vec4 baseColorFactor = glm::vec4(1.0f);
+        glm::vec4 emissiveFactor = glm::vec4(0.0f);
 
-        float metallicFactor = 1.0f;
+        float metallicFactor = 0.0f;
         float roughnessFactor = 1.0f;
         float alphaCutoff = 0.5f;
-        uint32_t flags = 0;
+        float occlusionStrength = 1.0f;
 
+        uint32_t flags = 0;
         uint32_t baseColorTextureIndex = UINT32_MAX;
         uint32_t normalTextureIndex = UINT32_MAX;
         uint32_t metallicRoughnessTextureIndex = UINT32_MAX;
-        uint32_t samplerIndex = UINT32_MAX;
+
+        uint32_t occlusionTextureIndex = UINT32_MAX;
+        uint32_t emissiveTextureIndex = UINT32_MAX;
+        uint32_t baseColorSamplerIndex = UINT32_MAX;
+        uint32_t normalSamplerIndex = UINT32_MAX;
+
+        uint32_t metallicRoughnessSamplerIndex = UINT32_MAX;
+        uint32_t occlusionSamplerIndex = UINT32_MAX;
+        uint32_t emissiveSamplerIndex = UINT32_MAX;
+        uint32_t padding0 = 0;
     };
 
     GpuMaterialData makeGpuMaterialData(const MaterialAsset& src);

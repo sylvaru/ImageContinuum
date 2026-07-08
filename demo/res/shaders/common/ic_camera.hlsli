@@ -1,6 +1,8 @@
 #ifndef IC_CAMERA_HLSLI
 #define IC_CAMERA_HLSLI
 
+static const uint IC_MAX_POINT_LIGHTS = 8;
+
 struct FrameConstants
 {
     float4x4 view;
@@ -15,6 +17,20 @@ struct FrameConstants
 
     float3 lightColor;
     float padding0;
+
+    uint environmentEnabled;
+    uint prefilteredMipCount;
+    float environmentIntensity;
+    float environmentExposure;
+
+    uint pointLightCount;
+    float3 padding1;
+
+    float4 pointLightPositionRange[IC_MAX_POINT_LIGHTS];
+    float4 pointLightColorIntensity[IC_MAX_POINT_LIGHTS];
+
+    uint4 clusterDimensions;
+    uint4 clusterConfig;
 };
 
 ConstantBuffer<FrameConstants> gFrame : register(b0, space0);

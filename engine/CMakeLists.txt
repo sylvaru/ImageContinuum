@@ -43,6 +43,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/path_tracing/path_trace_scene_builder.h"
     "include/ic/renderer/render_world.h"
     "include/ic/renderer/renderer_gpu_assets.h"
+    "include/ic/renderer/ibl_baker.h"
      
     "include/ic/renderer/vulkan_backend/vulkan_backend.h" 
     
@@ -105,6 +106,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/renderer.h"
     "src/ic/renderer/renderer.cpp" 
     "src/ic/renderer/pipeline_library.cpp"
+    "src/ic/renderer/ibl_baker.cpp"
     "src/ic/renderer/path_tracing/path_trace_scene_builder.cpp"
     "src/ic/renderer/renderer_gpu_assets.cpp"
     "include/ic/renderer/frame_graph/frame_graph_arena.h"
@@ -151,7 +153,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/scene/scene_transform_system.cpp"
     "src/ic/scene/scene.cpp"
     "src/ic/scene/scene_camera_controller_system.cpp"
-     "include/ic/renderer/renderer_path/path_tracer.h")
+     "include/ic/renderer/renderer_path/path_tracer.h" "include/ic/renderer/renderer_path/clustered_forward.h")
 
     if (WIN32)
     target_sources(ImageContinuumEngine PRIVATE

@@ -1,6 +1,10 @@
 #pragma once
 
 //#include "ic/rendering/renderer_defs.h"
+#include <span>
+#include <vector>
+
+#include "ibl_baker.h"
 #include "render_handles.h"
 
 namespace ic 
@@ -19,7 +23,7 @@ namespace ic
     public:
         virtual ~RendererBackend() = default;
 
-        virtual void initialize(
+        virtual void init(
             const RendererSpecification& spec,
             const PipelineLibrary& pipelineLibrary,
             Window& window,
@@ -31,6 +35,27 @@ namespace ic
             const CompiledGraphPlan& plan,
             const FrameContext& frame,
             const SceneRenderView& scene) = 0;
+
+        //[[nodiscard]] virtual SwapchainInfo swapchainInfo() const = 0;
+
+        virtual std::vector<IBLBakeResult> executeIBLBakeRequests(
+            std::span<const IBLBakeRequest> requests,
+            const FrameContext&)
+        {
+            std::vector<IBLBakeResult> results;
+            results.reserve(requests.size());
+            for (const IBLBakeRequest& request : requests)
+            {
+                results.push_back(
+                    IBLBakeResult{
+                        .requestId = request.requestId,
+                        .handle = request.handle,
+                        .success = false,
+                        .error = "IBL baking is not implemented by this backend" });
+            }
+
+            return results;
+        }
 
         virtual bool beginDebugGuiFrame()
         {
@@ -50,23 +75,13 @@ namespace ic
         {
         }
 
-        // Opaque backend management methods acting entirely on handles
-        //virtual void createBuffer(
-        //    BufferHandle,
-        //    const BufferDesc&) = 0;
+        virtual bool clusteredForwardHeatmapEnabled() const
+        {
+            return false;
+        }
 
-        //virtual void createTexture(
-        //    TextureHandle,
-        //    const TextureDesc&) = 0;
-
-        //virtual void createPipeline(
-        //    PipelineHandle,
-        //    const PipelineDesc&) = 0;
+        virtual void setClusteredForwardHeatmapEnabled(bool)
+        {
+        }
     };
-
-    // Backend should eventually know almost nothing about how dependencies were generated
-    //for (GraphNodeId nodeId : plan.executionOrder)
-    //{
-    //    executeNode(nodeId);
-    //}
 }

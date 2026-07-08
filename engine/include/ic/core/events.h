@@ -1,6 +1,11 @@
 // ic/interface/events.h
 #pragma once
+
 #include "ic/common/ic_key_codes.h"
+
+#include <cassert>
+#include <cstdint>
+#include <variant>
 
 namespace ic
 {
@@ -46,48 +51,51 @@ namespace ic
     constexpr size_t kEventChannelCount =
         static_cast<size_t>(EventChannel::Count);
 
+    struct KeyEvent
+    {
+        IcKey key{};
+    };
+
+    struct MouseButtonEvent
+    {
+        MouseButton button{};
+    };
+
+    struct MouseMoveEvent
+    {
+        double x = 0.0;
+        double y = 0.0;
+    };
+
+    struct ScrollEvent
+    {
+        double dx = 0.0;
+        double dy = 0.0;
+    };
+
+    struct ResizeEvent
+    {
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+
+    using EventPayload = std::variant<
+        std::monostate,
+        KeyEvent,
+        MouseMoveEvent,
+        MouseButtonEvent,
+        ScrollEvent,
+        ResizeEvent>;
+
     struct Event
     {
         EventType type = EventType::None;
-
-        union
-        {
-            struct
-            {
-                IcKey key;
-            } key;
-
-            struct
-            {
-                MouseButton button;
-            } mouseButton;
-
-            struct
-            {
-                double x;
-                double y;
-            } mouseMove;
-
-            struct
-            {
-                double dx;
-                double dy;
-            } scroll;
-
-            struct
-            {
-                uint32_t width;
-                uint32_t height;
-            } resize;
-        };
-
+        EventPayload payload = std::monostate{};
     };
 
-
-    constexpr EventChannel
-        channelForEvent(const EventType t)
+    [[nodiscard]] constexpr EventChannel channelForEvent(EventType type)
     {
-        switch (t)
+        switch (type)
         {
         case EventType::KeyPressed:
         case EventType::KeyReleased:
@@ -101,103 +109,138 @@ namespace ic
         case EventType::WindowClose:
             return EventChannel::Window;
 
+        case EventType::ShaderReloaded:
+        case EventType::SwapchainRecreated:
+            return EventChannel::Renderer;
+
+        case EventType::AssetLoaded:
+        case EventType::AssetUnloaded:
+            return EventChannel::Asset;
+
+        case EventType::PhysicsBodyCreated:
+        case EventType::PhysicsBodyDestroyed:
+            return EventChannel::Physics;
+
+        case EventType::None:
         default:
             return EventChannel::System;
         }
     }
 
-    constexpr bool isInputEvent(EventType t)
+    [[nodiscard]] constexpr bool isInputEvent(EventType type)
     {
-        return channelForEvent(t) == EventChannel::Input;
+        return channelForEvent(type) == EventChannel::Input;
     }
 
-    constexpr bool isWindowEvent(EventType type)
+    [[nodiscard]] constexpr bool isWindowEvent(EventType type)
     {
-        switch (type)
-        {
-        case EventType::WindowResize:
-        case EventType::WindowClose:
-            return true;
+        return channelForEvent(type) == EventChannel::Window;
+    }
 
-        default:
-            return false;
-        }
+    template <typename T>
+    [[nodiscard]] constexpr bool hasPayload(const Event& event)
+    {
+        return std::holds_alternative<T>(event.payload);
+    }
+
+    template <typename T>
+    [[nodiscard]] constexpr const T* getPayload(const Event& event)
+    {
+        return std::get_if<T>(&event.payload);
+    }
+
+    template <typename T>
+    [[nodiscard]] constexpr T* getPayload(Event& event)
+    {
+        return std::get_if<T>(&event.payload);
     }
 
     [[nodiscard]] constexpr Event makeKeyPressed(IcKey key)
     {
-        Event e{};
-        e.type = EventType::KeyPressed;
-        e.key.key = key;
-        return e;
+        return Event{
+            .type = EventType::KeyPressed,
+            .payload = KeyEvent{
+                .key = key
+            }
+        };
     }
 
     [[nodiscard]] constexpr Event makeKeyReleased(IcKey key)
     {
-        Event e{};
-        e.type = EventType::KeyReleased;
-        e.key.key = key;
-        return e;
+        return Event{
+            .type = EventType::KeyReleased,
+            .payload = KeyEvent{
+                .key = key
+            }
+        };
     }
 
     [[nodiscard]] constexpr Event makeMouseMoved(
         double x,
         double y)
     {
-        Event e{};
-        e.type = EventType::MouseMoved;
-        e.mouseMove.x = x;
-        e.mouseMove.y = y;
-        return e;
+        return Event{
+            .type = EventType::MouseMoved,
+            .payload = MouseMoveEvent{
+                .x = x,
+                .y = y
+            }
+        };
     }
 
     [[nodiscard]] constexpr Event makeMouseScrolled(
         double dx,
         double dy)
     {
-        Event e{};
-        e.type = EventType::MouseScrolled;
-        e.scroll.dx = dx;
-        e.scroll.dy = dy;
-        return e;
+        return Event{
+            .type = EventType::MouseScrolled,
+            .payload = ScrollEvent{
+                .dx = dx,
+                .dy = dy
+            }
+        };
     }
 
     [[nodiscard]] constexpr Event makeMouseButtonPressed(
         MouseButton button)
     {
-        Event e{};
-        e.type = EventType::MouseButtonPressed;
-        e.mouseButton.button = button;
-        return e;
+        return Event{
+            .type = EventType::MouseButtonPressed,
+            .payload = MouseButtonEvent{
+                .button = button
+            }
+        };
     }
 
     [[nodiscard]] constexpr Event makeMouseButtonReleased(
         MouseButton button)
     {
-        Event e{};
-        e.type = EventType::MouseButtonReleased;
-        e.mouseButton.button = button;
-        return e;
+        return Event{
+            .type = EventType::MouseButtonReleased,
+            .payload = MouseButtonEvent{
+                .button = button
+            }
+        };
     }
 
     [[nodiscard]] constexpr Event makeWindowClose()
     {
-        Event e{};
-        e.type = EventType::WindowClose;
-        return e;
+        return Event{
+            .type = EventType::WindowClose,
+            .payload = std::monostate{}
+        };
     }
 
     [[nodiscard]] constexpr Event makeWindowResize(
         uint32_t width,
         uint32_t height)
     {
-        Event e{};
-        e.type = EventType::WindowResize;
-        e.resize.width = width;
-        e.resize.height = height;
-        return e;
+        return Event{
+            .type = EventType::WindowResize,
+            .payload = ResizeEvent{
+                .width = width,
+                .height = height
+            }
+        };
     }
-   
 }
-
-

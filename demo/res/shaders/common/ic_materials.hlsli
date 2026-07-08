@@ -12,16 +12,27 @@ struct ObjectData
 struct MaterialData
 {
     float4 baseColorFactor;
+    float4 emissiveFactor;
 
     float metallicFactor;
     float roughnessFactor;
     float alphaCutoff;
-    uint flags;
+    float occlusionStrength;
 
+    uint flags;
     uint baseColorTextureIndex;
     uint normalTextureIndex;
     uint metallicRoughnessTextureIndex;
-    uint samplerIndex;
+
+    uint occlusionTextureIndex;
+    uint emissiveTextureIndex;
+    uint baseColorSamplerIndex;
+    uint normalSamplerIndex;
+
+    uint metallicRoughnessSamplerIndex;
+    uint occlusionSamplerIndex;
+    uint emissiveSamplerIndex;
+    uint padding0;
 };
 
 struct DrawConstants

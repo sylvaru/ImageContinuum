@@ -27,7 +27,7 @@ namespace ic
 	class DX12Backend : public RendererBackend
 	{
 	public:
-        void initialize(
+        void init(
             const RendererSpecification& spec,
             const PipelineLibrary& pipelineLibrary,
             Window& window,
@@ -40,10 +40,16 @@ namespace ic
             const FrameContext& ctx,
             const SceneRenderView& scene) override;
 
+        std::vector<IBLBakeResult> executeIBLBakeRequests(
+            std::span<const IBLBakeRequest> requests,
+            const FrameContext& ctx) override;
+
         bool beginDebugGuiFrame() override;
         void endDebugGuiFrame() override;
         bool vsyncEnabled() const override;
         void setVsyncEnabled(bool enabled) override;
+        bool clusteredForwardHeatmapEnabled() const override;
+        void setClusteredForwardHeatmapEnabled(bool enabled) override;
 
         DX12ResourceAllocator& resourceAllocator()
         {
@@ -91,17 +97,36 @@ namespace ic
             DX12DescriptorAllocation descriptor;
         };
 
+        struct GraphResourceEntry
+        {
+            GraphResourceType type = GraphResourceType::Texture;
+            ResourceOwnership ownership = ResourceOwnership::Transient;
+            ImportedResource imported = ImportedResource::None;
+            DX12Texture texture;
+            DX12Buffer buffer;
+            DX12DescriptorAllocation rtv;
+            DX12DescriptorAllocation dsv;
+            DX12DescriptorAllocation srvUav;
+            D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t mipLevels = 1;
+            uint32_t arrayLayers = 1;
+        };
+
         struct FrameSceneResources
         {
             DX12Buffer frameConstants;
             DX12Buffer objects;
             DX12Buffer materials;
+            DX12Buffer visibleLights;
 
             DX12DescriptorAllocation objectSrv;
             DX12DescriptorAllocation materialSrv;
 
             uint32_t objectCapacity = 0;
             uint32_t materialCapacity = 0;
+            uint32_t visibleLightCapacity = 0;
         };
 
         struct DrawItem
@@ -151,9 +176,12 @@ namespace ic
             uint32_t sceneMaterialCount = 0;
             uint32_t sceneTriangleCount = 0;
             uint32_t sceneBvhNodeCount = 0;
+            uint32_t firstEmissiveTriangleIndex = UINT32_MAX;
             uint32_t accumulatedSampleCount = 0;
             uint64_t sceneVersion = UINT64_MAX;
             uint64_t environmentVersion = UINT64_MAX;
+            uint64_t lastSceneBuildFrame = UINT64_MAX;
+            bool sceneHadPendingModels = false;
             float tonemapExposure = 1.0f;
             glm::mat4 previousView = glm::mat4(1.0f);
             glm::mat4 previousProjection = glm::mat4(1.0f);
@@ -165,13 +193,48 @@ namespace ic
         {
             AssetHandle source = {};
             DX12Texture cubemap;
+            DX12Texture irradiance;
+            DX12Texture prefiltered;
+            DX12Texture brdfLut;
             DX12DescriptorAllocation cubemapSrv;
             DX12DescriptorAllocation cubemapUav;
+            DX12DescriptorAllocation irradianceSrv;
+            DX12DescriptorAllocation irradianceUav;
+            DX12DescriptorAllocation prefilteredSrv;
+            std::vector<DX12DescriptorAllocation> prefilteredUavs;
+            DX12DescriptorAllocation brdfLutSrv;
+            DX12DescriptorAllocation brdfLutUav;
             DX12DescriptorAllocation sampler;
             std::vector<DX12Buffer> skyboxConstants;
             D3D12_RESOURCE_STATES cubemapState = D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES irradianceState = D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES prefilteredState = D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES brdfLutState = D3D12_RESOURCE_STATE_COMMON;
             uint32_t cubemapSize = 512;
+            uint32_t irradianceSize = 64;
+            uint32_t prefilterSize = 256;
+            uint32_t prefilterMipCount = 1;
+            uint32_t brdfLutSize = 512;
             bool converted = false;
+            bool iblBaked = false;
+        };
+
+        struct ClusteredForwardResources
+        {
+            DX12Buffer clusterBounds;
+            DX12Buffer clusterLightGrid;
+            DX12Buffer clusterLightIndices;
+            DX12Buffer clusterLightCounter;
+            D3D12_RESOURCE_STATES boundsState = D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES gridState = D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES indicesState = D3D12_RESOURCE_STATE_COMMON;
+            D3D12_RESOURCE_STATES counterState = D3D12_RESOURCE_STATE_COMMON;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t clusterCountX = 0;
+            uint32_t clusterCountY = 0;
+            uint32_t clusterCountZ = 0;
+            uint32_t clusterCount = 0;
         };
 
         void executeGraph(
@@ -277,7 +340,28 @@ namespace ic
             ID3D12GraphicsCommandList4* cmd);
         void ensureDepthTarget();
         void destroyDepthTarget();
+        void materializeGraphResources(
+            const CompiledGraphPlan& plan,
+            ID3D12Resource* swapchainImage);
+        void destroyGraphResources();
+        GraphResourceEntry* graphResource(GraphResourceId id);
+        const GraphResourceEntry* graphResource(GraphResourceId id) const;
+        GraphResourceId findGraphAttachment(
+            const CompiledGraphPlan& plan,
+            GraphNodeId node,
+            ResourceUsage usage) const;
         void ensureComputeTestBuffer();
+        void ensureClusteredForwardResources();
+        bool bindClusteredForwardCompute(
+            const DX12ComputePipeline& pipeline,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd);
+        void bindClusteredForwardGraphics(
+            const DX12GraphicsPipeline& pipeline,
+            const FrameContext& ctx,
+            ID3D12GraphicsCommandList4* cmd);
+        void destroyClusteredForwardResources();
 
         UploadedModel* requestModel(
             AssetHandle handle,
@@ -337,6 +421,7 @@ namespace ic
         DX12Buffer m_computeTestBuffer;
         D3D12_RESOURCE_STATES m_computeTestBufferState =
             D3D12_RESOURCE_STATE_COMMON;
+        ClusteredForwardResources m_clusteredForwardResources;
         PathTraceResources m_pathTraceResources;
         EnvironmentResources m_environmentResources;
 
@@ -346,6 +431,8 @@ namespace ic
         std::unordered_map<AssetHandle, UploadedModel, AssetHandleHash> m_uploadedModels;
         std::unordered_map<uint64_t, UploadedTexture> m_uploadedTextures;
         std::unordered_map<uint64_t, UploadedSampler> m_uploadedSamplers;
+        std::unordered_map<GraphResourceId, GraphResourceEntry>
+            m_graphResources;
         std::vector<FrameSceneResources> m_sceneFrameResources;
         PreparedSceneFrame m_preparedScene;
 
@@ -357,6 +444,7 @@ namespace ic
         std::unordered_map<ID3D12Resource*, ResourceState> m_resourceStates;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;
+        bool m_clusteredForwardHeatmapEnabled = false;
         std::string m_imguiIniPath;
 	};
 }

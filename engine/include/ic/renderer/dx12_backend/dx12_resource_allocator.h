@@ -16,6 +16,10 @@ namespace ic
     {
         Microsoft::WRL::ComPtr<ID3D12Resource> resource;
         uint64_t size = 0;
+        BufferUsageFlags usage = BufferUsageFlags::None;
+        ResourceMemoryUsage memoryUsage = ResourceMemoryUsage::GpuOnly;
+        bool mappedAtCreation = false;
+
         D3D12_RESOURCE_STATES initialState = D3D12_RESOURCE_STATE_COMMON;
         D3D12_GPU_VIRTUAL_ADDRESS gpuAddress = 0;
         void* mapped = nullptr;
@@ -26,21 +30,15 @@ namespace ic
 
         DX12Buffer(DX12Buffer&& other) noexcept
         {
-            *this = std::move(other);
+            moveFrom(other);
         }
 
         DX12Buffer& operator=(DX12Buffer&& other) noexcept
         {
             if (this != &other)
             {
-                resource = std::move(other.resource);
-                size = std::exchange(other.size, 0);
-                initialState =
-                    std::exchange(
-                        other.initialState,
-                        D3D12_RESOURCE_STATE_COMMON);
-                gpuAddress = std::exchange(other.gpuAddress, 0);
-                mapped = std::exchange(other.mapped, nullptr);
+                assert(resource == nullptr);
+                moveFrom(other);
             }
 
             return *this;
@@ -49,6 +47,25 @@ namespace ic
         explicit operator bool() const
         {
             return resource.Get() != nullptr;
+        }
+
+        void reset() noexcept
+        {
+            resource = nullptr;
+            size = 0;
+            initialState = D3D12_RESOURCE_STATE_COMMON;
+            gpuAddress = 0;
+            mapped = nullptr;
+        }
+
+    private:
+        void moveFrom(DX12Buffer& other) noexcept
+        {
+            resource = std::exchange(other.resource, nullptr);
+            size = std::exchange(other.size, 0);
+            initialState = std::exchange(other.initialState, D3D12_RESOURCE_STATE_COMMON);
+            gpuAddress = std::exchange(other.gpuAddress, 0);
+            mapped = std::exchange(other.mapped, nullptr);
         }
     };
 
@@ -64,19 +81,15 @@ namespace ic
 
         DX12Texture(DX12Texture&& other) noexcept
         {
-            *this = std::move(other);
+            moveFrom(other);
         }
 
         DX12Texture& operator=(DX12Texture&& other) noexcept
         {
             if (this != &other)
             {
-                resource = std::move(other.resource);
-                initialState =
-                    std::exchange(
-                        other.initialState,
-                        D3D12_RESOURCE_STATE_COMMON);
-                desc = std::exchange(other.desc, {});
+                assert(resource == nullptr);
+                moveFrom(other);
             }
 
             return *this;
@@ -85,6 +98,20 @@ namespace ic
         explicit operator bool() const
         {
             return resource.Get() != nullptr;
+        }
+
+        void reset() noexcept
+        {
+            resource = nullptr;
+            initialState = D3D12_RESOURCE_STATE_COMMON;
+            desc = {};
+        }
+    private:
+        void moveFrom(DX12Texture& other) noexcept
+        {
+            resource = std::exchange(other.resource, nullptr);
+            initialState = std::exchange(other.initialState, D3D12_RESOURCE_STATE_COMMON);
+            desc = std::exchange(other.desc, {});
         }
     };
 

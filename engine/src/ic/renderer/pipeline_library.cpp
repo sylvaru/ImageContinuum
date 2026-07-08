@@ -380,6 +380,8 @@ namespace ic
             return PipelineBindingLayoutKind::EnvironmentConvert;
         if (value == "Skybox")
             return PipelineBindingLayoutKind::Skybox;
+        if (value == "ClusteredForward")
+            return PipelineBindingLayoutKind::ClusteredForward;
         if (value == "PathTrace")
             return PipelineBindingLayoutKind::PathTrace;
         if (value == "PathTraceTonemap")

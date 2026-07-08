@@ -36,7 +36,6 @@ namespace ic
             f.channels[i].drain(
                 [this, ch](Event& e)
                 {
-                    (void)e;
                     m_app.dispatchEvent(ch, e);
                 });
         }

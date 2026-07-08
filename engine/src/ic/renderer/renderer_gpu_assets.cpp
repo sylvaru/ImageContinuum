@@ -17,9 +17,12 @@ namespace ic
     {
         GpuMaterialData dst{};
         dst.baseColorFactor = src.baseColorFactor;
+        dst.emissiveFactor =
+            glm::vec4(src.emissiveFactor * src.emissiveStrength, 0.0f);
         dst.metallicFactor = src.metallicFactor;
         dst.roughnessFactor = src.roughnessFactor;
         dst.alphaCutoff = src.alphaCutoff;
+        dst.occlusionStrength = src.occlusionTexture.strength;
         dst.flags =
             (src.doubleSided ? MaterialFlagDoubleSided : 0u) |
             (src.alphaBlend ? MaterialFlagAlphaBlend : 0u) |

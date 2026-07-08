@@ -15,7 +15,10 @@ StructuredBuffer<PathTraceTriangle> gSceneTriangles : register(t4, space0);
 StructuredBuffer<PathTraceBVHNode> gSceneBvhNodes : register(t5, space0);
 TextureCube<float4> gEnvironmentTexture : register(t6, space0);
 SamplerState gEnvironmentSampler : register(s7, space0);
+Texture2D<float4> gBindlessTextures[] : register(t4098, space0);
+SamplerState gBindlessSamplers[] : register(s256, space0);
 
+static const uint IC_INVALID_BINDLESS_INDEX = 0xffffffffu;
 static const uint MaterialDiffuse = 0;
 static const uint MaterialEmissive = 1;
 
@@ -26,8 +29,25 @@ struct Hit
     float3 normal;
     float3 albedo;
     float3 emission;
+    float metallic;
+    float roughness;
+    float ao;
     uint materialType;
 };
+
+float4 sampleMaterialTexture(uint textureIndex, uint samplerIndex, float2 uv, float4 fallbackValue)
+{
+    if (textureIndex != IC_INVALID_BINDLESS_INDEX &&
+        samplerIndex != IC_INVALID_BINDLESS_INDEX)
+    {
+        return gBindlessTextures[NonUniformResourceIndex(textureIndex)].SampleLevel(
+            gBindlessSamplers[NonUniformResourceIndex(samplerIndex)],
+            uv,
+            0.0f);
+    }
+
+    return fallbackValue;
+}
 
 bool intersectPlane(
     Ray ray,
@@ -67,6 +87,9 @@ bool intersectPlane(
     bestHit.normal = denom < 0.0f ? normal : -normal;
     bestHit.albedo = albedo;
     bestHit.emission = emission;
+    bestHit.metallic = 0.0f;
+    bestHit.roughness = 1.0f;
+    bestHit.ao = 1.0f;
     bestHit.materialType = materialType;
     return true;
 }
@@ -127,6 +150,9 @@ bool intersectBox(
     bestHit.normal = normal;
     bestHit.albedo = albedo;
     bestHit.emission = 0.0f;
+    bestHit.metallic = 0.0f;
+    bestHit.roughness = 1.0f;
+    bestHit.ao = 1.0f;
     bestHit.materialType = MaterialDiffuse;
     return true;
 }
@@ -139,6 +165,9 @@ Hit makeMiss()
     hit.normal = 0.0f;
     hit.albedo = 0.0f;
     hit.emission = 0.0f;
+    hit.metallic = 0.0f;
+    hit.roughness = 1.0f;
+    hit.ao = 1.0f;
     hit.materialType = MaterialDiffuse;
     return hit;
 }
@@ -224,25 +253,91 @@ bool intersectSceneTriangle(
     {
         normal = safeNormalize(cross(e1, e2));
     }
-    if (dot(normal, ray.direction) > 0.0f)
-    {
-        normal = -normal;
-    }
-
     PathTraceMaterial material;
     material.baseColor = float4(0.8f, 0.8f, 0.8f, 1.0f);
     material.emissive = 0.0f;
     material.materialType = MaterialDiffuse;
+    material.roughnessFactor = 1.0f;
+    material.metallicFactor = 0.0f;
+    material.occlusionStrength = 1.0f;
     if (tri.materialIndex < gConstants.sceneMaterialCount)
     {
         material = gSceneMaterials[tri.materialIndex];
     }
 
+    const float w = 1.0f - u - v;
+    const float2 uv0 =
+        v0.texCoord.xy * w +
+        v1.texCoord.xy * u +
+        v2.texCoord.xy * v;
+    const float3 tangentSample =
+        v0.tangent.xyz * w +
+        v1.tangent.xyz * u +
+        v2.tangent.xyz * v;
+    const float tangentSign =
+        v0.tangent.w * w +
+        v1.tangent.w * u +
+        v2.tangent.w * v;
+
+    const float4 baseColorSample =
+        sampleMaterialTexture(
+            material.baseColorTextureIndex,
+            material.baseColorSamplerIndex,
+            uv0,
+            float4(1.0f, 1.0f, 1.0f, 1.0f));
+    const float4 normalSample =
+        sampleMaterialTexture(
+            material.normalTextureIndex,
+            material.normalSamplerIndex,
+            uv0,
+            float4(0.5f, 0.5f, 1.0f, 1.0f));
+    const float4 metallicRoughnessSample =
+        sampleMaterialTexture(
+            material.metallicRoughnessTextureIndex,
+            material.metallicRoughnessSamplerIndex,
+            uv0,
+            float4(1.0f, 1.0f, 0.0f, 1.0f));
+    const float4 occlusionSample =
+        sampleMaterialTexture(
+            material.occlusionTextureIndex,
+            material.occlusionSamplerIndex,
+            uv0,
+            float4(1.0f, 1.0f, 1.0f, 1.0f));
+    const float4 emissiveSample =
+        sampleMaterialTexture(
+            material.emissiveTextureIndex,
+            material.emissiveSamplerIndex,
+            uv0,
+            float4(1.0f, 1.0f, 1.0f, 1.0f));
+
+    const float3 tangent =
+        safeNormalize(tangentSample - normal * dot(tangentSample, normal));
+    const float3 bitangent =
+        safeNormalize(cross(normal, tangent) * (tangentSign < 0.0f ? -1.0f : 1.0f));
+    const float3 normalMap = normalSample.xyz * 2.0f - 1.0f;
+    normal =
+        safeNormalize(
+            tangent * normalMap.x +
+            bitangent * normalMap.y +
+            normal * normalMap.z);
+    if (dot(normal, ray.direction) > 0.0f)
+    {
+        normal = -normal;
+    }
+
     bestHit.t = t;
     bestHit.position = ray.origin + ray.direction * t;
     bestHit.normal = normal;
-    bestHit.albedo = max(material.baseColor.rgb, 0.0f);
-    bestHit.emission = max(material.emissive.rgb, 0.0f);
+    bestHit.albedo =
+        max(material.baseColor.rgb * baseColorSample.rgb, 0.0f);
+    bestHit.emission =
+        max(material.emissive.rgb * emissiveSample.rgb, 0.0f);
+    bestHit.metallic =
+        saturate(material.metallicFactor * metallicRoughnessSample.b);
+    bestHit.roughness =
+        clamp(material.roughnessFactor * metallicRoughnessSample.g, 0.04f, 1.0f);
+    bestHit.ao =
+        lerp(1.0f, occlusionSample.r, saturate(material.occlusionStrength));
     bestHit.materialType =
         dot(bestHit.emission, bestHit.emission) > 0.0f
             ? MaterialEmissive
@@ -363,36 +458,26 @@ bool visibleToLight(float3 origin, float3 lightPoint)
 
 float3 sampleSceneDirectLight(Hit hit, inout uint rngState)
 {
-    uint lightTriangleIndex = 0xffffffffu;
-    PathTraceMaterial lightMaterial;
-    lightMaterial.emissive = 0.0f;
-
-    for (uint triangleIndex = 0;
-         triangleIndex < gConstants.sceneTriangleCount;
-         ++triangleIndex)
-    {
-        const PathTraceTriangle tri = gSceneTriangles[triangleIndex];
-        if (tri.materialIndex >= gConstants.sceneMaterialCount)
-        {
-            continue;
-        }
-
-        const PathTraceMaterial material =
-            gSceneMaterials[tri.materialIndex];
-        if (dot(material.emissive.rgb, material.emissive.rgb) > 0.0f)
-        {
-            lightTriangleIndex = triangleIndex;
-            lightMaterial = material;
-            break;
-        }
-    }
-
-    if (lightTriangleIndex == 0xffffffffu)
+    const uint lightTriangleIndex = gConstants.sceneEmissiveTriangleIndex;
+    if (lightTriangleIndex == IC_INVALID_BINDLESS_INDEX ||
+        lightTriangleIndex >= gConstants.sceneTriangleCount)
     {
         return 0.0f;
     }
 
     const PathTraceTriangle tri = gSceneTriangles[lightTriangleIndex];
+    if (tri.materialIndex >= gConstants.sceneMaterialCount)
+    {
+        return 0.0f;
+    }
+
+    const PathTraceMaterial lightMaterial =
+        gSceneMaterials[tri.materialIndex];
+    if (dot(lightMaterial.emissive.rgb, lightMaterial.emissive.rgb) <= 0.0f)
+    {
+        return 0.0f;
+    }
+
     const PathTraceVertex v0 = gSceneVertices[tri.i0];
     const PathTraceVertex v1 = gSceneVertices[tri.i1];
     const PathTraceVertex v2 = gSceneVertices[tri.i2];
@@ -430,15 +515,59 @@ float3 sampleSceneDirectLight(Hit hit, inout uint rngState)
         return 0.0f;
     }
 
-    const float3 brdf = hit.albedo * 0.31830988618f;
+    const float3 brdf = hit.albedo * hit.ao * (1.0f - hit.metallic) * 0.31830988618f;
     return brdf * lightMaterial.emissive.rgb * nDotL * lightDot * area / distanceSq;
 }
 
 float3 sampleDirectLight(Hit hit, inout uint rngState)
 {
+    float3 radiance = 0.0f;
+
     if (gConstants.useSceneGeometry != 0u)
     {
-        return sampleSceneDirectLight(hit, rngState);
+        radiance += sampleSceneDirectLight(hit, rngState);
+    }
+
+    const uint pointLightCount =
+        min(gConstants.pointLightCount, IC_MAX_PATH_TRACE_POINT_LIGHTS);
+    if (pointLightCount != 0u)
+    {
+        const uint lightIndex =
+            min((uint)(random01(rngState) * pointLightCount), pointLightCount - 1u);
+        const float4 positionRange =
+            gConstants.pointLightPositionRange[lightIndex];
+        const float4 colorIntensity =
+            gConstants.pointLightColorIntensity[lightIndex];
+
+        const float3 toLight = positionRange.xyz - hit.position;
+        const float distanceSq = max(dot(toLight, toLight), 1.0e-4f);
+        const float distance = sqrt(distanceSq);
+        const float range = max(positionRange.w, 0.001f);
+        const float3 lightDir = toLight / distance;
+        const float rangeAttenuation =
+            saturate(1.0f - (distance / range) * (distance / range));
+        const float attenuation =
+            (rangeAttenuation * rangeAttenuation) / distanceSq;
+        const float nDotL = max(dot(hit.normal, lightDir), 0.0f);
+        if (nDotL > 0.0f &&
+            attenuation > 0.0f &&
+            visibleToLight(hit.position + hit.normal * 0.002f, positionRange.xyz))
+        {
+            const float3 brdf =
+                hit.albedo * hit.ao * (1.0f - hit.metallic) * 0.31830988618f;
+            radiance +=
+                brdf *
+                colorIntensity.rgb *
+                colorIntensity.w *
+                attenuation *
+                nDotL *
+                pointLightCount;
+        }
+    }
+
+    if (gConstants.useSceneGeometry != 0u)
+    {
+        return radiance;
     }
 
     const float2 xi = random02(rngState);
@@ -463,8 +592,8 @@ float3 sampleDirectLight(Hit hit, inout uint rngState)
 
     const float area = 0.64f * 0.56f;
     const float3 lightEmission = float3(18.0f, 15.0f, 11.0f);
-    const float3 brdf = hit.albedo * 0.31830988618f;
-    return brdf * lightEmission * nDotL * lightDot * area / distanceSq;
+    const float3 brdf = hit.albedo * hit.ao * (1.0f - hit.metallic) * 0.31830988618f;
+    return radiance + brdf * lightEmission * nDotL * lightDot * area / distanceSq;
 }
 
 float3 clampLuminance(float3 value, float maxLuminance)
@@ -552,10 +681,22 @@ float3 tracePath(Ray ray, inout uint rngState)
         radiance += clampLuminance(
             throughput * sampleDirectLight(hit, rngState),
             bounce == 0u ? 4.0f : 2.0f);
-        throughput *= hit.albedo;
-
         ray.origin = hit.position + hit.normal * 0.002f;
-        ray.direction = cosineHemisphere(hit.normal, rngState);
+        if (hit.metallic > 0.5f)
+        {
+            const float3 reflected = reflect(ray.direction, hit.normal);
+            const float3 roughDirection = cosineHemisphere(hit.normal, rngState);
+            ray.direction =
+                safeNormalize(lerp(reflected, roughDirection, hit.roughness * hit.roughness));
+            throughput *=
+                lerp(float3(0.04f, 0.04f, 0.04f), hit.albedo, hit.metallic) *
+                hit.ao;
+        }
+        else
+        {
+            throughput *= hit.albedo * hit.ao;
+            ray.direction = cosineHemisphere(hit.normal, rngState);
+        }
     }
 
     return radiance;

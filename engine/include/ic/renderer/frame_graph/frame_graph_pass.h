@@ -16,7 +16,9 @@ namespace ic
     {
         None = 0,
         SceneGeometry,
-        Skybox
+        Skybox,
+        TransparentGeometry
+
     };
 
     enum class AttachmentLoadOp : uint8_t

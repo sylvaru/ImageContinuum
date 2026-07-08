@@ -20,6 +20,8 @@ namespace ic
         VkDeviceSize size = 0;
         VkDeviceAddress gpuAddress = 0;
         void* mapped = nullptr;
+        bool persistentlyMapped = false;
+        bool explicitlyMapped = false;
 
         VulkanBuffer() = default;
         VulkanBuffer(const VulkanBuffer&) = delete;
@@ -27,21 +29,17 @@ namespace ic
 
         VulkanBuffer(VulkanBuffer&& other) noexcept
         {
-            *this = std::move(other);
+            moveFrom(other);
         }
 
         VulkanBuffer& operator=(VulkanBuffer&& other) noexcept
         {
             if (this != &other)
             {
-                buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
-                allocation =
-                    std::exchange(other.allocation, VK_NULL_HANDLE);
-                allocationInfo =
-                    std::exchange(other.allocationInfo, {});
-                size = std::exchange(other.size, 0);
-                gpuAddress = std::exchange(other.gpuAddress, 0);
-                mapped = std::exchange(other.mapped, nullptr);
+                assert(buffer == VK_NULL_HANDLE);
+                assert(allocation == VK_NULL_HANDLE);
+
+                moveFrom(other);
             }
 
             return *this;
@@ -50,6 +48,31 @@ namespace ic
         explicit operator bool() const
         {
             return buffer != VK_NULL_HANDLE;
+        }
+
+        void reset() noexcept
+        {
+            buffer = VK_NULL_HANDLE;
+            allocation = VK_NULL_HANDLE;
+            allocationInfo = {};
+            size = 0;
+            gpuAddress = 0;
+            mapped = nullptr;
+            persistentlyMapped = false;
+            explicitlyMapped = false;
+        }
+
+    private:
+        void moveFrom(VulkanBuffer& other) noexcept
+        {
+            buffer = std::exchange(other.buffer, VK_NULL_HANDLE);
+            allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+            allocationInfo = std::exchange(other.allocationInfo, {});
+            size = std::exchange(other.size, 0);
+            gpuAddress = std::exchange(other.gpuAddress, 0);
+            mapped = std::exchange(other.mapped, nullptr);
+            persistentlyMapped = std::exchange(other.persistentlyMapped, false);
+            explicitlyMapped = std::exchange(other.explicitlyMapped, false);
         }
     };
 
@@ -69,22 +92,17 @@ namespace ic
 
         VulkanTexture(VulkanTexture&& other) noexcept
         {
-            *this = std::move(other);
+            moveFrom(other);
         }
 
         VulkanTexture& operator=(VulkanTexture&& other) noexcept
         {
             if (this != &other)
             {
-                image = std::exchange(other.image, VK_NULL_HANDLE);
-                allocation =
-                    std::exchange(other.allocation, VK_NULL_HANDLE);
-                allocationInfo =
-                    std::exchange(other.allocationInfo, {});
-                extent = std::exchange(other.extent, {});
-                format = std::exchange(other.format, VK_FORMAT_UNDEFINED);
-                mipLevels = std::exchange(other.mipLevels, 1);
-                arrayLayers = std::exchange(other.arrayLayers, 1);
+                assert(image == VK_NULL_HANDLE);
+                assert(allocation == VK_NULL_HANDLE);
+
+                moveFrom(other);
             }
 
             return *this;
@@ -93,6 +111,30 @@ namespace ic
         explicit operator bool() const
         {
             return image != VK_NULL_HANDLE;
+        }
+
+
+        void reset() noexcept
+        {
+            image = VK_NULL_HANDLE;
+            allocation = VK_NULL_HANDLE;
+            allocationInfo = {};
+            extent = {};
+            format = VK_FORMAT_UNDEFINED;
+            mipLevels = 1;
+            arrayLayers = 1;
+        }
+    private:
+
+        void moveFrom(VulkanTexture& other) noexcept
+        {
+            image = std::exchange(other.image, VK_NULL_HANDLE);
+            allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
+            allocationInfo = std::exchange(other.allocationInfo, {});
+            extent = std::exchange(other.extent, {});
+            format = std::exchange(other.format, VK_FORMAT_UNDEFINED);
+            mipLevels = std::exchange(other.mipLevels, 1);
+            arrayLayers = std::exchange(other.arrayLayers, 1);
         }
     };
 

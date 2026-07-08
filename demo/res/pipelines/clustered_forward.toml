@@ -1,0 +1,198 @@
+[pipelines.forward_bindless]
+type = "Graphics"
+vertexLayout = "AssetVertex"
+bindingLayout = "ForwardBindless"
+topology = "TriangleList"
+
+[pipelines.forward_bindless.raster]
+cullMode = "None"
+depthClip = true
+
+[pipelines.forward_bindless.depth]
+enabled = true
+write = true
+compare = "LessEqual"
+format = "D32_Float"
+
+[pipelines.forward_bindless.blend]
+enabled = false
+
+[pipelines.forward_bindless.color]
+formats = ["Swapchain"]
+
+[pipelines.forward_bindless.shaders.dx12]
+vertex = "demo/res/compiled_shaders/dx12/forward_bindless.vs.dxil"
+pixel = "demo/res/compiled_shaders/dx12/forward_bindless.ps.dxil"
+
+[pipelines.forward_bindless.shaders.vulkan]
+vertex = "demo/res/compiled_shaders/vulkan/forward_bindless.vert.spv"
+pixel = "demo/res/compiled_shaders/vulkan/forward_bindless.frag.spv"
+
+[pipelines.depth_prepass]
+type = "Graphics"
+vertexLayout = "AssetVertex"
+bindingLayout = "ClusteredForward"
+topology = "TriangleList"
+
+[pipelines.depth_prepass.raster]
+cullMode = "None"
+depthClip = true
+
+[pipelines.depth_prepass.depth]
+enabled = true
+write = true
+compare = "LessEqual"
+format = "D32_Float"
+
+[pipelines.depth_prepass.shaders.dx12]
+vertex = "demo/res/compiled_shaders/dx12/depth_prepass.vs.dxil"
+pixel = "demo/res/compiled_shaders/dx12/depth_prepass.ps.dxil"
+
+[pipelines.depth_prepass.shaders.vulkan]
+vertex = "demo/res/compiled_shaders/vulkan/depth_prepass.vert.spv"
+pixel = "demo/res/compiled_shaders/vulkan/depth_prepass.frag.spv"
+
+[pipelines.equirect_to_cubemap]
+type = "Compute"
+bindingLayout = "EnvironmentConvert"
+
+[pipelines.equirect_to_cubemap.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/equirect_to_cubemap.cs.dxil"
+
+[pipelines.equirect_to_cubemap.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/equirect_to_cubemap.comp.spv"
+
+[pipelines.ibl_irradiance]
+type = "Compute"
+bindingLayout = "EnvironmentConvert"
+
+[pipelines.ibl_irradiance.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/ibl_irradiance.cs.dxil"
+
+[pipelines.ibl_irradiance.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/ibl_irradiance.comp.spv"
+
+[pipelines.ibl_prefilter]
+type = "Compute"
+bindingLayout = "EnvironmentConvert"
+
+[pipelines.ibl_prefilter.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/ibl_prefilter.cs.dxil"
+
+[pipelines.ibl_prefilter.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/ibl_prefilter.comp.spv"
+
+[pipelines.ibl_brdf_lut]
+type = "Compute"
+bindingLayout = "EnvironmentConvert"
+
+[pipelines.ibl_brdf_lut.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/ibl_brdf_lut.cs.dxil"
+
+[pipelines.ibl_brdf_lut.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/ibl_brdf_lut.comp.spv"
+
+[pipelines.skybox]
+type = "Graphics"
+vertexLayout = "Unknown"
+bindingLayout = "Skybox"
+
+[pipelines.skybox.raster]
+cullMode = "None"
+
+[pipelines.skybox.depth]
+enabled = true
+write = false
+compare = "LessEqual"
+format = "D32_Float"
+
+[pipelines.skybox.color]
+formats = ["Swapchain"]
+
+[pipelines.skybox.shaders.dx12]
+vertex = "demo/res/compiled_shaders/dx12/skybox.vs.dxil"
+pixel = "demo/res/compiled_shaders/dx12/skybox.ps.dxil"
+
+[pipelines.skybox.shaders.vulkan]
+vertex = "demo/res/compiled_shaders/vulkan/skybox.vert.spv"
+pixel = "demo/res/compiled_shaders/vulkan/skybox.frag.spv"
+
+[pipelines.visibility_test]
+type = "Compute"
+bindingLayout = "ComputeStorageBuffer"
+
+[pipelines.visibility_test.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/visibility_test.cs.dxil"
+
+[pipelines.visibility_test.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/visibility_test.comp.spv"
+
+[pipelines.independent_compute_test]
+type = "Compute"
+bindingLayout = "ComputeStorageBuffer"
+
+[pipelines.independent_compute_test.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/independent_compute_test.cs.dxil"
+
+[pipelines.independent_compute_test.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/independent_compute_test.comp.spv"
+
+[pipelines.cluster_build]
+type = "Compute"
+bindingLayout = "ClusteredForward"
+
+[pipelines.cluster_build.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/cluster_build.cs.dxil"
+
+[pipelines.cluster_build.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/cluster_build.comp.spv"
+
+[pipelines.reset_cluster_light_counter]
+type = "Compute"
+bindingLayout = "ClusteredForward"
+
+[pipelines.reset_cluster_light_counter.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/reset_cluster_light_counter.cs.dxil"
+
+[pipelines.reset_cluster_light_counter.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/reset_cluster_light_counter.comp.spv"
+
+[pipelines.cluster_light_cull]
+type = "Compute"
+bindingLayout = "ClusteredForward"
+
+[pipelines.cluster_light_cull.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/cluster_light_cull.cs.dxil"
+
+[pipelines.cluster_light_cull.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/cluster_light_cull.comp.spv"
+
+[pipelines.clustered_forward_opaque]
+type = "Graphics"
+vertexLayout = "AssetVertex"
+bindingLayout = "ClusteredForward"
+topology = "TriangleList"
+
+[pipelines.clustered_forward_opaque.raster]
+cullMode = "None"
+depthClip = true
+
+[pipelines.clustered_forward_opaque.depth]
+enabled = true
+write = true
+compare = "LessEqual"
+format = "D32_Float"
+
+[pipelines.clustered_forward_opaque.blend]
+enabled = false
+
+[pipelines.clustered_forward_opaque.color]
+formats = ["Swapchain"]
+
+[pipelines.clustered_forward_opaque.shaders.dx12]
+vertex = "demo/res/compiled_shaders/dx12/clustered_forward_opaque.vs.dxil"
+pixel = "demo/res/compiled_shaders/dx12/clustered_forward_opaque.ps.dxil"
+
+[pipelines.clustered_forward_opaque.shaders.vulkan]
+vertex = "demo/res/compiled_shaders/vulkan/clustered_forward_opaque.vert.spv"
+pixel = "demo/res/compiled_shaders/vulkan/clustered_forward_opaque.frag.spv"

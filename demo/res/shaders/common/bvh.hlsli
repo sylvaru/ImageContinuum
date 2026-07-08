@@ -13,19 +13,33 @@ struct PathTraceVertex
 {
     float4 position;
     float4 normal;
+    float4 tangent;
+    float4 texCoord;
 };
 
 struct PathTraceMaterial
 {
     float4 baseColor;
     float4 emissive;
+
+    float metallicFactor;
+    float roughnessFactor;
+    float occlusionStrength;
+    uint materialType;
+
     uint baseColorTextureIndex;
     uint normalTextureIndex;
-    uint materialType;
-    float roughness;
-    float metallic;
-    float padding;
-    float2 padding1;
+    uint metallicRoughnessTextureIndex;
+    uint occlusionTextureIndex;
+
+    uint emissiveTextureIndex;
+    uint baseColorSamplerIndex;
+    uint normalSamplerIndex;
+    uint metallicRoughnessSamplerIndex;
+
+    uint occlusionSamplerIndex;
+    uint emissiveSamplerIndex;
+    float2 padding0;
 };
 
 struct PathTraceTriangle

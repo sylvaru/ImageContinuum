@@ -9,9 +9,7 @@ namespace ic
     enum class FramePhase
     {
         Input,
-        Simulation,
-        RenderPrep,
-        RenderSubmit
+        Simulation
     };
 
     class FramePipeline

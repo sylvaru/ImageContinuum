@@ -25,22 +25,33 @@ near = 0.1
 far = 1000.0
 
 [entities.fly_camera]
-move_speed = 5.0
+move_speed = 1.0
 fast_move_multiplier = 4.0
-mouse_sensitivity = 0.0025
+mouse_sensitivity = 0.0010
 yaw = 0.0
 pitch = 0.0
 capture_mouse = true
 
+
 [[entities]]
-id = 2
-name = "Cornell Box"
-model = "CornellBox-Original.gltf"
+id = 5
+name = "FPS MAP"
+model = "FPS_MAP/scene.glb"
 
 [entities.transform]
-translation = [0.0, 0.0, 0.0]
+translation = [0.0, -1.02, -0.85]
 rotation = [0.0, 0.0, 0.0, 1.0]
-scale = [1.0, 1.0, 1.0]
+scale = [0.222, 0.222, 0.222]
+
+[[entities]]
+id = 6
+name = "Damaged PBR Helmet"
+model = "DamagedHelmet/glTF/DamagedHelmet.gltf"
+
+[entities.transform]
+translation = [0.0, -0.25, -1.55]
+rotation = [0.0, 0.0, 0.0, 1.0]
+scale = [0.35, 0.35, 0.35]
 
 [[entities]]
 id = 3
@@ -53,3 +64,63 @@ rotation = [-0.4, 0.2, 0.0, 1.0]
 type = "directional"
 color = [1.0, 0.95, 0.85]
 intensity = 4.0
+
+[[entities]]
+id = 10
+name = "Floor Probe Light Warm"
+model = "light_marker_warm.gltf"
+
+[entities.transform]
+translation = [-1.15, 0.85, -1.65]
+scale = [0.12, 0.12, 0.12]
+
+[entities.light]
+type = "point"
+color = [1.0, 0.58, 0.32]
+intensity = 14.0
+range = 3.0
+
+[[entities]]
+id = 11
+name = "Floor Probe Light Cool"
+model = "light_marker_cool.gltf"
+
+[entities.transform]
+translation = [1.05, 1.05, -1.25]
+scale = [0.12, 0.12, 0.12]
+
+[entities.light]
+type = "point"
+color = [0.35, 0.62, 1.0]
+intensity = 12.0
+range = 2.8
+
+[[entities]]
+id = 12
+name = "Floor Probe Light Green"
+model = "light_marker_green.gltf"
+
+[entities.transform]
+translation = [-0.35, 1.25, 0.15]
+scale = [0.12, 0.12, 0.12]
+
+[entities.light]
+type = "point"
+color = [0.55, 1.0, 0.62]
+intensity = 8.0
+range = 2.2
+
+[[entities]]
+id = 13
+name = "Floor Probe Light Magenta"
+model = "light_marker_magenta.gltf"
+
+[entities.transform]
+translation = [0.85, 0.95, 0.55]
+scale = [0.12, 0.12, 0.12]
+
+[entities.light]
+type = "point"
+color = [1.0, 0.34, 0.78]
+intensity = 9.0
+range = 2.4

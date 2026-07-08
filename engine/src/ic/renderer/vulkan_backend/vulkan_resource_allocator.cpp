@@ -159,6 +159,7 @@ namespace ic
         }
 
         buffer.mapped = buffer.allocationInfo.pMappedData;
+        buffer.persistentlyMapped = buffer.mapped != nullptr;
 
         if (m_bufferDeviceAddress &&
             hasFlag(desc.usage, BufferUsageFlags::ShaderDeviceAddress))
@@ -276,12 +277,19 @@ namespace ic
 
         std::scoped_lock lock(m_mutex);
 
+        if (buffer.explicitlyMapped)
+        {
+            vmaUnmapMemory(m_allocator, buffer.allocation);
+            buffer.mapped = nullptr;
+            buffer.explicitlyMapped = false;
+        }
+
         vmaDestroyBuffer(
             m_allocator,
             buffer.buffer,
             buffer.allocation);
 
-        buffer = {};
+        buffer.reset();
     }
 
     void VulkanResourceAllocator::destroyTexture(VulkanTexture& texture)
@@ -298,7 +306,7 @@ namespace ic
             texture.image,
             texture.allocation);
 
-        texture = {};
+        texture.reset();
     }
 
     void* VulkanResourceAllocator::map(VulkanBuffer& buffer)
@@ -322,6 +330,7 @@ namespace ic
                 &buffer.mapped),
             "Failed to map Vulkan buffer.");
 
+        buffer.explicitlyMapped = true;
         return buffer.mapped;
     }
 
@@ -334,11 +343,19 @@ namespace ic
 
         std::scoped_lock lock(m_mutex);
 
-        vmaUnmapMemory(
-            m_allocator,
-            buffer.allocation);
+        if (buffer.explicitlyMapped)
+        {
+            vmaUnmapMemory(
+                m_allocator,
+                buffer.allocation);
 
-        buffer.mapped = nullptr;
+            buffer.explicitlyMapped = false;
+        }
+
+        if (!buffer.persistentlyMapped)
+        {
+            buffer.mapped = nullptr;
+        }
     }
 
     void VulkanResourceAllocator::flush(

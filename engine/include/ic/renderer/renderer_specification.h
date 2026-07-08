@@ -2,9 +2,19 @@
 #pragma once
 #include <cstdint>
 #include <filesystem>
+#include "render_types.h"
 
 namespace ic
 {
+    struct SwapchainInfo
+    {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        TextureFormat format = TextureFormat::Unknown;
+        uint32_t imageCount = 0;
+        bool valid = false;
+    };
+
     struct EnvironmentSettings
     {
         bool enabled = true;
@@ -33,9 +43,11 @@ namespace ic
     enum class RenderPathType : uint8_t
     {
         Forward,
+        ClusteredForward, // Preferred
         Deferred,
         PathTraced
     };
+
 
     struct RendererSpecification
     {

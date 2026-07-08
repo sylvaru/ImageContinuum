@@ -1,3 +1,4 @@
+#include "ic/common/ic_pch.h"
 #include "ic/renderer/dx12_backend/dx12_backend.h"
 
 #include "ic/core/frame_context.h"
@@ -21,20 +22,34 @@
 #include <cmath>
 #include <cstring>
 
-namespace
-{
-    void throwIfFailed(HRESULT hr, const char* message)
-    {
-        if (FAILED(hr))
-        {
-            throw std::runtime_error(message);
-        }
-    }
-}
 
 namespace ic
 {
-	void DX12Backend::initialize(
+
+    namespace
+    {
+        void throwIfFailed(HRESULT hr, const char* message)
+        {
+            if (FAILED(hr))
+            {
+                throw std::runtime_error(message);
+            }
+        }
+
+        uint32_t mipCountForSize(uint32_t size)
+        {
+            uint32_t levels = 1;
+            while (size > 1)
+            {
+                size >>= 1u;
+                ++levels;
+            }
+            return levels;
+        }
+    }
+
+
+	void DX12Backend::init(
 		const RendererSpecification& spec,
         const PipelineLibrary& pipelineLibrary,
 		Window& window,
@@ -89,7 +104,9 @@ namespace ic
         shutdownImGui();
         destroySceneResources();
         destroyEnvironmentResources();
+        destroyClusteredForwardResources();
         destroyPathTraceResources();
+        destroyGraphResources();
         destroyFrameSync();
         m_pipelineManager.shutdown();
         m_descriptorSystem.shutdown();
@@ -138,6 +155,8 @@ namespace ic
 
         ID3D12Resource* swapchainImage =
             m_swapchain.currentBackBuffer();
+
+        materializeGraphResources(plan, swapchainImage);
 
         std::vector<ID3D12CommandList*> commandLists;
         executeGraph(
@@ -302,14 +321,26 @@ namespace ic
                 break;
             }
         }
+        else if (GraphResourceEntry* entry = graphResource(barrier.resource))
+        {
+            dxResource = entry->type == GraphResourceType::Texture
+                ? entry->texture.resource.Get()
+                : entry->buffer.resource.Get();
+        }
 
         if (!dxResource)
         {
+            spdlog::error(
+                "[DX12Backend] Missing graph resource handle for barrier resource {}",
+                barrier.resource);
             return;
         }
 
         const D3D12_RESOURCE_STATES before =
-            usageToState(barrier.oldUsage);
+            resource.ownership == ResourceOwnership::Transient &&
+                graphResource(barrier.resource)
+                ? graphResource(barrier.resource)->state
+                : usageToState(barrier.oldUsage);
 
         const D3D12_RESOURCE_STATES after =
             usageToState(barrier.newUsage);
@@ -324,6 +355,14 @@ namespace ic
             dxResource,
             before,
             after);
+
+        if (resource.ownership == ResourceOwnership::Transient)
+        {
+            if (GraphResourceEntry* entry = graphResource(barrier.resource))
+            {
+                entry->state = after;
+            }
+        }
 
     }
 
@@ -362,8 +401,6 @@ namespace ic
         ID3D12GraphicsCommandList4* cmd,
         [[maybe_unused]] ID3D12Resource* swapchainImage)
     {
-        ensureDepthTarget();
-
         DX12GraphicsPipeline* pipeline =
             m_pipelineManager.graphicsPipeline(
                 pipelineForNode(plan, node));
@@ -380,9 +417,26 @@ namespace ic
 
         const bool hasColorTarget =
             pipeline->desc.colorAttachmentCount > 0;
+        const GraphResourceId colorResource =
+            findGraphAttachment(plan, node.nodeId, ResourceUsage::ColorAttachment);
+        const GraphResourceId depthResource =
+            findGraphAttachment(plan, node.nodeId, ResourceUsage::DepthAttachment);
+        const GraphResourceEntry* colorEntry =
+            colorResource != InvalidGraphResourceId
+                ? graphResource(colorResource)
+                : nullptr;
+        const GraphResourceEntry* depthEntry =
+            depthResource != InvalidGraphResourceId
+                ? graphResource(depthResource)
+                : nullptr;
+        constexpr bool useGraphAttachments = false;
 
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv =
-            m_swapchain.currentRtv();
+            useGraphAttachments &&
+                colorEntry && colorEntry->ownership == ResourceOwnership::Transient &&
+                colorEntry->rtv.valid()
+                ? colorEntry->rtv.cpuStart
+                : m_swapchain.currentRtv();
 
         D3D12_VIEWPORT viewport{};
         viewport.TopLeftX = 0.0f;
@@ -401,21 +455,32 @@ namespace ic
         cmd->RSSetViewports(1, &viewport);
         cmd->RSSetScissorRects(1, &scissor);
 
-        if (m_depthState != D3D12_RESOURCE_STATE_DEPTH_WRITE)
+        if (!useGraphAttachments || !depthEntry)
         {
-            transitionResource(
-                cmd,
-                m_depthTexture.resource.Get(),
-                m_depthState,
-                D3D12_RESOURCE_STATE_DEPTH_WRITE);
-            m_depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            ensureDepthTarget();
+            if (m_depthState != D3D12_RESOURCE_STATE_DEPTH_WRITE)
+            {
+                transitionResource(
+                    cmd,
+                    m_depthTexture.resource.Get(),
+                    m_depthState,
+                    D3D12_RESOURCE_STATE_DEPTH_WRITE);
+                m_depthState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            }
         }
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+            useGraphAttachments &&
+                depthEntry && depthEntry->ownership == ResourceOwnership::Transient &&
+                depthEntry->dsv.valid()
+                ? depthEntry->dsv.cpuStart
+                : m_depthDsv.cpuStart;
 
         cmd->OMSetRenderTargets(
             hasColorTarget ? 1u : 0u,
             hasColorTarget ? &rtv : nullptr,
             FALSE,
-            &m_depthDsv.cpuStart);
+            &dsv);
 
         constexpr FLOAT clearColor[4] = { 0.02f, 0.02f, 0.025f, 1.0f };
         if (hasColorTarget &&
@@ -427,7 +492,7 @@ namespace ic
             (pass && pass->depthLoadOp == AttachmentLoadOp::Clear))
         {
             cmd->ClearDepthStencilView(
-                m_depthDsv.cpuStart,
+                dsv,
                 D3D12_CLEAR_FLAG_DEPTH,
                 1.0f,
                 0,
@@ -444,6 +509,19 @@ namespace ic
         if (!pass || pass->drawList != DrawListKind::SceneGeometry)
         {
             return;
+        }
+
+        if (!m_environmentResources.converted)
+        {
+            if (DX12ComputePipeline* convertPipeline =
+                    environmentConvertPipeline())
+            {
+                (void)convertEnvironmentIfReady(
+                    *convertPipeline,
+                    ctx,
+                    scene,
+                    cmd);
+            }
         }
 
         if (!prepareSceneResources(ctx, scene) ||
@@ -470,21 +548,44 @@ namespace ic
 
         cmd->SetGraphicsRootSignature(pipeline->rootSignature.Get());
         cmd->SetPipelineState(pipeline->pipelineState.Get());
-        cmd->SetGraphicsRootConstantBufferView(
-            0,
-            frameResources.frameConstants.gpuAddress);
-        cmd->SetGraphicsRootDescriptorTable(
-            1,
-            frameResources.objectSrv.gpuStart);
-        cmd->SetGraphicsRootDescriptorTable(
-            2,
-            frameResources.materialSrv.gpuStart);
-        cmd->SetGraphicsRootDescriptorTable(
-            4,
-            m_descriptorSystem.shaderResourceGpuStart());
-        cmd->SetGraphicsRootDescriptorTable(
-            5,
-            m_descriptorSystem.samplerGpuStart());
+        if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::ClusteredForward)
+        {
+            bindClusteredForwardGraphics(*pipeline, ctx, cmd);
+        }
+        else
+        {
+            cmd->SetGraphicsRootConstantBufferView(
+                0,
+                frameResources.frameConstants.gpuAddress);
+            cmd->SetGraphicsRootDescriptorTable(
+                1,
+                frameResources.objectSrv.gpuStart);
+            cmd->SetGraphicsRootDescriptorTable(
+                2,
+                frameResources.materialSrv.gpuStart);
+            cmd->SetGraphicsRootDescriptorTable(
+                4,
+                m_descriptorSystem.shaderResourceGpuStart());
+            cmd->SetGraphicsRootDescriptorTable(
+                5,
+                m_descriptorSystem.samplerGpuStart());
+            if (m_environmentResources.iblBaked)
+            {
+                cmd->SetGraphicsRootDescriptorTable(
+                    6,
+                    m_environmentResources.irradianceSrv.gpuStart);
+                cmd->SetGraphicsRootDescriptorTable(
+                    7,
+                    m_environmentResources.prefilteredSrv.gpuStart);
+                cmd->SetGraphicsRootDescriptorTable(
+                    8,
+                    m_environmentResources.brdfLutSrv.gpuStart);
+                cmd->SetGraphicsRootDescriptorTable(
+                    9,
+                    m_environmentResources.sampler.gpuStart);
+            }
+        }
         cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
         UploadedModel* boundModel = nullptr;
@@ -526,8 +627,9 @@ namespace ic
             constants.meshIndex = draw.meshIndex;
             constants.materialIndex = draw.materialIndex;
 
+            const UINT drawRootParameter = 3u;
             cmd->SetGraphicsRoot32BitConstants(
-                3,
+                drawRootParameter,
                 4,
                 &constants,
                 0);
@@ -610,6 +712,14 @@ namespace ic
                 0,
                 m_computeTestBuffer.gpuAddress);
         }
+        else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::ClusteredForward)
+        {
+            if (!bindClusteredForwardCompute(*pipeline, ctx, scene, cmd))
+            {
+                return;
+            }
+        }
 
         cmd->Dispatch(
             pass->groupCountX,
@@ -623,6 +733,26 @@ namespace ic
             barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
             barrier.UAV.pResource = m_computeTestBuffer.resource.Get();
             cmd->ResourceBarrier(1, &barrier);
+        }
+        else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::ClusteredForward)
+        {
+            D3D12_RESOURCE_BARRIER barriers[4]{};
+            ID3D12Resource* resources[] =
+            {
+                m_clusteredForwardResources.clusterBounds.resource.Get(),
+                m_clusteredForwardResources.clusterLightGrid.resource.Get(),
+                m_clusteredForwardResources.clusterLightIndices.resource.Get(),
+                m_clusteredForwardResources.clusterLightCounter.resource.Get()
+            };
+            for (uint32_t i = 0; i < static_cast<uint32_t>(std::size(barriers)); ++i)
+            {
+                barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                barriers[i].UAV.pResource = resources[i];
+            }
+            cmd->ResourceBarrier(
+                static_cast<UINT>(std::size(barriers)),
+                barriers);
         }
     }
 
@@ -727,6 +857,12 @@ namespace ic
             static_cast<UINT>(std::size(heaps)),
             heaps);
         cmd->SetComputeRootSignature(pipeline.rootSignature.Get());
+        if (!pipeline.pipelineState.Get())
+        {
+            spdlog::error(
+                "[DX12] Environment conversion PSO is null; skipping HDR conversion");
+            return false;
+        }
         cmd->SetPipelineState(pipeline.pipelineState.Get());
         cmd->SetComputeRootDescriptorTable(0, textureIt->second.srv.gpuStart);
         cmd->SetComputeRootDescriptorTable(1, m_environmentResources.cubemapUav.gpuStart);
@@ -838,6 +974,8 @@ namespace ic
             m_pathTraceResources.sceneTriangleCount;
         constants.sceneBvhNodeCount =
             m_pathTraceResources.sceneBvhNodeCount;
+        constants.sceneEmissiveTriangleIndex =
+            m_pathTraceResources.firstEmissiveTriangleIndex;
         constants.useSceneGeometry =
             m_pathTraceResources.sceneTriangleCount != 0u &&
             m_pathTraceResources.sceneBvhNodeCount != 0u
@@ -872,6 +1010,20 @@ namespace ic
             m_pathTraceResources.width,
             m_pathTraceResources.height,
             constants);
+        for (const SceneLightRenderItem& light : scene.lights)
+        {
+            if (light.type != LightType::Point ||
+                constants.pointLightCount >= MaxPathTracePointLights)
+            {
+                continue;
+            }
+
+            const uint32_t lightIndex = constants.pointLightCount++;
+            constants.pointLightPositionRange[lightIndex] =
+                glm::vec4(light.position, light.range);
+            constants.pointLightColorIntensity[lightIndex] =
+                glm::vec4(light.color, light.intensity);
+        }
 
         const uint32_t frameSlot =
             static_cast<uint32_t>(
@@ -947,6 +1099,12 @@ namespace ic
                 3,
                 m_environmentResources.sampler.gpuStart);
         }
+        cmd->SetComputeRootDescriptorTable(
+            4,
+            m_descriptorSystem.shaderResourceGpuStart());
+        cmd->SetComputeRootDescriptorTable(
+            5,
+            m_descriptorSystem.samplerGpuStart());
 
         const uint32_t groupCountX =
             (m_pathTraceResources.width + 7u) / 8u;
@@ -1183,6 +1341,7 @@ namespace ic
     {
         destroyDepthTarget();
         destroyPathTraceResources();
+        destroyClusteredForwardResources();
         m_resourceAllocator.destroyBuffer(m_computeTestBuffer);
         m_computeTestBufferState = D3D12_RESOURCE_STATE_COMMON;
 
@@ -1211,6 +1370,7 @@ namespace ic
             m_resourceAllocator.destroyBuffer(resources.frameConstants);
             m_resourceAllocator.destroyBuffer(resources.objects);
             m_resourceAllocator.destroyBuffer(resources.materials);
+            m_resourceAllocator.destroyBuffer(resources.visibleLights);
             m_descriptorSystem.releaseResourceDescriptors(resources.objectSrv);
             m_descriptorSystem.releaseResourceDescriptors(resources.materialSrv);
             resources = {};
@@ -1315,20 +1475,77 @@ namespace ic
             return;
         }
 
-        const bool retryPendingScene =
-            m_pathTraceResources.sceneTriangleCount == 0u &&
-            !scene.models.empty();
+        AssetManager& assets = *ctx.services->assetManager;
+        const bool hasPendingModels =
+            std::ranges::any_of(
+                scene.models,
+                [&assets](const SceneModelRenderItem& item)
+                {
+                    return !assets.model(item.model);
+                });
+        const bool retryThisFrame =
+            (hasPendingModels ||
+                m_pathTraceResources.sceneHadPendingModels ||
+                (m_pathTraceResources.sceneTriangleCount == 0u &&
+                    !scene.models.empty())) &&
+            (m_pathTraceResources.lastSceneBuildFrame == UINT64_MAX ||
+                ctx.frameIndex - m_pathTraceResources.lastSceneBuildFrame >=
+                    30u);
         if (m_pathTraceResources.sceneVersion == scene.sceneVersion &&
-            !retryPendingScene &&
+            !retryThisFrame &&
             m_pathTraceResources.sceneSrvs.valid())
         {
             return;
         }
 
+        m_pathTraceResources.lastSceneBuildFrame = ctx.frameIndex;
         PathTraceSceneData sceneData =
             buildPathTraceSceneData(
                 scene,
-                *ctx.services->assetManager);
+                assets,
+                [this, &assets](
+                    AssetHandle modelHandle,
+                    const MaterialTextureSlot& slot)
+                {
+                    PathTraceMaterialTextureIndices indices{};
+                    indices.samplerIndex = requestSampler(nullptr);
+
+                    const ModelAsset* model = assets.model(modelHandle);
+                    if (!model ||
+                        slot.textureIndex < 0 ||
+                        static_cast<size_t>(slot.textureIndex) >=
+                            model->textures.size())
+                    {
+                        return indices;
+                    }
+
+                    const TextureAsset& texture =
+                        model->textures[static_cast<size_t>(slot.textureIndex)];
+                    if (texture.samplerIndex >= 0 &&
+                        static_cast<size_t>(texture.samplerIndex) <
+                            model->samplers.size())
+                    {
+                        indices.samplerIndex =
+                            requestSampler(
+                                &model->samplers[
+                                    static_cast<size_t>(texture.samplerIndex)]);
+                    }
+
+                    if (texture.imageIndex < 0 ||
+                        static_cast<size_t>(texture.imageIndex) >=
+                            model->images.size())
+                    {
+                        return indices;
+                    }
+
+                    indices.textureIndex =
+                        requestTexture(
+                            modelHandle,
+                            static_cast<uint32_t>(texture.imageIndex),
+                            model->images[static_cast<size_t>(texture.imageIndex)],
+                            slot.transfer);
+                    return indices;
+                });
         if (sceneData.triangles.empty() &&
             m_pathTraceResources.sceneSrvs.valid())
         {
@@ -1338,6 +1555,7 @@ namespace ic
         uploadPathTraceScene(sceneData);
 
         m_pathTraceResources.sceneVersion = scene.sceneVersion;
+        m_pathTraceResources.sceneHadPendingModels = hasPendingModels;
         m_pathTraceResources.accumulatedSampleCount = 0;
         m_pathTraceResources.resetAccumulation = true;
     }
@@ -1363,6 +1581,16 @@ namespace ic
             static_cast<uint32_t>(sceneData.triangles.size());
         m_pathTraceResources.sceneBvhNodeCount =
             static_cast<uint32_t>(sceneData.bvhNodes.size());
+        m_pathTraceResources.firstEmissiveTriangleIndex =
+            sceneData.firstEmissiveTriangleIndex;
+
+        spdlog::info(
+            "[DX12] Path trace scene upload: vertices={} materials={} triangles={} bvhNodes={} firstEmissiveTriangle={}",
+            m_pathTraceResources.sceneVertexCount,
+            m_pathTraceResources.sceneMaterialCount,
+            m_pathTraceResources.sceneTriangleCount,
+            m_pathTraceResources.sceneBvhNodeCount,
+            m_pathTraceResources.firstEmissiveTriangleIndex);
 
         struct PendingSceneUpload
         {
@@ -1595,6 +1823,7 @@ namespace ic
         m_pathTraceResources.sceneMaterialCount = 0;
         m_pathTraceResources.sceneTriangleCount = 0;
         m_pathTraceResources.sceneBvhNodeCount = 0;
+        m_pathTraceResources.firstEmissiveTriangleIndex = UINT32_MAX;
     }
 
     void DX12Backend::destroyPathTraceResources()
@@ -1696,6 +1925,239 @@ namespace ic
                 .debugName = "DX12 compute binding test buffer"
             });
         m_computeTestBufferState = m_computeTestBuffer.initialState;
+    }
+
+    void DX12Backend::ensureClusteredForwardResources()
+    {
+        const uint32_t width = std::max(1u, m_swapchain.width());
+        const uint32_t height = std::max(1u, m_swapchain.height());
+        const uint32_t clusterCountX =
+            (width + ClusteredForwardTileSizeX - 1u) /
+            ClusteredForwardTileSizeX;
+        const uint32_t clusterCountY =
+            (height + ClusteredForwardTileSizeY - 1u) /
+            ClusteredForwardTileSizeY;
+        const uint32_t clusterCountZ = ClusteredForwardSliceCountZ;
+        const uint32_t clusterCount =
+            clusterCountX * clusterCountY * clusterCountZ;
+
+        if (m_clusteredForwardResources.clusterBounds &&
+            m_clusteredForwardResources.width == width &&
+            m_clusteredForwardResources.height == height)
+        {
+            return;
+        }
+
+        destroyClusteredForwardResources();
+
+        m_clusteredForwardResources.width = width;
+        m_clusteredForwardResources.height = height;
+        m_clusteredForwardResources.clusterCountX = clusterCountX;
+        m_clusteredForwardResources.clusterCountY = clusterCountY;
+        m_clusteredForwardResources.clusterCountZ = clusterCountZ;
+        m_clusteredForwardResources.clusterCount = clusterCount;
+
+        const uint64_t maxClusterLightRefs =
+            static_cast<uint64_t>(clusterCount) *
+            ClusteredForwardMaxLightsPerCluster;
+
+        m_clusteredForwardResources.clusterBounds =
+            m_resourceAllocator.createBuffer({
+                .size = clusterCount * sizeof(GpuClusterBounds),
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "DX12 clustered cluster bounds"
+            });
+        m_clusteredForwardResources.clusterLightGrid =
+            m_resourceAllocator.createBuffer({
+                .size = clusterCount * sizeof(GpuClusterLightGrid),
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "DX12 clustered light grid"
+            });
+        m_clusteredForwardResources.clusterLightIndices =
+            m_resourceAllocator.createBuffer({
+                .size = maxClusterLightRefs * sizeof(uint32_t),
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "DX12 clustered light indices"
+            });
+        m_clusteredForwardResources.clusterLightCounter =
+            m_resourceAllocator.createBuffer({
+                .size = sizeof(uint32_t),
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "DX12 clustered light counter"
+            });
+
+        m_clusteredForwardResources.boundsState =
+            m_clusteredForwardResources.clusterBounds.initialState;
+        m_clusteredForwardResources.gridState =
+            m_clusteredForwardResources.clusterLightGrid.initialState;
+        m_clusteredForwardResources.indicesState =
+            m_clusteredForwardResources.clusterLightIndices.initialState;
+        m_clusteredForwardResources.counterState =
+            m_clusteredForwardResources.clusterLightCounter.initialState;
+
+        spdlog::info(
+            "[DX12Backend] Clustered forward resources: {}x{}x{} clusters",
+            clusterCountX,
+            clusterCountY,
+            clusterCountZ);
+    }
+
+    bool DX12Backend::bindClusteredForwardCompute(
+        const DX12ComputePipeline& pipeline,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd)
+    {
+        ensureClusteredForwardResources();
+        if (!prepareSceneResources(ctx, scene))
+        {
+            return false;
+        }
+
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(ctx.frameIndex % m_sceneFrameResources.size());
+        FrameSceneResources& frameResources = m_sceneFrameResources[frameSlot];
+
+        auto transitionClusterBuffer =
+            [&](DX12Buffer& buffer, D3D12_RESOURCE_STATES& state)
+            {
+                if (state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+                {
+                    transitionResource(
+                        cmd,
+                        buffer.resource.Get(),
+                        state,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                    state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                }
+            };
+        transitionClusterBuffer(
+            m_clusteredForwardResources.clusterBounds,
+            m_clusteredForwardResources.boundsState);
+        transitionClusterBuffer(
+            m_clusteredForwardResources.clusterLightGrid,
+            m_clusteredForwardResources.gridState);
+        transitionClusterBuffer(
+            m_clusteredForwardResources.clusterLightIndices,
+            m_clusteredForwardResources.indicesState);
+        transitionClusterBuffer(
+            m_clusteredForwardResources.clusterLightCounter,
+            m_clusteredForwardResources.counterState);
+
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            m_descriptorSystem.shaderResourceHeap(),
+            m_descriptorSystem.samplerHeap()
+        };
+        cmd->SetDescriptorHeaps(
+            static_cast<UINT>(std::size(heaps)),
+            heaps);
+        cmd->SetComputeRootSignature(pipeline.rootSignature.Get());
+        cmd->SetComputeRootConstantBufferView(
+            0,
+            frameResources.frameConstants.gpuAddress);
+
+        cmd->SetComputeRootUnorderedAccessView(
+            10,
+            m_clusteredForwardResources.clusterBounds.gpuAddress);
+
+        cmd->SetComputeRootUnorderedAccessView(
+            11,
+            m_clusteredForwardResources.clusterLightGrid.gpuAddress);
+
+        cmd->SetComputeRootUnorderedAccessView(
+            12,
+            m_clusteredForwardResources.clusterLightIndices.gpuAddress);
+
+        cmd->SetComputeRootShaderResourceView(
+            13,
+            frameResources.visibleLights.gpuAddress);
+
+        cmd->SetComputeRootUnorderedAccessView(
+            14,
+            m_clusteredForwardResources.clusterLightCounter.gpuAddress);
+        return true;
+    }
+
+    void DX12Backend::bindClusteredForwardGraphics(
+        const DX12GraphicsPipeline& pipeline,
+        const FrameContext& ctx,
+        ID3D12GraphicsCommandList4* cmd)
+    {
+        const uint32_t frameSlot =
+            static_cast<uint32_t>(ctx.frameIndex % m_sceneFrameResources.size());
+        FrameSceneResources& frameResources = m_sceneFrameResources[frameSlot];
+
+        cmd->SetGraphicsRootSignature(pipeline.rootSignature.Get());
+        cmd->SetGraphicsRootConstantBufferView(
+            0,
+            frameResources.frameConstants.gpuAddress);
+        cmd->SetGraphicsRootDescriptorTable(1, frameResources.objectSrv.gpuStart);
+        cmd->SetGraphicsRootDescriptorTable(2, frameResources.materialSrv.gpuStart);
+        cmd->SetGraphicsRootDescriptorTable(
+            4,
+            m_descriptorSystem.shaderResourceGpuStart());
+
+        cmd->SetGraphicsRootDescriptorTable(
+            5,
+            m_descriptorSystem.samplerGpuStart());
+
+        if (m_environmentResources.iblBaked)
+        {
+            cmd->SetGraphicsRootDescriptorTable(
+                6,
+                m_environmentResources.irradianceSrv.gpuStart);
+            cmd->SetGraphicsRootDescriptorTable(
+                7,
+                m_environmentResources.prefilteredSrv.gpuStart);
+            cmd->SetGraphicsRootDescriptorTable(
+                8,
+                m_environmentResources.brdfLutSrv.gpuStart);
+            cmd->SetGraphicsRootDescriptorTable(
+                9,
+                m_environmentResources.sampler.gpuStart);
+        }
+        cmd->SetGraphicsRootUnorderedAccessView(
+            10,
+            m_clusteredForwardResources.clusterBounds.gpuAddress);
+        cmd->SetGraphicsRootUnorderedAccessView(
+            11,
+            m_clusteredForwardResources.clusterLightGrid.gpuAddress);
+        cmd->SetGraphicsRootUnorderedAccessView(
+            12,
+            m_clusteredForwardResources.clusterLightIndices.gpuAddress);
+        cmd->SetGraphicsRootShaderResourceView(
+            13,
+            frameResources.visibleLights.gpuAddress);
+        cmd->SetGraphicsRootUnorderedAccessView(
+            14,
+            m_clusteredForwardResources.clusterLightCounter.gpuAddress);
+        cmd->SetGraphicsRootShaderResourceView(
+            15,
+            m_clusteredForwardResources.clusterBounds.gpuAddress);
+        cmd->SetGraphicsRootShaderResourceView(
+            16,
+            m_clusteredForwardResources.clusterLightGrid.gpuAddress);
+        cmd->SetGraphicsRootShaderResourceView(
+            17,
+            m_clusteredForwardResources.clusterLightIndices.gpuAddress);
+    }
+
+    void DX12Backend::destroyClusteredForwardResources()
+    {
+        m_resourceAllocator.destroyBuffer(
+            m_clusteredForwardResources.clusterBounds);
+        m_resourceAllocator.destroyBuffer(
+            m_clusteredForwardResources.clusterLightGrid);
+        m_resourceAllocator.destroyBuffer(
+            m_clusteredForwardResources.clusterLightIndices);
+        m_resourceAllocator.destroyBuffer(
+            m_clusteredForwardResources.clusterLightCounter);
+        m_clusteredForwardResources = {};
     }
 
     bool DX12Backend::ensureEnvironmentResources(
@@ -1890,10 +2352,28 @@ namespace ic
     void DX12Backend::destroyEnvironmentResources()
     {
         m_resourceAllocator.destroyTexture(m_environmentResources.cubemap);
+        m_resourceAllocator.destroyTexture(m_environmentResources.irradiance);
+        m_resourceAllocator.destroyTexture(m_environmentResources.prefiltered);
+        m_resourceAllocator.destroyTexture(m_environmentResources.brdfLut);
         m_descriptorSystem.releaseResourceDescriptors(
             m_environmentResources.cubemapSrv);
         m_descriptorSystem.releaseResourceDescriptors(
             m_environmentResources.cubemapUav);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_environmentResources.irradianceSrv);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_environmentResources.irradianceUav);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_environmentResources.prefilteredSrv);
+        for (DX12DescriptorAllocation allocation :
+            m_environmentResources.prefilteredUavs)
+        {
+            m_descriptorSystem.releaseResourceDescriptors(allocation);
+        }
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_environmentResources.brdfLutSrv);
+        m_descriptorSystem.releaseResourceDescriptors(
+            m_environmentResources.brdfLutUav);
         m_descriptorSystem.releaseSamplers(m_environmentResources.sampler);
         for (DX12Buffer& buffer :
             m_environmentResources.skyboxConstants)
@@ -1949,6 +2429,603 @@ namespace ic
         m_depthState = D3D12_RESOURCE_STATE_COMMON;
         m_depthWidth = 0;
         m_depthHeight = 0;
+    }
+
+    DX12Backend::GraphResourceEntry* DX12Backend::graphResource(
+        GraphResourceId id)
+    {
+        auto it = m_graphResources.find(id);
+        return it != m_graphResources.end() ? &it->second : nullptr;
+    }
+
+    const DX12Backend::GraphResourceEntry* DX12Backend::graphResource(
+        GraphResourceId id) const
+    {
+        auto it = m_graphResources.find(id);
+        return it != m_graphResources.end() ? &it->second : nullptr;
+    }
+
+    GraphResourceId DX12Backend::findGraphAttachment(
+        const CompiledGraphPlan& plan,
+        GraphNodeId node,
+        ResourceUsage usage) const
+    {
+        for (const ResourceBarrier& barrier : plan.barriers)
+        {
+            if (barrier.toNode == node && barrier.newUsage == usage)
+            {
+                return barrier.resource;
+            }
+        }
+        return InvalidGraphResourceId;
+    }
+
+    void DX12Backend::destroyGraphResources()
+    {
+        for (auto& [id, entry] : m_graphResources)
+        {
+            m_resourceAllocator.destroyTexture(entry.texture);
+            m_resourceAllocator.destroyBuffer(entry.buffer);
+            m_descriptorSystem.releaseRTV(entry.rtv);
+            m_descriptorSystem.releaseDSV(entry.dsv);
+            m_descriptorSystem.releaseResourceDescriptors(entry.srvUav);
+        }
+        m_graphResources.clear();
+    }
+
+    void DX12Backend::materializeGraphResources(
+        const CompiledGraphPlan& plan,
+        [[maybe_unused]] ID3D12Resource* swapchainImage)
+    {
+        const uint32_t extentWidth = m_swapchain.width();
+        const uint32_t extentHeight = m_swapchain.height();
+        for (const GraphResource& resource : plan.resources)
+        {
+            GraphResourceEntry& entry = m_graphResources[resource.id];
+            entry.type = resource.type;
+            entry.ownership = resource.ownership;
+            entry.imported = resource.imported;
+
+            if (resource.ownership == ResourceOwnership::Imported)
+            {
+                entry.width = extentWidth;
+                entry.height = extentHeight;
+                continue;
+            }
+
+            if (resource.type == GraphResourceType::Texture)
+            {
+                TextureDesc desc = resource.textureDesc;
+                if (desc.width == 0) desc.width = extentWidth;
+                if (desc.height == 0) desc.height = extentHeight;
+
+                const bool recreate =
+                    !entry.texture ||
+                    entry.width != desc.width ||
+                    entry.height != desc.height ||
+                    entry.mipLevels != desc.mipLevels ||
+                    entry.arrayLayers != desc.arrayLayers;
+                if (!recreate)
+                {
+                    continue;
+                }
+
+                m_resourceAllocator.destroyTexture(entry.texture);
+                m_descriptorSystem.releaseRTV(entry.rtv);
+                m_descriptorSystem.releaseDSV(entry.dsv);
+                m_descriptorSystem.releaseResourceDescriptors(entry.srvUav);
+                entry.rtv = {};
+                entry.dsv = {};
+                entry.srvUav = {};
+
+                entry.texture = m_resourceAllocator.createTexture(desc);
+                entry.state = entry.texture.initialState;
+                entry.width = desc.width;
+                entry.height = desc.height;
+                entry.mipLevels = desc.mipLevels;
+                entry.arrayLayers = desc.arrayLayers;
+
+                if (hasFlag(desc.usage, TextureUsageFlags::ColorAttachment))
+                {
+                    entry.rtv = m_descriptorSystem.allocateRTV(1);
+                    D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+                    rtv.Format = entry.texture.desc.Format;
+                    rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+                    m_device.device()->CreateRenderTargetView(
+                        entry.texture.resource.Get(),
+                        &rtv,
+                        entry.rtv.cpuStart);
+                }
+                if (hasFlag(desc.usage, TextureUsageFlags::DepthAttachment))
+                {
+                    entry.dsv = m_descriptorSystem.allocateDSV(1);
+                    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+                    dsv.Format = DXGI_FORMAT_D32_FLOAT;
+                    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+                    m_device.device()->CreateDepthStencilView(
+                        entry.texture.resource.Get(),
+                        &dsv,
+                        entry.dsv.cpuStart);
+                }
+            }
+            else
+            {
+                BufferDesc desc = resource.bufferDesc;
+
+                const bool recreate =
+                    !entry.buffer ||
+                    entry.buffer.size != desc.size ||
+                    entry.buffer.usage != desc.usage ||
+                    entry.buffer.memoryUsage != desc.memoryUsage ||
+                    entry.buffer.mappedAtCreation != desc.mappedAtCreation;
+
+                if (!recreate)
+                {
+                    continue;
+                }
+
+                waitForGpu();
+
+                m_resourceAllocator.destroyBuffer(entry.buffer);
+
+                entry.buffer = m_resourceAllocator.createBuffer(desc);
+                entry.state = entry.buffer.initialState;
+            }
+        }
+    }
+
+    std::vector<IBLBakeResult> DX12Backend::executeIBLBakeRequests(
+        std::span<const IBLBakeRequest> requests,
+        const FrameContext& ctx)
+    {
+        std::vector<IBLBakeResult> results;
+        results.reserve(requests.size());
+
+        for (const IBLBakeRequest& request : requests)
+        {
+            IBLBakeResult result{};
+            result.requestId = request.requestId;
+            result.handle = request.handle;
+
+            if (!ctx.services || !ctx.services->assetManager)
+            {
+                result.error = "SourceNotReady";
+                results.push_back(std::move(result));
+                continue;
+            }
+
+            const ImageAsset* image =
+                ctx.services->assetManager->image(
+                    request.desc.sourceEnvironment);
+            if (!image || !image->valid())
+            {
+                result.error = "SourceNotReady";
+                results.push_back(std::move(result));
+                continue;
+            }
+
+            auto computePipeline = [&](const char* name) -> DX12ComputePipeline*
+                {
+                    const PipelineId pipelineId = makePipelineId(name);
+                    auto it = m_computePipelineHandles.find(pipelineId);
+                    ComputePipelineHandle handle{};
+                    if (it != m_computePipelineHandles.end())
+                    {
+                        handle = it->second;
+                    }
+                    else
+                    {
+                        ComputePipelineDesc desc =
+                            m_pipelineLibrary->resolveCompute(
+                                pipelineId,
+                                RendererBackendType::DX12);
+                        handle = m_pipelineManager.requestComputePipeline(desc);
+                        m_computePipelineHandles.emplace(pipelineId, handle);
+                    }
+                    return m_pipelineManager.computePipeline(handle);
+                };
+
+            DX12ComputePipeline* convertPipeline =
+                computePipeline("equirect_to_cubemap");
+            DX12ComputePipeline* irradiancePipeline =
+                computePipeline("ibl_irradiance");
+            DX12ComputePipeline* prefilterPipeline =
+                computePipeline("ibl_prefilter");
+            DX12ComputePipeline* brdfPipeline =
+                computePipeline("ibl_brdf_lut");
+
+            convertPipeline =
+                m_pipelineManager.computePipeline(
+                    m_computePipelineHandles.at(
+                        makePipelineId("equirect_to_cubemap")));
+            irradiancePipeline =
+                m_pipelineManager.computePipeline(
+                    m_computePipelineHandles.at(
+                        makePipelineId("ibl_irradiance")));
+            prefilterPipeline =
+                m_pipelineManager.computePipeline(
+                    m_computePipelineHandles.at(
+                        makePipelineId("ibl_prefilter")));
+            brdfPipeline =
+                m_pipelineManager.computePipeline(
+                    m_computePipelineHandles.at(
+                        makePipelineId("ibl_brdf_lut")));
+
+            if (!convertPipeline ||
+                !irradiancePipeline ||
+                !prefilterPipeline ||
+                !brdfPipeline)
+            {
+                result.error = "Missing DX12 IBL compute pipeline";
+                results.push_back(std::move(result));
+                continue;
+            }
+
+            try
+            {
+                (void)requestTexture(
+                    request.desc.sourceEnvironment,
+                    0,
+                    *image,
+                    TextureTransferFunction::Linear);
+
+                SceneRenderView bakeScene{};
+                bakeScene.environment.equirectTexture =
+                    request.desc.sourceEnvironment;
+                bakeScene.environment.settings.cubemapSize =
+                    std::max(1u, request.desc.environmentSize);
+                bakeScene.environment.settings.intensity = 1.0f;
+                bakeScene.environment.version = request.requestId;
+                bakeScene.environment.enabled = 1u;
+
+                m_environmentResources.irradianceSize =
+                    std::max(1u, request.desc.irradianceSize);
+                m_environmentResources.prefilterSize =
+                    std::max(1u, request.desc.prefilterSize);
+                m_environmentResources.prefilterMipCount =
+                    mipCountForSize(m_environmentResources.prefilterSize);
+                m_environmentResources.brdfLutSize =
+                    std::max(1u, request.desc.brdfLutSize);
+
+                Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+                throwIfFailed(
+                    m_device.device()->CreateCommandAllocator(
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        IID_PPV_ARGS(&allocator)),
+                    "Failed to create DX12 IBL bake allocator.");
+
+                Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd;
+                throwIfFailed(
+                    m_device.device()->CreateCommandList(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        allocator.Get(),
+                        nullptr,
+                        IID_PPV_ARGS(&cmd)),
+                    "Failed to create DX12 IBL bake command list.");
+
+                (void)ensureEnvironmentResources(
+                    ctx,
+                    bakeScene,
+                    cmd.Get());
+                (void)convertEnvironmentIfReady(
+                    *convertPipeline,
+                    ctx,
+                    bakeScene,
+                    cmd.Get());
+
+                auto createCubeSrv = [&](DX12Texture& texture)
+                    {
+                        DX12DescriptorAllocation allocation =
+                            m_descriptorSystem.allocateResourceDescriptors(1);
+                        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                        srv.Shader4ComponentMapping =
+                            D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                        srv.Format = texture.desc.Format;
+                        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+                        srv.TextureCube.MipLevels = texture.desc.MipLevels;
+                        m_device.device()->CreateShaderResourceView(
+                            texture.resource.Get(),
+                            &srv,
+                            allocation.cpuStart);
+                        return allocation;
+                    };
+
+                auto createCubeUav = [&](DX12Texture& texture, uint32_t mip)
+                    {
+                        DX12DescriptorAllocation allocation =
+                            m_descriptorSystem.allocateResourceDescriptors(1);
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+                        uav.Format = texture.desc.Format;
+                        uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+                        uav.Texture2DArray.MipSlice = mip;
+                        uav.Texture2DArray.ArraySize = 6;
+                        m_device.device()->CreateUnorderedAccessView(
+                            texture.resource.Get(),
+                            nullptr,
+                            &uav,
+                            allocation.cpuStart);
+                        return allocation;
+                    };
+
+                if (!m_environmentResources.irradiance)
+                {
+                    m_environmentResources.irradiance =
+                        m_resourceAllocator.createTexture({
+                            .width = m_environmentResources.irradianceSize,
+                            .height = m_environmentResources.irradianceSize,
+                            .depth = 1,
+                            .mipLevels = 1,
+                            .arrayLayers = 6,
+                            .cubeCompatible = true,
+                            .format = request.desc.format,
+                            .usage =
+                                TextureUsageFlags::Sampled |
+                                TextureUsageFlags::Storage,
+                            .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                            .debugName = "DX12 IBL irradiance cubemap"
+                            });
+                    m_environmentResources.irradianceState =
+                        m_environmentResources.irradiance.initialState;
+                    m_environmentResources.irradianceSrv =
+                        createCubeSrv(m_environmentResources.irradiance);
+                    m_environmentResources.irradianceUav =
+                        createCubeUav(m_environmentResources.irradiance, 0);
+                }
+
+                if (!m_environmentResources.prefiltered)
+                {
+                    m_environmentResources.prefiltered =
+                        m_resourceAllocator.createTexture({
+                            .width = m_environmentResources.prefilterSize,
+                            .height = m_environmentResources.prefilterSize,
+                            .depth = 1,
+                            .mipLevels = m_environmentResources.prefilterMipCount,
+                            .arrayLayers = 6,
+                            .cubeCompatible = true,
+                            .format = request.desc.format,
+                            .usage =
+                                TextureUsageFlags::Sampled |
+                                TextureUsageFlags::Storage,
+                            .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                            .debugName = "DX12 IBL prefiltered cubemap"
+                            });
+                    m_environmentResources.prefilteredState =
+                        m_environmentResources.prefiltered.initialState;
+                    m_environmentResources.prefilteredSrv =
+                        createCubeSrv(m_environmentResources.prefiltered);
+                    m_environmentResources.prefilteredUavs.clear();
+                    for (uint32_t mip = 0;
+                        mip < m_environmentResources.prefilterMipCount;
+                        ++mip)
+                    {
+                        m_environmentResources.prefilteredUavs.push_back(
+                            createCubeUav(
+                                m_environmentResources.prefiltered,
+                                mip));
+                    }
+                }
+
+                if (!m_environmentResources.brdfLut)
+                {
+                    m_environmentResources.brdfLut =
+                        m_resourceAllocator.createTexture({
+                            .width = m_environmentResources.brdfLutSize,
+                            .height = m_environmentResources.brdfLutSize,
+                            .depth = 1,
+                            .mipLevels = 1,
+                            .arrayLayers = 1,
+                            .format = request.desc.format,
+                            .usage =
+                                TextureUsageFlags::Sampled |
+                                TextureUsageFlags::Storage,
+                            .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                            .debugName = "DX12 IBL BRDF LUT"
+                            });
+                    m_environmentResources.brdfLutState =
+                        m_environmentResources.brdfLut.initialState;
+                    m_environmentResources.brdfLutSrv =
+                        m_descriptorSystem.allocateResourceDescriptors(1);
+                    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                    srv.Shader4ComponentMapping =
+                        D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    srv.Format = m_environmentResources.brdfLut.desc.Format;
+                    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    srv.Texture2D.MipLevels = 1;
+                    m_device.device()->CreateShaderResourceView(
+                        m_environmentResources.brdfLut.resource.Get(),
+                        &srv,
+                        m_environmentResources.brdfLutSrv.cpuStart);
+
+                    m_environmentResources.brdfLutUav =
+                        m_descriptorSystem.allocateResourceDescriptors(1);
+                    D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+                    uav.Format = m_environmentResources.brdfLut.desc.Format;
+                    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                    m_device.device()->CreateUnorderedAccessView(
+                        m_environmentResources.brdfLut.resource.Get(),
+                        nullptr,
+                        &uav,
+                        m_environmentResources.brdfLutUav.cpuStart);
+                }
+
+                auto bindCompute =
+                    [&](DX12ComputePipeline& pipeline,
+                        D3D12_GPU_DESCRIPTOR_HANDLE source,
+                        D3D12_GPU_DESCRIPTOR_HANDLE output,
+                        uint32_t groupsX,
+                        uint32_t groupsY,
+                        uint32_t groupsZ)
+                    {
+                        ID3D12DescriptorHeap* heaps[] =
+                        {
+                            m_descriptorSystem.shaderResourceHeap(),
+                            m_descriptorSystem.samplerHeap()
+                        };
+                        cmd->SetDescriptorHeaps(
+                            static_cast<UINT>(std::size(heaps)),
+                            heaps);
+                        cmd->SetComputeRootSignature(
+                            pipeline.rootSignature.Get());
+                        cmd->SetPipelineState(pipeline.pipelineState.Get());
+                        cmd->SetComputeRootDescriptorTable(0, source);
+                        cmd->SetComputeRootDescriptorTable(1, output);
+                        cmd->SetComputeRootDescriptorTable(
+                            2,
+                            m_environmentResources.sampler.gpuStart);
+                        cmd->Dispatch(groupsX, groupsY, groupsZ);
+                    };
+
+                transitionResource(
+                    cmd.Get(),
+                    m_environmentResources.irradiance.resource.Get(),
+                    m_environmentResources.irradianceState,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                m_environmentResources.irradianceState =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                bindCompute(
+                    *irradiancePipeline,
+                    m_environmentResources.cubemapSrv.gpuStart,
+                    m_environmentResources.irradianceUav.gpuStart,
+                    (m_environmentResources.irradianceSize + 7u) / 8u,
+                    (m_environmentResources.irradianceSize + 7u) / 8u,
+                    6u);
+
+                D3D12_RESOURCE_BARRIER uavBarrier{};
+                uavBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uavBarrier.UAV.pResource =
+                    m_environmentResources.irradiance.resource.Get();
+                cmd->ResourceBarrier(1, &uavBarrier);
+                transitionResource(
+                    cmd.Get(),
+                    m_environmentResources.irradiance.resource.Get(),
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                m_environmentResources.irradianceState =
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+                transitionResource(
+                    cmd.Get(),
+                    m_environmentResources.prefiltered.resource.Get(),
+                    m_environmentResources.prefilteredState,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                m_environmentResources.prefilteredState =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                for (uint32_t mip = 0;
+                    mip < m_environmentResources.prefilterMipCount;
+                    ++mip)
+                {
+                    const uint32_t mipSize =
+                        std::max(
+                            m_environmentResources.prefilterSize >> mip,
+                            1u);
+                    bindCompute(
+                        *prefilterPipeline,
+                        m_environmentResources.cubemapSrv.gpuStart,
+                        m_environmentResources.prefilteredUavs[mip].gpuStart,
+                        (mipSize + 7u) / 8u,
+                        (mipSize + 7u) / 8u,
+                        6u);
+                }
+                uavBarrier.UAV.pResource =
+                    m_environmentResources.prefiltered.resource.Get();
+                cmd->ResourceBarrier(1, &uavBarrier);
+                transitionResource(
+                    cmd.Get(),
+                    m_environmentResources.prefiltered.resource.Get(),
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                m_environmentResources.prefilteredState =
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+
+                transitionResource(
+                    cmd.Get(),
+                    m_environmentResources.brdfLut.resource.Get(),
+                    m_environmentResources.brdfLutState,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                m_environmentResources.brdfLutState =
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                bindCompute(
+                    *brdfPipeline,
+                    m_environmentResources.cubemapSrv.gpuStart,
+                    m_environmentResources.brdfLutUav.gpuStart,
+                    (m_environmentResources.brdfLutSize + 7u) / 8u,
+                    (m_environmentResources.brdfLutSize + 7u) / 8u,
+                    1u);
+                uavBarrier.UAV.pResource =
+                    m_environmentResources.brdfLut.resource.Get();
+                cmd->ResourceBarrier(1, &uavBarrier);
+                transitionResource(
+                    cmd.Get(),
+                    m_environmentResources.brdfLut.resource.Get(),
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                m_environmentResources.brdfLutState =
+                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                m_environmentResources.iblBaked = true;
+
+                throwIfFailed(
+                    cmd->Close(),
+                    "Failed to close DX12 IBL bake command list.");
+
+                ID3D12CommandList* commandLists[] = { cmd.Get() };
+                m_device.graphicsQueue()->ExecuteCommandLists(
+                    1,
+                    commandLists);
+                waitForGpu();
+
+                if (!m_environmentResources.converted)
+                {
+                    result.error = "SourceNotReady";
+                    results.push_back(std::move(result));
+                    continue;
+                }
+
+                result.success = true;
+                result.resources.environmentCubemap =
+                    TextureHandle{ request.handle.index };
+                result.resources.irradianceCubemap =
+                    TextureHandle{ request.handle.index + 1u };
+                result.resources.prefilteredCubemap =
+                    TextureHandle{ request.handle.index + 2u };
+                result.resources.brdfLut =
+                    TextureHandle{ request.handle.index + 3u };
+                result.resources.environmentBindlessIndex =
+                    m_environmentResources.cubemapSrv.baseIndex;
+                result.resources.irradianceBindlessIndex =
+                    m_environmentResources.irradianceSrv.baseIndex;
+                result.resources.prefilteredBindlessIndex =
+                    m_environmentResources.prefilteredSrv.baseIndex;
+                result.resources.brdfLutBindlessIndex =
+                    m_environmentResources.brdfLutSrv.baseIndex;
+                result.resources.prefilteredMipCount =
+                    m_environmentResources.prefilterMipCount;
+
+                spdlog::info(
+                    "[DX12] IBL bake request={} produced env={} irradiance={} prefilter={} mips={} brdf={}",
+                    request.requestId,
+                    m_environmentResources.cubemapSize,
+                    m_environmentResources.irradianceSize,
+                    m_environmentResources.prefilterSize,
+                    m_environmentResources.prefilterMipCount,
+                    m_environmentResources.brdfLutSize);
+            }
+            catch (const std::exception& e)
+            {
+                result.success = false;
+                result.error = e.what();
+            }
+
+            results.push_back(std::move(result));
+        }
+
+        return results;
     }
 
     uint32_t DX12Backend::requestTexture(
@@ -2360,7 +3437,20 @@ namespace ic
             dst.normalTextureIndex = textureDescriptor(src.normalTexture);
             dst.metallicRoughnessTextureIndex =
                 textureDescriptor(src.metallicRoughnessTexture);
-            dst.samplerIndex = samplerDescriptor(src.baseColorTexture);
+            dst.occlusionTextureIndex =
+                textureDescriptor(src.occlusionTexture);
+            dst.emissiveTextureIndex =
+                textureDescriptor(src.emissiveTexture);
+            dst.baseColorSamplerIndex =
+                samplerDescriptor(src.baseColorTexture);
+            dst.normalSamplerIndex =
+                samplerDescriptor(src.normalTexture);
+            dst.metallicRoughnessSamplerIndex =
+                samplerDescriptor(src.metallicRoughnessTexture);
+            dst.occlusionSamplerIndex =
+                samplerDescriptor(src.occlusionTexture);
+            dst.emissiveSamplerIndex =
+                samplerDescriptor(src.emissiveTexture);
             uploaded.materials.push_back(dst);
         }
         if (uploaded.materials.empty())
@@ -2433,6 +3523,7 @@ namespace ic
         std::vector<DrawItem>& draws = m_preparedScene.draws;
         std::vector<GpuObjectData>& objects = m_preparedScene.objects;
         std::vector<GpuMaterialData>& materials = m_preparedScene.materials;
+        std::vector<GpuVisibleLight> visibleLights;
         auto& materialOffsets = m_preparedScene.materialOffsets;
 
         m_uploadedModels.reserve(
@@ -2500,6 +3591,28 @@ namespace ic
         if (materials.empty())
         {
             materials.push_back(GpuMaterialData{});
+        }
+
+        visibleLights.reserve(
+            std::min<size_t>(
+                scene.lights.size(),
+                ClusteredForwardMaxVisibleLights));
+        for (const SceneLightRenderItem& light : scene.lights)
+        {
+            if (light.type != LightType::Point ||
+                visibleLights.size() >= ClusteredForwardMaxVisibleLights)
+            {
+                continue;
+            }
+
+            GpuVisibleLight gpuLight{};
+            gpuLight.positionRange = glm::vec4(light.position, light.range);
+            gpuLight.colorIntensity = glm::vec4(light.color, light.intensity);
+            visibleLights.push_back(gpuLight);
+        }
+        if (visibleLights.empty())
+        {
+            visibleLights.push_back(GpuVisibleLight{});
         }
 
         const uint32_t frameSlot =
@@ -2593,6 +3706,23 @@ namespace ic
                 frameResources.materialSrv.cpuStart);
         }
 
+        if (visibleLights.size() > frameResources.visibleLightCapacity)
+        {
+            m_resourceAllocator.destroyBuffer(frameResources.visibleLights);
+            frameResources.visibleLights =
+                m_resourceAllocator.createBuffer({
+                    .size = visibleLights.size() * sizeof(GpuVisibleLight),
+                    .usage = BufferUsageFlags::None,
+                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                    .mappedAtCreation = true,
+                    .debugName = "DX12 clustered visible lights"
+                });
+            frameResources.visibleLightCapacity =
+                static_cast<uint32_t>(visibleLights.size());
+        }
+
+        ensureClusteredForwardResources();
+
         GpuFrameData frameData{};
         frameData.view = scene.camera.view;
         frameData.projection = glm::perspectiveRH_ZO(
@@ -2603,6 +3733,14 @@ namespace ic
         frameData.viewProjection = frameData.projection * frameData.view;
         frameData.cameraPosition = scene.camera.position;
         frameData.time = ctx.timeSinceStart;
+        frameData.environmentEnabled =
+            m_environmentResources.iblBaked ? 1u : 0u;
+        frameData.prefilteredMipCount =
+            m_environmentResources.prefilterMipCount;
+        frameData.environmentIntensity =
+            scene.environment.settings.intensity;
+        frameData.environmentExposure =
+            scene.environment.settings.skyboxExposure;
 
         for (const SceneLightRenderItem& light : scene.lights)
         {
@@ -2614,6 +3752,35 @@ namespace ic
                 break;
             }
         }
+        for (const SceneLightRenderItem& light : scene.lights)
+        {
+            if (light.type != LightType::Point ||
+                frameData.pointLightCount >= MaxGpuPointLights)
+            {
+                continue;
+            }
+
+            const uint32_t lightIndex = frameData.pointLightCount++;
+            frameData.pointLightPositionRange[lightIndex] =
+                glm::vec4(light.position, light.range);
+            frameData.pointLightColorIntensity[lightIndex] =
+                glm::vec4(light.color, light.intensity);
+        }
+        frameData.pointLightCount =
+            static_cast<uint32_t>(
+                std::min<size_t>(
+                    visibleLights.size(),
+                    ClusteredForwardMaxVisibleLights));
+        frameData.clusterDimensions = glm::uvec4(
+            m_clusteredForwardResources.clusterCountX,
+            m_clusteredForwardResources.clusterCountY,
+            m_clusteredForwardResources.clusterCountZ,
+            m_clusteredForwardResources.clusterCount);
+        frameData.clusterConfig = glm::uvec4(
+            ClusteredForwardTileSizeX,
+            ClusteredForwardTileSizeY,
+            ClusteredForwardMaxLightsPerCluster,
+            m_clusteredForwardHeatmapEnabled ? 1u : 0u);
 
         std::memcpy(
             frameResources.frameConstants.mapped,
@@ -2627,6 +3794,10 @@ namespace ic
             frameResources.materials.mapped,
             materials.data(),
             materials.size() * sizeof(GpuMaterialData));
+        std::memcpy(
+            frameResources.visibleLights.mapped,
+            visibleLights.data(),
+            visibleLights.size() * sizeof(GpuVisibleLight));
 
         m_preparedScene.valid = true;
         return true;
@@ -2655,41 +3826,6 @@ namespace ic
     }
 
 
-    bool DX12Backend::beginDebugGuiFrame()
-    {
-        if (!m_imguiEnabled || m_imguiFrameActive)
-        {
-            return false;
-        }
-
-        ImGui_ImplDX12_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
-
-        m_imguiFrameActive = true;
-        return true;
-    }
-
-    void DX12Backend::endDebugGuiFrame()
-    {
-        if (!m_imguiFrameActive)
-        {
-            return;
-        }
-
-        ImGui::Render();
-        m_imguiFrameActive = false;
-    }
-
-    bool DX12Backend::vsyncEnabled() const
-    {
-        return m_swapchain.vsyncEnabled();
-    }
-
-    void DX12Backend::setVsyncEnabled(bool enabled)
-    {
-        m_swapchain.setVsyncEnabled(enabled);
-    }
 
     void DX12Backend::initImGui(Window& window)
     {
@@ -2770,6 +3906,33 @@ namespace ic
         m_imguiFrameActive = false;
     }
 
+
+    bool DX12Backend::beginDebugGuiFrame()
+    {
+        if (!m_imguiEnabled || m_imguiFrameActive)
+        {
+            return false;
+        }
+
+        ImGui_ImplDX12_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        m_imguiFrameActive = true;
+        return true;
+    }
+
+    void DX12Backend::endDebugGuiFrame()
+    {
+        if (!m_imguiFrameActive)
+        {
+            return;
+        }
+
+        ImGui::Render();
+        m_imguiFrameActive = false;
+    }
+
     void DX12Backend::recordImGui(
         const FrameContext& ctx,
         ID3D12Resource* swapchainImage,
@@ -2824,6 +3987,28 @@ namespace ic
 
         commandLists.push_back(
             static_cast<ID3D12CommandList*>(cmd));
+    }
+
+
+
+    bool DX12Backend::vsyncEnabled() const
+    {
+        return m_swapchain.vsyncEnabled();
+    }
+
+    void DX12Backend::setVsyncEnabled(bool enabled)
+    {
+        m_swapchain.setVsyncEnabled(enabled);
+    }
+
+    bool DX12Backend::clusteredForwardHeatmapEnabled() const
+    {
+        return m_clusteredForwardHeatmapEnabled;
+    }
+
+    void DX12Backend::setClusteredForwardHeatmapEnabled(bool enabled)
+    {
+        m_clusteredForwardHeatmapEnabled = enabled;
     }
 
     D3D12_RESOURCE_STATES DX12Backend::usageToState(ResourceUsage usage) const
@@ -2987,6 +4172,7 @@ namespace ic
     {
         waitForGpu();
         destroyDepthTarget();
+        destroyGraphResources();
         destroyPathTraceResources();
         m_pipelineManager.shutdown();
         m_pipelineHandles.clear();

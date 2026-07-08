@@ -26,10 +26,12 @@ private:
     {
         AppConfigLoadDesc desc{};
         desc.defaultConfigPath =
+            //"demo/res/configs/forward.toml";
+            //"demo/res/configs/clustered_forward.toml";
             "demo/res/configs/path_traced.toml";
         desc.fallbackApp = createFallbackSpecification();
         desc.fallbackStartupScenePath =
-            "demo/res/scene_files/cornell_scene.toml";
+            "demo/res/scene_files/demo_scene.toml";
         return desc;
     }
 
@@ -38,12 +40,12 @@ private:
         AppSpecification spec{};
         spec.appName = "ImageContinuum Example App";
         spec.rendererSpec.backendType = defaultRendererBackend();
-        spec.rendererSpec.pathType = RenderPathType::PathTraced;
+        spec.rendererSpec.pathType = RenderPathType::Forward;
         spec.rendererSpec.useDebugGui = true;
         spec.rendererSpec.enableValidation = true;
         spec.rendererSpec.framesInFlight = 2;
         spec.rendererSpec.pipelineLibraryPath =
-            "demo/res/pipelines/path_tracing.toml";
+            "demo/res/pipelines/demo_scene.toml";
         spec.resourceRoots.assetRoot = "demo/res";
         spec.resourceRoots.modelRoot = "demo/res/models";
         spec.window.width = 1920;

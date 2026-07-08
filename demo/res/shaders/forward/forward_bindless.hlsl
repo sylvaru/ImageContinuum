@@ -4,6 +4,23 @@
 #include "../common/ic_bindless.hlsli"
 #include "../common/brdf.hlsli"
 
+#if defined(IC_TARGET_VULKAN)
+[[vk::binding(4098, 0)]]
+#endif
+TextureCube<float4> gIrradianceTexture : register(t0, space1);
+#if defined(IC_TARGET_VULKAN)
+[[vk::binding(4099, 0)]]
+#endif
+TextureCube<float4> gPrefilteredEnvironmentTexture : register(t1, space1);
+#if defined(IC_TARGET_VULKAN)
+[[vk::binding(4100, 0)]]
+#endif
+Texture2D<float4> gBrdfLutTexture : register(t2, space1);
+#if defined(IC_TARGET_VULKAN)
+[[vk::binding(256, 0)]]
+#endif
+SamplerState gIblSampler : register(s0, space1);
+
 struct VertexInput
 {
     float3 position : POSITION;
@@ -22,6 +39,7 @@ struct VertexOutput
     float2 uv0 : TEXCOORD2;
     float4 color : TEXCOORD3;
     nointerpolation uint materialIndex : TEXCOORD4;
+    float4 tangent : TEXCOORD5;
 };
 
 VertexOutput VSMain(VertexInput input)
@@ -32,6 +50,8 @@ VertexOutput VSMain(VertexInput input)
         mul(objectData.world, float4(input.position, 1.0f));
     const float3 worldNormal =
         mul((float3x3)objectData.inverseTransposeWorld, input.normal);
+    const float3 worldTangent =
+        mul((float3x3)objectData.world, input.tangent.xyz);
 
     VertexOutput output;
     output.position = mul(gFrame.viewProjection, worldPosition);
@@ -40,45 +60,166 @@ VertexOutput VSMain(VertexInput input)
     output.uv0 = input.uv0;
     output.color = input.color;
     output.materialIndex = gDraw.materialIndex;
+    output.tangent = float4(
+        safeNormalize(worldTangent, float3(1.0f, 0.0f, 0.0f)),
+        input.tangent.w);
     return output;
+}
+
+float4 sampleMaterialTexture(uint textureIndex, uint samplerIndex, float2 uv, float4 fallbackValue)
+{
+#if !defined(IC_DISABLE_TEXTURE_SAMPLING)
+    if (textureIndex != IC_INVALID_BINDLESS_INDEX &&
+        samplerIndex != IC_INVALID_BINDLESS_INDEX)
+    {
+        return gBindlessTextures[NonUniformResourceIndex(textureIndex)].Sample(
+            gBindlessSamplers[NonUniformResourceIndex(samplerIndex)],
+            uv);
+    }
+#else
+    fallbackValue.rgb += 0.0f * float3(textureIndex, samplerIndex, 0.0f);
+#endif
+    return fallbackValue;
 }
 
 float4 PSMain(VertexOutput input) : SV_Target0
 {
     const MaterialData material = gMaterials[input.materialIndex];
-    const uint textureIndex = material.baseColorTextureIndex;
-    const uint samplerIndex = material.samplerIndex;
-
-    float4 sampledBaseColor = float4(1.0f, 1.0f, 1.0f, 1.0f);
-#if !defined(IC_DISABLE_TEXTURE_SAMPLING)
-    if (textureIndex != IC_INVALID_BINDLESS_INDEX &&
-        samplerIndex != IC_INVALID_BINDLESS_INDEX)
-    {
-        sampledBaseColor =
-            gBindlessTextures[NonUniformResourceIndex(textureIndex)].Sample(
-                gBindlessSamplers[NonUniformResourceIndex(samplerIndex)],
-                input.uv0);
-    }
-#else
-    sampledBaseColor.rgb += 0.0f * float3(textureIndex, samplerIndex, 0.0f);
-#endif
+    const float4 sampledBaseColor =
+        sampleMaterialTexture(
+            material.baseColorTextureIndex,
+            material.baseColorSamplerIndex,
+            input.uv0,
+            float4(1.0f, 1.0f, 1.0f, 1.0f));
 
     const float3 baseColor =
         sampledBaseColor.rgb *
         material.baseColorFactor.rgb *
         input.color.rgb;
 
-    const float3 normal = safeNormalize(input.normal, float3(0.0f, 1.0f, 0.0f));
-    const float3 lightDirection = safeNormalize(-gFrame.lightDirection, float3(0.0f, 1.0f, 0.0f));
-    const float ndotl = saturate(dot(normal, lightDirection));
+    const float4 normalSample =
+        sampleMaterialTexture(
+            material.normalTextureIndex,
+            material.normalSamplerIndex,
+            input.uv0,
+            float4(0.5f, 0.5f, 1.0f, 1.0f));
+    const float3 geometricNormal =
+        safeNormalize(input.normal, float3(0.0f, 1.0f, 0.0f));
+    const float3 tangent =
+        safeNormalize(
+            input.tangent.xyz - geometricNormal * dot(input.tangent.xyz, geometricNormal),
+            float3(1.0f, 0.0f, 0.0f));
+    const float3 bitangent =
+        safeNormalize(cross(geometricNormal, tangent) * input.tangent.w, float3(0.0f, 0.0f, 1.0f));
+    const float3 normalMap = normalSample.xyz * 2.0f - 1.0f;
+    const float3 normal =
+        safeNormalize(
+            tangent * normalMap.x +
+            bitangent * normalMap.y +
+            geometricNormal * normalMap.z,
+            geometricNormal);
 
-    const float3 ambient = 0.035f * baseColor;
-    const float3 direct =
-        lambertDiffuse(baseColor) *
-        ndotl *
-        gFrame.lightColor *
-        gFrame.lightIntensity;
-    float3 color = ambient + direct;
+    const float4 metallicRoughnessSample =
+        sampleMaterialTexture(
+            material.metallicRoughnessTextureIndex,
+            material.metallicRoughnessSamplerIndex,
+            input.uv0,
+            float4(1.0f, 1.0f, 0.0f, 1.0f));
+    const float metallic =
+        saturate(material.metallicFactor * metallicRoughnessSample.b);
+    const float roughness =
+        clamp(material.roughnessFactor * metallicRoughnessSample.g, 0.04f, 1.0f);
+
+    const float ao =
+        lerp(
+            1.0f,
+            sampleMaterialTexture(
+                material.occlusionTextureIndex,
+                material.occlusionSamplerIndex,
+                input.uv0,
+                float4(1.0f, 1.0f, 1.0f, 1.0f)).r,
+            saturate(material.occlusionStrength));
+    const float3 emissive =
+        material.emissiveFactor.rgb *
+        sampleMaterialTexture(
+            material.emissiveTextureIndex,
+            material.emissiveSamplerIndex,
+            input.uv0,
+            float4(1.0f, 1.0f, 1.0f, 1.0f)).rgb;
+
+    const float3 viewDirection =
+        safeNormalize(gFrame.cameraPosition - input.worldPosition, normal);
+    const float3 lightDirection = safeNormalize(-gFrame.lightDirection, float3(0.0f, 1.0f, 0.0f));
+    float3 direct =
+        pbrDirectLighting(
+            baseColor,
+            metallic,
+            roughness,
+            normal,
+            viewDirection,
+            lightDirection,
+            gFrame.lightColor * gFrame.lightIntensity);
+
+    const uint pointLightCount = min(gFrame.pointLightCount, IC_MAX_POINT_LIGHTS);
+    for (uint lightIndex = 0; lightIndex < pointLightCount; ++lightIndex)
+    {
+        const float4 positionRange = gFrame.pointLightPositionRange[lightIndex];
+        const float4 colorIntensity = gFrame.pointLightColorIntensity[lightIndex];
+        const float3 toLight = positionRange.xyz - input.worldPosition;
+        const float distanceSq = max(dot(toLight, toLight), 1.0e-4f);
+        const float distance = sqrt(distanceSq);
+        const float range = max(positionRange.w, 0.001f);
+        const float rangeAttenuation =
+            saturate(1.0f - (distance / range) * (distance / range));
+        const float attenuation =
+            (rangeAttenuation * rangeAttenuation) / distanceSq;
+        direct +=
+            pbrDirectLighting(
+                baseColor,
+                metallic,
+                roughness,
+                normal,
+                viewDirection,
+                toLight / distance,
+                colorIntensity.rgb * colorIntensity.w * attenuation);
+    }
+
+    float3 ambient = 0.03f * baseColor * ao;
+    if (gFrame.environmentEnabled != 0u)
+    {
+        const float3 reflection =
+            reflect(-viewDirection, normal);
+        const float nDotV = saturate(dot(normal, viewDirection));
+        const float3 f0 =
+            lerp(float3(0.04f, 0.04f, 0.04f), baseColor, metallic);
+        const float3 fresnel =
+            fresnelSchlickRoughness(nDotV, f0, roughness);
+        const float3 diffuseIrradiance =
+            gIrradianceTexture.SampleLevel(gIblSampler, normal, 0.0f).rgb;
+        const float maxMip =
+            max((float)gFrame.prefilteredMipCount - 1.0f, 0.0f);
+        const float3 prefilteredColor =
+            gPrefilteredEnvironmentTexture.SampleLevel(
+                gIblSampler,
+                reflection,
+                roughness * maxMip).rgb;
+        const float2 brdf =
+            gBrdfLutTexture.SampleLevel(
+                gIblSampler,
+                float2(nDotV, roughness),
+                0.0f).rg;
+        const float3 diffuse =
+            diffuseIrradiance * baseColor * (1.0f - metallic);
+        const float3 specular =
+            prefilteredColor * (fresnel * brdf.x + brdf.y);
+        ambient =
+            (diffuse + specular) *
+            ao *
+            gFrame.environmentIntensity *
+            gFrame.environmentExposure;
+    }
+
+    float3 color = ambient + direct + emissive;
     color = color / (color + 1.0f);
     color = pow(max(color, 0.0f), 1.0f / 2.2f);
 

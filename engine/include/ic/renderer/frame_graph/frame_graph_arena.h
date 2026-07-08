@@ -27,6 +27,7 @@ namespace ic
         FrameGraphArena(
             FrameGraphArena&&) = delete;
 
+
         FrameGraphArena& operator=(
             FrameGraphArena&&) = delete;
 

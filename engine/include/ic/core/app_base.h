@@ -45,7 +45,7 @@ namespace ic
     class AppBase
     {
     public:
-        AppBase(AppSpecification apec);
+        AppBase(AppSpecification spec);
 
         int run(int argc, char** argv);
 

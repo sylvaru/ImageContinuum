@@ -3,10 +3,17 @@
 
 #include <cstdint>
 
+#include <glm/glm.hpp>
+
 namespace ic 
 {
     constexpr uint32_t MaxBindlessTextures = 4096;
     constexpr uint32_t MaxBindlessSamplers = 256;
+    constexpr uint32_t ClusteredForwardTileSizeX = 16;
+    constexpr uint32_t ClusteredForwardTileSizeY = 16;
+    constexpr uint32_t ClusteredForwardSliceCountZ = 24;
+    constexpr uint32_t ClusteredForwardMaxLightsPerCluster = 128;
+    constexpr uint32_t ClusteredForwardMaxVisibleLights = 256;
 
     enum class ResourceMemoryUsage : uint8_t
     {
@@ -23,7 +30,9 @@ namespace ic
         RGBA32_Float,
         BGRA8_UNorm,
         BGRA8_SRGB,
-        D32_Float
+        D32_Float,
+        R32_Float
+
     };
 
     enum class BufferUsageFlags : uint32_t
@@ -49,6 +58,50 @@ namespace ic
         TransferSrc = 1u << 4,
         TransferDst = 1u << 5
     };
+
+    struct alignas(16) GpuClusterBounds
+    {
+        // View-space minimum corner of the cluster AABB.
+        // xyz = min bounds
+        // w   = unused / padding
+        glm::vec4 minBounds;
+
+        // View-space maximum corner of the cluster AABB.
+        // xyz = max bounds
+        // w   = unused / padding
+        glm::vec4 maxBounds;
+    };
+
+    static_assert(sizeof(GpuClusterBounds) == 32);
+    static_assert(alignof(GpuClusterBounds) == 16);
+
+
+    struct alignas(16) GpuClusterLightGrid
+    {
+        // Offset into clusterLightIndexBuffer.
+        uint32_t offset = 0;
+
+        // Number of light indices used by this cluster.
+        uint32_t count = 0;
+
+        // Keep the struct 16-byte aligned and shader-friendly.
+        uint32_t pad0 = 0;
+        uint32_t pad1 = 0;
+    };
+
+    static_assert(sizeof(GpuClusterLightGrid) == 16);
+    static_assert(alignof(GpuClusterLightGrid) == 16);
+
+    struct alignas(16) GpuVisibleLight
+    {
+        glm::vec4 positionRange = glm::vec4(0.0f);
+        glm::vec4 colorIntensity = glm::vec4(0.0f);
+    };
+
+    static_assert(sizeof(GpuVisibleLight) == 32);
+    static_assert(alignof(GpuVisibleLight) == 16);
+
+
 
     constexpr BufferUsageFlags operator|(
         BufferUsageFlags lhs,

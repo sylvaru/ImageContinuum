@@ -25,12 +25,14 @@ near = 0.05
 far = 100.0
 
 [entities.fly_camera]
-move_speed = 3.0
+move_speed = 1.0
 fast_move_multiplier = 4.0
-mouse_sensitivity = 0.0025
+mouse_sensitivity = 0.0015
 yaw = 3.14159265
 pitch = 0.0
 capture_mouse = true
+
+
 
 [[entities]]
 id = 2
@@ -38,9 +40,10 @@ name = "Cornell Box"
 model = "CornellBox-Original.gltf"
 
 [entities.transform]
-translation = [0.0, 0.0, 0.0]
+translation = [2.35, -0.75, 0.35]
 rotation = [0.0, 90.0, 0.0, 1.0]
 scale = [1.0, 1.0, 1.0]
+
 
 [[entities]]
 id = 3

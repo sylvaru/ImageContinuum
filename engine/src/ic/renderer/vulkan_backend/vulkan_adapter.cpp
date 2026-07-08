@@ -254,7 +254,7 @@ namespace ic
 		return true;
 	}
 
-	QueueFamilyIndices VulkanAdapter::findQueueFamilies(VkPhysicalDevice device) 
+	QueueFamilyIndices VulkanAdapter::findQueueFamilies(VkPhysicalDevice device) const
 	{
 		QueueFamilyIndices indices;
 

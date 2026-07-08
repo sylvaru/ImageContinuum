@@ -63,6 +63,7 @@ namespace ic
         ComputeStorageBuffer,
         EnvironmentConvert,
         Skybox,
+        ClusteredForward,
         PathTrace,
         PathTraceTonemap
     };

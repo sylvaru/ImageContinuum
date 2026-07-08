@@ -103,7 +103,6 @@ function compileShader(options, sourcePath, outputRoot) {
   const source = readWithIncludes(sourcePath);
   const stem = path.basename(sourcePath, ".hlsl");
   const commonFlags = options.debug ? ["-Zi", "-Qembed_debug"] : ["-O3"];
-  commonFlags.push("-D", "IC_DISABLE_TEXTURE_SAMPLING=1");
   const vulkanRegisterFlags = [
     "-fvk-b-shift",
     "0",

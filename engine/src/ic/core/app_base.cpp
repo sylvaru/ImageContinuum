@@ -51,15 +51,13 @@ namespace ic
         AppRuntime(AppBase& app)
             : framePipeline(app)
             , eventQueue(std::make_unique<EventQueue>())
-        {
-        }
+        {}
     };
 
     AppBase::AppBase(AppSpecification spec)
         : m_spec(std::move(spec))
         , m_runtime(std::make_unique<AppRuntime>(*this))
-    {
-    }
+    {}
 
     AppBase::~AppBase() = default;
 
@@ -157,8 +155,6 @@ namespace ic
 
     void AppBase::dispatchEvent(EventChannel channel, Event& e)
     {
-
-        // channel based routing
         switch (channel)
         {
         case EventChannel::Input:
@@ -183,16 +179,27 @@ namespace ic
             m_runtime->input->onEvent(e);
         }
 
-        if (e.type == EventType::KeyPressed && e.key.key == IcKey::ESCAPE)
+        if (e.type == EventType::KeyPressed)
         {
-            m_runtime->window->requestClose();
+            const KeyEvent* key = getPayload<KeyEvent>(e);
+
+            if (key && key->key == IcKey::ESCAPE)
+            {
+                m_runtime->window->requestClose();
+            }
         }
 
         if (e.type == EventType::MouseButtonPressed)
         {
-            spdlog::info(
-                "Mouse button: {}",
-                (int)e.mouseButton.button);
+            const MouseButtonEvent* mouseButton =
+                getPayload<MouseButtonEvent>(e);
+
+            if (mouseButton)
+            {
+                spdlog::info(
+                    "Mouse button: {}",
+                    static_cast<int>(mouseButton->button));
+            }
         }
     }
     void AppBase::handleWindowEvent(Event& e)

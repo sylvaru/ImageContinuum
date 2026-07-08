@@ -19,6 +19,7 @@ namespace ic
 {
     inline constexpr uint32_t DefaultPathTraceMaxBounces = 4;
     inline constexpr uint32_t DefaultPathTraceSamplesPerPixel = 2;
+    inline constexpr uint32_t MaxPathTracePointLights = 8;
 
     struct PathTraceConstants
     {
@@ -39,13 +40,23 @@ namespace ic
 
         uint32_t useSceneGeometry = 0;
         uint32_t environmentEnabled = 0;
+        uint32_t sceneEmissiveTriangleIndex = UINT32_MAX;
+        uint32_t paddingScene0 = 0;
+
         float environmentIntensity = 1.0f;
         float environmentExposure = 1.0f;
+        glm::vec2 paddingScene1 = glm::vec2(0.0f);
 
         glm::vec4 cameraPositionAndTanHalfFov = glm::vec4(0.0f);
         glm::vec4 cameraForwardAndAspect = glm::vec4(0.0f);
         glm::vec4 cameraRightAndNear = glm::vec4(0.0f);
         glm::vec4 cameraUpAndFar = glm::vec4(0.0f);
+
+        uint32_t pointLightCount = 0;
+        glm::vec3 padding0 = glm::vec3(0.0f);
+
+        glm::vec4 pointLightPositionRange[MaxPathTracePointLights] = {};
+        glm::vec4 pointLightColorIntensity[MaxPathTracePointLights] = {};
     };
 
     struct TonemapConstants
@@ -67,7 +78,7 @@ namespace ic
         glm::vec2 padding0 = glm::vec2(0.0f);
     };
 
-    static_assert(sizeof(PathTraceConstants) == 128);
+    static_assert(sizeof(PathTraceConstants) == 416);
     static_assert(sizeof(TonemapConstants) == 16);
     static_assert(sizeof(SkyboxConstants) == 80);
 

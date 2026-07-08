@@ -452,7 +452,7 @@ namespace ic
         if (layout == PipelineBindingLayoutKind::PathTrace ||
             layout == PipelineBindingLayoutKind::PathTraceTonemap)
         {
-            VkDescriptorSetLayoutBinding bindings[8]{};
+            VkDescriptorSetLayoutBinding bindings[10]{};
 
             bindings[0].binding = 0;
             bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -466,7 +466,7 @@ namespace ic
 
             const uint32_t bindingCount =
                 layout == PipelineBindingLayoutKind::PathTrace
-                    ? 8u
+                    ? 10u
                     : 3u;
 
             if (layout == PipelineBindingLayoutKind::PathTrace)
@@ -489,6 +489,16 @@ namespace ic
                 bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
                 bindings[7].descriptorCount = 1;
                 bindings[7].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+                bindings[8].binding = MaxBindlessTextures + 2;
+                bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                bindings[8].descriptorCount = MaxBindlessTextures;
+                bindings[8].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
+                bindings[9].binding = MaxBindlessSamplers;
+                bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+                bindings[9].descriptorCount = MaxBindlessSamplers;
+                bindings[9].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
             }
             else
             {
@@ -591,13 +601,64 @@ namespace ic
             return setLayout;
         }
 
+        if (layout == PipelineBindingLayoutKind::ClusteredForward)
+        {
+            VkDescriptorSetLayoutBinding bindings[14]{};
+            bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[2] = { 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[3] = { 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, MaxBindlessTextures,
+                VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[4] = { 100, VK_DESCRIPTOR_TYPE_SAMPLER, MaxBindlessSamplers,
+                VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[5] = { MaxBindlessTextures + 2, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[6] = { MaxBindlessTextures + 3, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[7] = { MaxBindlessTextures + 4, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[8] = { MaxBindlessSamplers, VK_DESCRIPTOR_TYPE_SAMPLER, 1,
+                VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[9] = { 10, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[10] = { 11, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[11] = { 12, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[12] = { 13, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
+            bindings[13] = { 14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{};
+            layoutInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            layoutInfo.bindingCount =
+                static_cast<uint32_t>(std::size(bindings));
+            layoutInfo.pBindings = bindings;
+
+            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            throwIfFailed(
+                vkCreateDescriptorSetLayout(
+                    m_device,
+                    &layoutInfo,
+                    nullptr,
+                    &setLayout),
+                "Failed to create Vulkan clustered forward descriptor set layout.");
+
+            return setLayout;
+        }
+
         if (layout != PipelineBindingLayoutKind::ForwardBindless)
         {
             throw std::runtime_error(
                 "Unsupported Vulkan pipeline binding layout.");
         }
 
-        VkDescriptorSetLayoutBinding bindings[5]{};
+        VkDescriptorSetLayoutBinding bindings[9]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[0].descriptorCount = 1;
@@ -625,6 +686,26 @@ namespace ic
         bindings[4].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         bindings[4].descriptorCount = MaxBindlessSamplers;
         bindings[4].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        bindings[5].binding = MaxBindlessTextures + 2;
+        bindings[5].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bindings[5].descriptorCount = 1;
+        bindings[5].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        bindings[6].binding = MaxBindlessTextures + 3;
+        bindings[6].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bindings[6].descriptorCount = 1;
+        bindings[6].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        bindings[7].binding = MaxBindlessTextures + 4;
+        bindings[7].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+        bindings[7].descriptorCount = 1;
+        bindings[7].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        bindings[8].binding = MaxBindlessSamplers;
+        bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+        bindings[8].descriptorCount = 1;
+        bindings[8].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType =

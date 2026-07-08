@@ -95,8 +95,11 @@ namespace ic
 
         DX12Buffer buffer{};
         buffer.size = desc.size;
+        buffer.usage = desc.usage;
+        buffer.memoryUsage = desc.memoryUsage;
+        buffer.mappedAtCreation = desc.mappedAtCreation;
         buffer.initialState = initialState;
-
+       
         {
             std::scoped_lock lock(m_mutex);
 
@@ -218,22 +221,18 @@ namespace ic
 
     void DX12ResourceAllocator::destroyBuffer(DX12Buffer& buffer)
     {
-        if (!buffer)
-        {
-            return;
-        }
+        if (!buffer) return;
 
-        if (buffer.mapped)
-        {
-            unmap(buffer);
-        }
+        if (buffer.mapped) unmap(buffer);
 
-        buffer = {};
+        buffer.reset();
     }
 
     void DX12ResourceAllocator::destroyTexture(DX12Texture& texture)
     {
-        texture = {};
+        if (!texture) return;
+
+        texture.reset();
     }
 
     void* DX12ResourceAllocator::map(DX12Buffer& buffer)
@@ -241,6 +240,12 @@ namespace ic
         if (!buffer)
         {
             return nullptr;
+        }
+
+        if (buffer.memoryUsage == ResourceMemoryUsage::GpuOnly)
+        {
+            throw std::runtime_error(
+                "Cannot map GPU only buffer");
         }
 
         if (buffer.mapped)

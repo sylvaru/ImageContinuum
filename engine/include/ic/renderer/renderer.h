@@ -1,6 +1,7 @@
 // ic/renderer/renderer.h
 #pragma once
 #include "ic/common/ic_common.h"
+#include "ibl_baker.h"
 #include "renderer_specification.h"
 namespace ic
 {
@@ -37,8 +38,18 @@ namespace ic
         void endDebugGuiFrame();
         [[nodiscard]] bool vsyncEnabled() const;
         void setVsyncEnabled(bool enabled);
+        [[nodiscard]] bool clusteredForwardHeatmapEnabled() const;
+        void setClusteredForwardHeatmapEnabled(bool enabled);
+        [[nodiscard]] RenderPathType renderPathType() const;
         
-        void rebuildGraph();
+        void buildOrRebuildFrameGraph();
+
+        [[nodiscard]] IBLHandle requestIBLBake(
+            const IBLBakeDesc& desc);
+        [[nodiscard]] IBLBakeState iblState(
+            IBLHandle handle) const;
+        [[nodiscard]] IBLProbeSnapshot iblSnapshot(
+            IBLHandle handle) const;
 
         static Scope<RendererBackend> createBackend(
             RendererBackendType type);
@@ -46,6 +57,14 @@ namespace ic
         static Scope<RendererPath> createPath(RenderPathType type);
 
     private:
+
+        void syncSceneEnvironmentIBL(
+            FrameContext& frame,
+            const SceneRenderView& scene);
+
+        void processPendingRendererJobs(
+            FrameContext& frame);
+
         struct Runtime;
         Scope<Runtime> m_runtime;
 

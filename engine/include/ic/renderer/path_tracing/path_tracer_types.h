@@ -52,19 +52,33 @@ namespace ic
     {
         glm::vec4 position{ 0.0f, 0.0f, 0.0f, 1.0f };
         glm::vec4 normal{ 0.0f, 1.0f, 0.0f, 0.0f };
+        glm::vec4 tangent{ 1.0f, 0.0f, 0.0f, 1.0f };
+        glm::vec4 texCoord{ 0.0f };
     };
 
     struct PathTraceMaterial
     {
         glm::vec4 baseColor{ 1.0f };
         glm::vec4 emissive{ 0.0f };
+
+        float metallicFactor = 0.0f;
+        float roughnessFactor = 1.0f;
+        float occlusionStrength = 1.0f;
+        uint32_t materialType = 0;
+
         uint32_t baseColorTextureIndex = UINT32_MAX;
         uint32_t normalTextureIndex = UINT32_MAX;
-        PathTraceMaterialType materialType = PathTraceMaterialType::Diffuse;
-        float roughness = 1.0f;
-        float metallic = 0.0f;
-        float padding = 0.0f;
-        glm::vec2 padding1{ 0.0f };
+        uint32_t metallicRoughnessTextureIndex = UINT32_MAX;
+        uint32_t occlusionTextureIndex = UINT32_MAX;
+
+        uint32_t emissiveTextureIndex = UINT32_MAX;
+        uint32_t baseColorSamplerIndex = UINT32_MAX;
+        uint32_t normalSamplerIndex = UINT32_MAX;
+        uint32_t metallicRoughnessSamplerIndex = UINT32_MAX;
+
+        uint32_t occlusionSamplerIndex = UINT32_MAX;
+        uint32_t emissiveSamplerIndex = UINT32_MAX;
+        glm::vec2 padding0{ 0.0f };
     };
 
     struct PathTraceTriangle
@@ -100,10 +114,11 @@ namespace ic
         std::vector<PathTraceMaterial> materials;
         std::vector<PathTraceTriangle> triangles;
         std::vector<PathTraceBVHNode> bvhNodes;
+        uint32_t firstEmissiveTriangleIndex = UINT32_MAX;
     };
 
-    static_assert(sizeof(PathTraceVertex) == 32);
-    static_assert(sizeof(PathTraceMaterial) == 64);
+    static_assert(sizeof(PathTraceVertex) == 64);
+    static_assert(sizeof(PathTraceMaterial) == 96);
     static_assert(sizeof(PathTraceTriangle) == 16);
     static_assert(sizeof(PathTraceBVHNode) == 32);
 }

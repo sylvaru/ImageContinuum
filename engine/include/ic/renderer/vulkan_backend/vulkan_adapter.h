@@ -28,7 +28,7 @@ namespace ic
 	private:
 		bool isSuitable(VkPhysicalDevice device);
 		QueueFamilyIndices findQueueFamilies(
-			VkPhysicalDevice device);
+			VkPhysicalDevice device) const;
 
 
 		void logDeviceInfo() const;
