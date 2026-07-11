@@ -19,7 +19,7 @@ namespace ic
         Transfer
     };
 
-    enum class GraphNodeType
+    enum class GraphNodeType : uint8_t
     {
         Graphics,
         Compute,
@@ -53,6 +53,7 @@ namespace ic
 
         ConstantBuffer,
         StorageBuffer,
+        IndirectArgument,
 
         TransferSrc,
         TransferDst,
@@ -84,6 +85,7 @@ namespace ic
 
         ResourceUsage oldUsage;
         ResourceUsage newUsage;
+        bool firstUse = false;
     };
 
     struct ResourceAccess
@@ -172,6 +174,21 @@ namespace ic
         uint32_t nodeCount = 0;
     };
 
+    struct QueueSubmissionWait
+    {
+        uint32_t submissionIndex = 0;
+    };
+
+    struct QueueSubmissionBatch
+    {
+        QueueType queue = QueueType::Graphics;
+        uint32_t levelIndex = 0;
+        uint32_t firstNode = 0;
+        uint32_t nodeCount = 0;
+        uint32_t firstWait = 0;
+        uint32_t waitCount = 0;
+    };
+
     struct ExecutionNode
     {
         GraphNodeId nodeId;
@@ -187,7 +204,36 @@ namespace ic
         uint32_t dependencyCount;
 
         uint32_t payloadIndex;
+
+        // Contiguous range in CompiledGraphPlan::resourceAccesses. Backends
+        // consume these declared bindings directly; barriers are synchronization
+        // output and must never be used to rediscover pass inputs/outputs.
+        uint32_t firstResourceAccess = 0;
+        uint32_t resourceAccessCount = 0;
     };
 
+    static_assert(sizeof(QueueType) == 1);
+    static_assert(sizeof(GraphNodeType) == 1);
+    static_assert(sizeof(GraphResourceType) == 1);
+    static_assert(sizeof(AccessType) == 1);
+    static_assert(sizeof(ResourceUsage) == 1);
+    static_assert(sizeof(ResourceOwnership) == 1);
+    static_assert(sizeof(ImportedResource) == 1);
 
+    static_assert(sizeof(ResourceBarrier) == 20);
+    static_assert(sizeof(ResourceAccess) == 12);
+    static_assert(sizeof(ResourceState) == 2);
+    static_assert(sizeof(ImportedResourceDesc) == 2);
+
+    static_assert(sizeof(ResourceLifetime) == 12);
+    static_assert(sizeof(Dependency) == 8);
+
+    static_assert(sizeof(GraphNode) == 12);
+    static_assert(sizeof(NodeRecord) == 12);
+    static_assert(sizeof(NodeSchedule) == 20);
+
+    static_assert(sizeof(ExecutionLevel) == 8);
+    static_assert(sizeof(QueueSubmissionWait) == 4);
+    static_assert(sizeof(QueueSubmissionBatch) == 24);
+    static_assert(sizeof(ExecutionNode) == 36);
 }

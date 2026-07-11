@@ -57,6 +57,8 @@ namespace ic
             return m_features;
         }
 
+        void logValidationMessages();
+
     private:
         void queryFeatureSupport();
 
@@ -66,6 +68,7 @@ namespace ic
             const wchar_t* name) const;
 
         Microsoft::WRL::ComPtr<ID3D12Device5> m_device;
+        Microsoft::WRL::ComPtr<ID3D12InfoQueue> m_infoQueue;
         Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_graphicsQueue;
         Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_computeQueue;
         Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_copyQueue;

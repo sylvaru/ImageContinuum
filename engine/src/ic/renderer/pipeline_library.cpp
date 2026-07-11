@@ -382,6 +382,10 @@ namespace ic
             return PipelineBindingLayoutKind::Skybox;
         if (value == "ClusteredForward")
             return PipelineBindingLayoutKind::ClusteredForward;
+        if (value == "HiZDepthPyramid")
+            return PipelineBindingLayoutKind::HiZDepthPyramid;
+        if (value == "GpuFrustumCull")
+            return PipelineBindingLayoutKind::GpuFrustumCull;
         if (value == "PathTrace")
             return PipelineBindingLayoutKind::PathTrace;
         if (value == "PathTraceTonemap")
@@ -427,6 +431,7 @@ namespace ic
         if (value == "BGRA8_UNorm") return TextureFormat::BGRA8_UNorm;
         if (value == "BGRA8_SRGB") return TextureFormat::BGRA8_SRGB;
         if (value == "D32_Float") return TextureFormat::D32_Float;
+        if (value == "R32_Float") return TextureFormat::R32_Float;
         if (value == "Unknown") return TextureFormat::Unknown;
         throw std::runtime_error("Invalid texture format.");
     }

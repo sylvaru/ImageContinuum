@@ -3,6 +3,7 @@
 #include "renderer_path.h"
 #include "ic/renderer/frame_graph/frame_graph_types.h"
 #include "ic/renderer/frame_graph/frame_graph_builder.h"
+#include "ic/renderer/gpu_driven_submission.h"
 
 namespace ic
 {
@@ -14,6 +15,7 @@ namespace ic
         GraphResourceId sceneDepth;
         //GraphResourceId visibilityBuffer;
         GraphResourceId environmentCubemap;
+        GpuDrivenGraphResources gpuDriven;
 
         void buildFrameGraph(
             RendererPathContext& ctx,
@@ -54,22 +56,14 @@ namespace ic
                 .debugName = "Environment.SkyboxCubemap"
                 });
 
-            EnvironmentConvertPassData environmentConvert{};
-            environmentConvert.outputCubemap = environmentCubemap;
-            auto environmentNode =
-                builder.addGraphNode(
-                    environmentConvert,
-                    GraphNodeType::Compute,
-                    QueueType::Compute);
-            builder.write(
-                environmentNode,
-                environmentCubemap,
-                ResourceUsage::StorageTexture);
+            gpuDriven = declareGpuDrivenResources(builder);
+            addGpuDrivenCullPasses(builder, gpuDriven);
 
-            builder.addGraphicsPass("DepthPrepass")
+            auto depthNode = builder.addGraphicsPass("DepthPrepass")
                 .pipeline("depth_prepass")
                 .drawList(DrawListKind::SceneGeometry)
                 .depth(sceneDepth);
+            readGpuDrivenStream(builder, depthNode, gpuDriven);
 
             auto forwardNode = builder.addGraphicsPass("ForwardOpaque")
                 .pipeline("forward_bindless")
@@ -77,6 +71,7 @@ namespace ic
                 .depthLoadOp(AttachmentLoadOp::Load)
                 .color(backBuffer)
                 .depth(sceneDepth);
+            readGpuDrivenStream(builder, forwardNode, gpuDriven);
 
             //builder.read(
             //    forwardNode,

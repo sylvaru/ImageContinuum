@@ -10,11 +10,15 @@
 #include "ic/renderer/vulkan_backend/vulkan_descriptor_system.h"
 #include "ic/renderer/vulkan_backend/vulkan_pipeline_manager.h"
 #include "ic/renderer/vulkan_backend/vulkan_resource_allocator.h"
+#include "ic/renderer/vulkan_backend/vulkan_graph_resource_registry.h"
+#include "ic/renderer/vulkan_backend/vulkan_frame_executor.h"
+#include "ic/renderer/vulkan_backend/vulkan_gpu_scene.h"
 #include "ic/renderer/renderer_gpu_assets.h"
 #include "ic/renderer/path_tracing/path_tracer_types.h"
 
 #include <glm/glm.hpp>
 #include <unordered_map>
+#include <array>
 #include <vector>
 
 namespace ic
@@ -51,6 +55,10 @@ namespace ic
         void setVsyncEnabled(bool enabled) override;
         bool clusteredForwardHeatmapEnabled() const override;
         void setClusteredForwardHeatmapEnabled(bool enabled) override;
+        bool hiZDebugViewEnabled() const override;
+        void setHiZDebugViewEnabled(bool enabled) override;
+        uint32_t hiZDebugMip() const override;
+        void setHiZDebugMip(uint32_t mip) override;
 
         VulkanResourceAllocator& resourceAllocator()
         {
@@ -62,58 +70,10 @@ namespace ic
             return m_resourceAllocator;
         }
 
-        struct FrameSync
-        {
-            VkFence inFlightFence = VK_NULL_HANDLE;
-            VkSemaphore imageAvailable = VK_NULL_HANDLE;
-        };
-
-        struct VulkanResource
-        {
-            VkImage image;
-            VkBuffer buffer;
-            VkImageLayout currentLayout;
-        };
-
-        struct GraphResourceEntry
-        {
-            GraphResourceType type = GraphResourceType::Texture;
-            ResourceOwnership ownership = ResourceOwnership::Transient;
-            ImportedResource imported = ImportedResource::None;
-            VulkanTexture texture;
-            VulkanBuffer buffer;
-            VkImageView view = VK_NULL_HANDLE;
-            VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
-            uint32_t width = 0;
-            uint32_t height = 0;
-            uint32_t mipLevels = 1;
-            uint32_t arrayLayers = 1;
-
-            GraphResourceEntry() = default;
-
-            GraphResourceEntry(const GraphResourceEntry&) = delete;
-            GraphResourceEntry& operator=(const GraphResourceEntry&) = delete;
-
-            GraphResourceEntry(GraphResourceEntry&&) noexcept = default;
-            GraphResourceEntry& operator=(GraphResourceEntry&&) noexcept = default;
-        };
-
         struct ImageState
         {
             VkImageLayout layout;
             AccessType access;
-        };
-
-        struct UploadedModel
-        {
-            VulkanBuffer vertexBuffer;
-            VulkanBuffer indexBuffer;
-            std::vector<GpuMesh> meshes;
-            std::vector<glm::mat4> meshTransforms;
-            std::vector<GpuMaterialData> materials;
-            std::vector<uint32_t> textureDescriptorIndices;
-            std::vector<uint32_t> samplerDescriptorIndices;
-            bool uploaded = false;
         };
 
         struct UploadedTexture
@@ -128,47 +88,6 @@ namespace ic
         {
             VkSampler sampler = VK_NULL_HANDLE;
             uint32_t descriptorIndex = UINT32_MAX;
-        };
-
-        struct FrameSceneResources
-        {
-            VulkanBuffer frameConstants;
-            VulkanBuffer objects;
-            VulkanBuffer materials;
-            VulkanBuffer visibleLights;
-
-            VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
-            VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
-
-            uint32_t objectCapacity = 0;
-            uint32_t materialCapacity = 0;
-            uint32_t visibleLightCapacity = 0;
-            uint32_t bindlessTextureCount = 0;
-            uint32_t bindlessSamplerCount = 0;
-            uint64_t environmentVersion = UINT64_MAX;
-            bool iblBaked = false;
-            PipelineBindingLayoutKind descriptorLayout =
-                PipelineBindingLayoutKind::Unknown;
-        };
-
-        struct DrawItem
-        {
-            UploadedModel* model = nullptr;
-            uint32_t objectIndex = 0;
-            uint32_t meshIndex = 0;
-            uint32_t materialIndex = 0;
-        };
-
-        struct PreparedSceneFrame
-        {
-            uint64_t frameIndex = UINT64_MAX;
-            bool valid = false;
-
-            std::vector<DrawItem> draws;
-            std::vector<GpuObjectData> objects;
-            std::vector<GpuMaterialData> materials;
-            std::unordered_map<AssetHandle, uint32_t, AssetHandleHash>
-                materialOffsets;
         };
 
         struct PathTraceResources
@@ -254,14 +173,26 @@ namespace ic
             bool skyboxDescriptorsDirty = true;
         };
 
+        // Clustered-light-grid + Hi-Z debug overlay resources. The GPU-driven
+        // cull/indirect-draw buffers live in VulkanGpuScene (m_gpuScene)
+        // instead, since they are a separate concern (draw submission, not
+        // light clustering or debug visualization).
         struct ClusteredForwardResources
         {
             VulkanBuffer clusterBounds;
             VulkanBuffer clusterLightGrid;
             VulkanBuffer clusterLightIndices;
             VulkanBuffer clusterLightCounter;
+            VkSampler hiZDebugSampler = VK_NULL_HANDLE;
+            std::vector<VkImageView> hiZDebugViews;
+            std::vector<VkDescriptorSet> hiZDebugDescriptors;
+            GraphResourceId hiZDebugResource = InvalidGraphResourceId;
+            uint64_t hiZDebugGeneration = 0;
             uint32_t width = 0;
             uint32_t height = 0;
+            uint32_t hiZMipCount = 0;
+            bool loggedHiZ = false;
+            bool loggedHiZDebugResource = false;
             uint32_t clusterCountX = 0;
             uint32_t clusterCountY = 0;
             uint32_t clusterCountZ = 0;
@@ -305,12 +236,9 @@ namespace ic
             const ResourceBarrier& barrier,
             std::span<const GraphResource> resources,
             VkImage swapchainImage,
-            VkImageLayout swapchainInitialLayout);
-
-        void submitFrame(
-            std::span<const VkCommandBuffer> commandBuffers,
-            FrameSync& sync,
-            VkSemaphore renderFinished);
+            VkImageLayout swapchainInitialLayout,
+            bool crossQueue,
+            QueueType commandQueue);
 
         void executeGraphicsNode(
             const CompiledGraphPlan& plan,
@@ -385,19 +313,13 @@ namespace ic
             VkCommandBuffer cmd);
         void ensureDepthTarget();
         void destroyDepthTarget();
-        void materializeGraphResources(
-            const CompiledGraphPlan& plan,
-            VkImage swapchainImage);
-        void destroyGraphResources();
-        GraphResourceEntry* graphResource(GraphResourceId id);
-        const GraphResourceEntry* graphResource(GraphResourceId id) const;
-        GraphResourceId findGraphAttachment(
-            const CompiledGraphPlan& plan,
-            GraphNodeId node,
-            ResourceUsage usage) const;
+        void drawHiZDebugWindow();
+        void ensureHiZDebugDescriptors(VulkanGraphResourceEntry& hiZ);
+        void destroyHiZDebugDescriptors();
         void ensureComputeTestResources(
             const VulkanComputePipeline& pipeline);
         void ensureClusteredForwardResources();
+        void ensureGpuDrivenResources();
         bool bindClusteredForwardCompute(
             const VulkanComputePipeline& pipeline,
             const FrameContext& ctx,
@@ -407,9 +329,12 @@ namespace ic
             const VulkanGraphicsPipeline& pipeline,
             const FrameContext& ctx,
             VkCommandBuffer cmd);
+        void readbackVisibleInstanceCount(
+            const FrameContext& ctx,
+            VkCommandBuffer cmd);
         void destroyClusteredForwardResources();
 
-        UploadedModel* requestModel(
+        VulkanUploadedModel* requestModel(
             AssetHandle handle,
             const AssetManager& assets);
 
@@ -424,7 +349,8 @@ namespace ic
         bool prepareSceneResources(
             const FrameContext& ctx,
             const SceneRenderView& scene,
-            GraphicsPipelineHandle pipelineHandle);
+            GraphicsPipelineHandle pipelineHandle,
+            bool updateGraphicsDescriptors = true);
 
         GraphicsPipelineHandle pipelineForNode(
             const CompiledGraphPlan& plan,
@@ -435,13 +361,9 @@ namespace ic
             const ExecutionNode& node);
 
         void updateFrameDescriptors(
-            FrameSceneResources& resources,
+            VulkanGpuSceneFrameResources& resources,
             GraphicsPipelineHandle pipelineHandle);
 
-        void initFrameSync(const RendererSpecification& spec);
-        void initSwapchainSync();
-        void destroyFrameSync();
-        void destroySwapchainSync();
         void onSwapchainRecreated();
         TextureFormat swapchainTextureFormat() const;
 
@@ -465,18 +387,13 @@ namespace ic
             VkAccessFlags srcAccess,
             VkAccessFlags dstAccess,
             VkPipelineStageFlags srcStage,
-            VkPipelineStageFlags dstStage);
+            VkPipelineStageFlags dstStage,
+            uint32_t baseMipLevel = 0,
+            uint32_t levelCount = 1);
 
-        std::unordered_map<GraphResourceId, VulkanResource> m_resources;
-        std::unordered_map<GraphResourceId, GraphResourceEntry>
-            m_graphResources;
+        VulkanGraphResourceRegistry m_graphResourceRegistry;
+        VulkanFrameExecutor m_frameExecutor;
         std::unordered_map<VkImage, ImageState> m_imageStates;
-
-        std::vector<FrameSync> m_frameSync;
-        uint32_t m_currentSwapchainImage = 0;
-        std::vector<VkSemaphore> m_imageRenderFinished;
-        std::vector<VkFence> m_imagesInFlight;
-        std::vector<VkImageLayout> m_swapchainImageLayouts;
 
         VulkanInstance m_instance;
         VulkanPlatform m_platform;
@@ -503,15 +420,16 @@ namespace ic
         const PipelineLibrary* m_pipelineLibrary = nullptr;
         std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash> m_pipelineHandles;
         std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash> m_computePipelineHandles;
-        std::unordered_map<AssetHandle, UploadedModel, AssetHandleHash> m_uploadedModels;
+        std::unordered_map<AssetHandle, VulkanUploadedModel, AssetHandleHash> m_uploadedModels;
         std::unordered_map<uint64_t, UploadedTexture> m_uploadedTextures;
         std::unordered_map<uint64_t, UploadedSampler> m_uploadedSamplers;
-        std::vector<FrameSceneResources> m_sceneFrameResources;
-        PreparedSceneFrame m_preparedScene;
+        VulkanGpuScene m_gpuScene;
         uint32_t m_workerSlots = 1;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;
         bool m_clusteredForwardHeatmapEnabled = false;
+        bool m_hiZDebugViewEnabled = false;
+        uint32_t m_hiZDebugMip = 0;
         std::string m_imguiIniPath;
     };
 }

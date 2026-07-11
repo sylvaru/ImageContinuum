@@ -42,9 +42,10 @@ struct VertexOutput
     float4 tangent : TEXCOORD5;
 };
 
-VertexOutput VSMain(VertexInput input)
+VertexOutput VSMain(VertexInput input, uint instanceId : SV_InstanceID)
 {
-    const ObjectData objectData = gObjects[gDraw.objectIndex];
+    const DrawMetadata draw = resolveDrawMetadata(instanceId);
+    const ObjectData objectData = gObjects[draw.transformIndex];
 
     const float4 worldPosition =
         mul(objectData.world, float4(input.position, 1.0f));
@@ -59,7 +60,7 @@ VertexOutput VSMain(VertexInput input)
     output.normal = safeNormalize(worldNormal, float3(0.0f, 1.0f, 0.0f));
     output.uv0 = input.uv0;
     output.color = input.color;
-    output.materialIndex = gDraw.materialIndex;
+    output.materialIndex = draw.materialIndex;
     output.tangent = float4(
         safeNormalize(worldTangent, float3(1.0f, 0.0f, 0.0f)),
         input.tangent.w);

@@ -11,7 +11,7 @@ asset_root = "demo/res"
 model_root = "demo/res/models"
 
 [renderer]
-backend = "DX12"
+backend = "Vulkan"
 path = "ClusteredForward"
 validation = true
 debug_gui = true

@@ -2,11 +2,14 @@
 #include "ic/core/app_base.h"
 #include "ic/core/asset_manager.h"
 #include "ic/renderer/pipeline_library.h"
+#include "ic/renderer/gpu_driven_submission.h"
+#include "ic/renderer/vulkan_backend/vulkan_pass_recorders.h"
 #include "ic/renderer/renderer_specification.h"
 #include "ic/renderer/path_tracing/path_trace_scene_builder.h"
 #include "ic/renderer/renderer_common/renderer_util.h"
 #include "ic/interface/window.h"
 #include "ic/core/frame_context.h"
+#include "ic/renderer/frame_graph/frame_graph_executor.h"
 #include "ic/scene/scene_render_view.h"
 
 #include <glm/ext/matrix_clip_space.hpp>
@@ -87,11 +90,11 @@ namespace ic
             workerCount == 0 ? 1 : workerCount;
         m_workerSlots = workerSlots;
 
-        initFrameSync(spec);
+        m_frameExecutor.init(m_device, m_swapchain, framesInFlight);
 
 		m_commandSystem.init(
 			m_device.device(),
-			m_adapter.info().queueFamilies.graphics,
+			m_adapter.info().queueFamilies,
 			framesInFlight,
 			workerSlots);
 
@@ -99,8 +102,13 @@ namespace ic
             m_device.device(),
             m_device.info());
 
+        m_graphResourceRegistry.init(
+            m_device,
+            m_resourceAllocator,
+            framesInFlight);
+        m_gpuScene.init(m_resourceAllocator, framesInFlight);
+
         m_pipelineManager.init(m_device.device());
-        m_sceneFrameResources.resize(framesInFlight);
         m_pipelineLibrary = &pipelineLibrary;
 
         if (spec.useDebugGui)
@@ -121,11 +129,10 @@ namespace ic
         destroyEnvironmentResources();
         destroyClusteredForwardResources();
         destroyPathTraceResources();
-        destroyGraphResources();
+        m_graphResourceRegistry.shutdown();
         m_pipelineManager.shutdown();
 
-        destroySwapchainSync();
-        destroyFrameSync();
+        m_frameExecutor.shutdown();
 
         m_descriptorSystem.shutdown();
         m_resourceAllocator.shutdown();
@@ -149,59 +156,61 @@ namespace ic
             vkDeviceWaitIdle(m_device.device());
         }
 
+        if (!m_frameExecutor.ready())
+        {
+            return;
+        }
+
         const uint32_t frameSlot =
-            static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size());
+            static_cast<uint32_t>(
+                ctx.frameIndex % m_frameExecutor.framesInFlight());
 
-        auto& frameSync =
-            m_frameSync[frameSlot];
+        m_frameExecutor.waitForFrameSlot(frameSlot);
 
-        vkWaitForFences(
-            m_device.device(),
-            1,
-            &frameSync.inFlightFence,
-            VK_TRUE,
-            UINT64_MAX);
+        if (frameSlot < m_gpuScene.frameSlotCount())
+        {
+            VulkanGpuSceneFrameResources& resources =
+                m_gpuScene.frameResources(frameSlot);
+            if (resources.hiZDescriptorPool != VK_NULL_HANDLE)
+            {
+                vkResetDescriptorPool(
+                    m_device.device(),
+                    resources.hiZDescriptorPool,
+                    0);
+            }
+            if (resources.gpuCullDescriptorPool != VK_NULL_HANDLE)
+            {
+                vkResetDescriptorPool(
+                    m_device.device(),
+                    resources.gpuCullDescriptorPool,
+                    0);
+            }
+        }
 
-        // Acquire swapchain image
-        uint32_t imageIndex =
-            m_swapchain.acquireNextImage(
-                frameSync.imageAvailable);
-
-        if (imageIndex == UINT32_MAX)
+        const VulkanFrameExecutor::AcquiredFrame frame =
+            m_frameExecutor.acquire(frameSlot);
+        if (!frame.acquired)
         {
             onSwapchainRecreated();
             return;
         }
 
-        m_currentSwapchainImage = imageIndex;
+        VkImage swapchainImage = frame.swapchainImage;
 
-        VkImage swapchainImage =
-            m_swapchain.image(imageIndex);
+        // The slot's prior GPU work completed in waitForFrameSlot above, so any
+        // resources retired the last time this slot was used are now safe to
+        // free without adding a GPU wait.
+        m_graphResourceRegistry.recycleFrameSlot(frameSlot);
 
-        materializeGraphResources(plan, swapchainImage);
-
-        const VkImageLayout swapchainInitialLayout =
-            imageIndex < m_swapchainImageLayouts.size()
-            ? m_swapchainImageLayouts[imageIndex]
-            : VK_IMAGE_LAYOUT_UNDEFINED;
-
-        if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE)
-        {
-            vkWaitForFences(
-                m_device.device(),
-                1,
-                &m_imagesInFlight[imageIndex],
-                VK_TRUE,
-                UINT64_MAX);
-        }
-
-        m_imagesInFlight[imageIndex] =
-            frameSync.inFlightFence;
-
-        vkResetFences(
-            m_device.device(),
-            1,
-            &frameSync.inFlightFence);
+        VulkanGraphResourceImports graphImports{};
+        graphImports.swapchainImage = swapchainImage;
+        const VkExtent2D graphExtent = m_swapchain.extent();
+        m_graphResourceRegistry.materialize(
+            plan,
+            frameSlot,
+            graphExtent.width,
+            graphExtent.height,
+            graphImports);
 
         m_commandSystem.beginFrame(frameSlot);
 
@@ -211,34 +220,15 @@ namespace ic
             ctx,
             scene,
             swapchainImage,
-            swapchainInitialLayout,
+            frame.initialLayout,
             commandBuffers);
         recordImGui(
             ctx,
             swapchainImage,
             commandBuffers);
 
-        VkSemaphore renderFinished =
-            m_imageRenderFinished[imageIndex];
-
-        // Submit
-        submitFrame(
-            commandBuffers,
-            frameSync,
-            renderFinished);
-
-        if (imageIndex < m_swapchainImageLayouts.size())
-        {
-            m_swapchainImageLayouts[imageIndex] =
-                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        }
-
-        // Present
         const bool presented =
-            m_swapchain.present(
-                m_device.presentQueue(),
-                imageIndex,
-                renderFinished);
+            m_frameExecutor.submitAndPresent(plan, commandBuffers, frameSlot);
 
         if (!presented)
         {
@@ -246,41 +236,6 @@ namespace ic
         }
     }
 
-
-    void VulkanBackend::submitFrame(
-        std::span<const VkCommandBuffer> commandBuffers,
-        FrameSync& sync,
-        VkSemaphore renderFinished)
-    {
-        VkPipelineStageFlags waitStage =
-            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
-
-        VkSubmitInfo submit{};
-        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-
-        submit.waitSemaphoreCount = 1;
-        submit.pWaitSemaphores = &sync.imageAvailable;
-        submit.pWaitDstStageMask = &waitStage;
-
-        submit.commandBufferCount =
-            static_cast<uint32_t>(commandBuffers.size());
-        submit.pCommandBuffers = commandBuffers.data();
-
-        submit.signalSemaphoreCount = 1;
-        submit.pSignalSemaphores = &renderFinished;
-
-        VkResult result =
-            vkQueueSubmit(
-                m_device.graphicsQueue(),
-                1,
-                &submit,
-                sync.inFlightFence);
-
-        if (result != VK_SUCCESS)
-        {
-            throw std::runtime_error("Failed to submit Vulkan frame.");
-        }
-    }
 
     void VulkanBackend::executeGraph(
         const CompiledGraphPlan& plan,
@@ -290,13 +245,41 @@ namespace ic
         VkImageLayout swapchainInitialLayout,
         std::vector<VkCommandBuffer>& commandBuffers)
     {
+        // Resolve lazy pipeline/resource state before worker threads begin.
+        // Recording jobs may only read this shared renderer state.
+        ensureDepthTarget();
+        ensureGpuDrivenResources();
+        ensureClusteredForwardResources();
+        for (const ExecutionNode& node : plan.nodes)
+        {
+            if (node.type == GraphNodeType::Graphics)
+            {
+                const GraphicsPipelineHandle handle =
+                    pipelineForNode(plan, node);
+                const GraphicsPassData* pass =
+                    node.payloadIndex < plan.payloads.size()
+                        ? std::get_if<GraphicsPassData>(
+                            &plan.payloads[node.payloadIndex])
+                        : nullptr;
+                if (pass && pass->drawList == DrawListKind::SceneGeometry)
+                {
+                    (void)prepareSceneResources(ctx, scene, handle);
+                }
+            }
+            else if (node.type == GraphNodeType::Compute)
+            {
+                (void)computePipelineForNode(plan, node);
+            }
+        }
+
         auto recordNode =
             [&](GraphNodeId nodeId, uint32_t workerIndex)
             {
                 auto lease =
                     m_commandSystem.acquireFrameCommandBuffer(
-                        static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size()),
-                        workerIndex);
+                        static_cast<uint32_t>(ctx.frameIndex % m_frameExecutor.framesInFlight()),
+                        workerIndex,
+                        plan.nodes[nodeId].queue);
 
                 VkCommandBuffer cmd =
                     lease.commandBuffer();
@@ -339,28 +322,12 @@ namespace ic
                 return cmd;
             };
 
-        if (plan.executionLevels.empty())
-        {
-            for (uint32_t i = 0; i < plan.executionOrder.size(); ++i)
-            {
-                commandBuffers.push_back(
-                    recordNode(plan.executionOrder[i], i % m_workerSlots));
-            }
-
-            return;
-        }
-
-        for (const ExecutionLevel& level : plan.executionLevels)
-        {
-            for (uint32_t i = 0; i < level.nodeCount; ++i)
-            {
-                const GraphNodeId nodeId =
-                    plan.executionLevelNodes[level.firstNode + i];
-
-                commandBuffers.push_back(
-                    recordNode(nodeId, i % m_workerSlots));
-            }
-        }
+        recordFrameGraph(
+            plan,
+            ctx.services ? ctx.services->jobSystem : nullptr,
+            m_workerSlots,
+            recordNode,
+            commandBuffers);
     }
 
     void VulkanBackend::applyBarriers(
@@ -384,7 +351,11 @@ namespace ic
                     barrier,
                     plan.resources,
                     swapchainImage,
-                    swapchainInitialLayout);
+                    swapchainInitialLayout,
+                    barrier.fromNode != barrier.toNode &&
+                    plan.nodes[barrier.fromNode].queue !=
+                        plan.nodes[barrier.toNode].queue,
+                    node.queue);
             }
 
             return;
@@ -403,12 +374,17 @@ namespace ic
                 continue;
             }
 
+            const ResourceBarrier& barrier = plan.barriers[barrierIndex];
             recordBarrier(
                 cmd,
-                plan.barriers[barrierIndex],
+                barrier,
                 plan.resources,
                 swapchainImage,
-                swapchainInitialLayout);
+                swapchainInitialLayout,
+                barrier.fromNode != barrier.toNode &&
+                plan.nodes[barrier.fromNode].queue !=
+                    plan.nodes[barrier.toNode].queue,
+                node.queue);
         }
     }
 
@@ -417,7 +393,9 @@ namespace ic
         const ResourceBarrier& barrier,
         std::span<const GraphResource> resources,
         VkImage swapchainImage,
-        VkImageLayout swapchainInitialLayout)
+        VkImageLayout swapchainInitialLayout,
+        bool crossQueue,
+        QueueType commandQueue)
     {
 
         VkImageMemoryBarrier vkBarrier{};
@@ -428,7 +406,8 @@ namespace ic
 
         if (resource.type == GraphResourceType::Buffer)
         {
-            const GraphResourceEntry* entry = graphResource(barrier.resource);
+            const VulkanGraphResourceEntry* entry =
+                m_graphResourceRegistry.entry(barrier.resource);
             if (!entry || !entry->buffer)
             {
                 spdlog::error(
@@ -440,6 +419,7 @@ namespace ic
             VkBufferMemoryBarrier bufferBarrier{};
             bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
             bufferBarrier.srcAccessMask =
+                (crossQueue || barrier.firstUse) ? 0 :
                 accessMaskFor(barrier.oldUsage, barrier.fromAccess);
             bufferBarrier.dstAccessMask =
                 accessMaskFor(barrier.newUsage, barrier.toAccess);
@@ -449,10 +429,28 @@ namespace ic
             bufferBarrier.offset = 0;
             bufferBarrier.size = entry->buffer.size;
 
+            VkPipelineStageFlags srcStage = (crossQueue || barrier.firstUse)
+                ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                : pipelineStageFor(barrier.oldUsage, barrier.fromAccess);
+            VkPipelineStageFlags dstStage =
+                pipelineStageFor(barrier.newUsage, barrier.toAccess);
+            if (commandQueue == QueueType::Compute)
+            {
+                srcStage = crossQueue ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                    : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            }
+            else if (commandQueue == QueueType::Transfer)
+            {
+                srcStage = crossQueue ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                    : VK_PIPELINE_STAGE_TRANSFER_BIT;
+                dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+            }
+
             vkCmdPipelineBarrier(
                 cmd,
-                pipelineStageFor(barrier.oldUsage, barrier.fromAccess),
-                pipelineStageFor(barrier.newUsage, barrier.toAccess),
+                srcStage,
+                dstStage,
                 0,
                 0, nullptr,
                 1, &bufferBarrier,
@@ -476,7 +474,8 @@ namespace ic
         }
         else
         {
-            const GraphResourceEntry* entry = graphResource(barrier.resource);
+            const VulkanGraphResourceEntry* entry =
+                m_graphResourceRegistry.entry(barrier.resource);
             if (!entry || entry->type != GraphResourceType::Texture ||
                 !entry->texture)
             {
@@ -490,19 +489,22 @@ namespace ic
         vkBarrier.image = image;
 
         const bool isExternalFirstUse =
-            isSwapchainImage &&
-            barrier.fromNode == barrier.toNode;
+            barrier.firstUse;
 
         vkBarrier.oldLayout = isExternalFirstUse
-            ? swapchainInitialLayout
-            : (!isSwapchainImage && graphResource(barrier.resource)
-                ? graphResource(barrier.resource)->layout
+            ? (isSwapchainImage
+                ? swapchainInitialLayout
+                : VK_IMAGE_LAYOUT_UNDEFINED)
+            : (!isSwapchainImage &&
+                m_graphResourceRegistry.entry(barrier.resource)
+                ? m_graphResourceRegistry.entry(barrier.resource)->layout
                 : usageToLayout(barrier.oldUsage));
 
         vkBarrier.newLayout = usageToLayout(barrier.newUsage);
 
         vkBarrier.srcAccessMask =
-            vkBarrier.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+            crossQueue || barrier.firstUse ||
+                vkBarrier.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
                 ? 0
                 : accessMaskFor(
                     barrier.oldUsage,
@@ -522,13 +524,20 @@ namespace ic
         vkBarrier.dstQueueFamilyIndex =
             VK_QUEUE_FAMILY_IGNORED;
 
+        const bool depthTexture =
+            resource.type == GraphResourceType::Texture &&
+            (resource.textureDesc.format == TextureFormat::D32_Float ||
+                hasFlag(
+                    resource.textureDesc.usage,
+                    TextureUsageFlags::DepthAttachment));
         vkBarrier.subresourceRange.aspectMask =
-            barrier.newUsage == ResourceUsage::DepthAttachment
-                ? VK_IMAGE_ASPECT_DEPTH_BIT
-                : VK_IMAGE_ASPECT_COLOR_BIT;
+            depthTexture ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
 
         vkBarrier.subresourceRange.baseMipLevel = 0;
-        vkBarrier.subresourceRange.levelCount = 1;
+        vkBarrier.subresourceRange.levelCount =
+            resource.ownership == ResourceOwnership::Transient
+                ? std::max(1u, resource.textureDesc.mipLevels)
+                : 1u;
         vkBarrier.subresourceRange.baseArrayLayer = 0;
         vkBarrier.subresourceRange.layerCount = 1;
 
@@ -538,6 +547,10 @@ namespace ic
                 barrier.fromAccess);
 
         if (vkBarrier.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+        {
+            srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+        }
+        if (crossQueue)
         {
             srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         }
@@ -551,6 +564,18 @@ namespace ic
         {
             dstStage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
         }
+        if (commandQueue == QueueType::Compute)
+        {
+            srcStage = crossQueue ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+            dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+        }
+        else if (commandQueue == QueueType::Transfer)
+        {
+            srcStage = crossQueue ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                : VK_PIPELINE_STAGE_TRANSFER_BIT;
+            dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        }
 
         vkCmdPipelineBarrier(
             cmd,
@@ -563,7 +588,8 @@ namespace ic
 
         if (!isSwapchainImage)
         {
-            if (GraphResourceEntry* entry = graphResource(barrier.resource))
+            if (VulkanGraphResourceEntry* entry =
+                    m_graphResourceRegistry.entry(barrier.resource))
             {
                 entry->layout = vkBarrier.newLayout;
             }
@@ -623,19 +649,19 @@ namespace ic
         const bool hasColorTarget =
             pipeline->desc.colorAttachmentCount > 0;
         const GraphResourceId colorResource =
-            findGraphAttachment(plan, node.nodeId, ResourceUsage::ColorAttachment);
+            findNodeResource(plan, node, ResourceUsage::ColorAttachment);
         const GraphResourceId depthResource =
-            findGraphAttachment(plan, node.nodeId, ResourceUsage::DepthAttachment);
-        const GraphResourceEntry* colorEntry =
+            findNodeResource(plan, node, ResourceUsage::DepthAttachment);
+        const VulkanGraphResourceEntry* colorEntry =
             colorResource != InvalidGraphResourceId
-                ? graphResource(colorResource)
+                ? m_graphResourceRegistry.entry(colorResource)
                 : nullptr;
-        const GraphResourceEntry* depthEntry =
+        const VulkanGraphResourceEntry* depthEntry =
             depthResource != InvalidGraphResourceId
-                ? graphResource(depthResource)
+                ? m_graphResourceRegistry.entry(depthResource)
                 : nullptr;
 
-        constexpr bool useGraphAttachments = false;
+        constexpr bool useGraphAttachments = true;
         ensureDepthTarget();
 
         if (pass && pass->drawList == DrawListKind::Skybox &&
@@ -690,7 +716,7 @@ namespace ic
             useGraphAttachments &&
                 colorEntry && colorEntry->ownership == ResourceOwnership::Transient
                 ? colorEntry->view
-                : m_swapchain.imageView(m_currentSwapchainImage);
+                : m_swapchain.imageView(m_frameExecutor.currentSwapchainImage());
         colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         colorAttachment.loadOp =
             pass && pass->colorLoadOp == AttachmentLoadOp::Load
@@ -751,10 +777,10 @@ namespace ic
         if (pass &&
             pass->drawList == DrawListKind::SceneGeometry &&
             prepareSceneResources(ctx, scene, pipelineHandle) &&
-            !m_preparedScene.draws.empty())
+            !m_gpuScene.draws().empty())
         {
-            const std::vector<DrawItem>& draws =
-                m_preparedScene.draws;
+            const std::span<const VulkanGpuScene::DrawItem> draws =
+                m_gpuScene.draws();
             const VkExtent2D extent = m_swapchain.extent();
 
             VkViewport viewport{};
@@ -774,9 +800,9 @@ namespace ic
 
             const uint32_t frameSlot =
                 static_cast<uint32_t>(
-                    ctx.frameIndex % m_sceneFrameResources.size());
-            FrameSceneResources& frameResources =
-                m_sceneFrameResources[frameSlot];
+                    ctx.frameIndex % m_gpuScene.frameSlotCount());
+            VulkanGpuSceneFrameResources& frameResources =
+                m_gpuScene.frameResources(frameSlot);
 
             vkCmdBindPipeline(
                 cmd,
@@ -793,61 +819,32 @@ namespace ic
                 0,
                 nullptr);
 
-            UploadedModel* boundModel = nullptr;
-            for (const DrawItem& draw : draws)
-            {
-                if (!draw.model ||
-                    draw.meshIndex >= draw.model->meshes.size())
+            const bool useGpuDriven =
+                m_gpuScene.indirectArguments &&
+                m_gpuScene.binCounts &&
+                !m_gpuScene.geometryBins().empty();
+
+            VulkanIndirectDrawStream indirectStream{};
+            indirectStream.indirectArguments =
+                m_gpuScene.indirectArguments.buffer;
+            indirectStream.binCounts = m_gpuScene.binCounts.buffer;
+
+            // Shared by the depth prepass and the forward pass: both
+            // pipelines route scene geometry through this same recorder (see
+            // vulkan_pass_recorders.h for why there is no separate depth-only
+            // path).
+            recordSceneGeometryDraws(
+                cmd,
+                pipeline->pipelineLayout,
+                draws,
+                m_gpuScene.geometryBins(),
+                useGpuDriven,
+                indirectStream,
+                [this](AssetHandle handle) -> VulkanUploadedModel*
                 {
-                    continue;
-                }
-
-                const GpuMesh& mesh =
-                    draw.model->meshes[draw.meshIndex];
-                if (mesh.indexCount == 0)
-                {
-                    continue;
-                }
-
-                if (boundModel != draw.model)
-                {
-                    VkDeviceSize offset = 0;
-                    vkCmdBindVertexBuffers(
-                        cmd,
-                        0,
-                        1,
-                        &draw.model->vertexBuffer.buffer,
-                        &offset);
-                    vkCmdBindIndexBuffer(
-                        cmd,
-                        draw.model->indexBuffer.buffer,
-                        0,
-                        VK_INDEX_TYPE_UINT32);
-                    boundModel = draw.model;
-                }
-
-                DrawConstants constants{};
-                constants.objectIndex = draw.objectIndex;
-                constants.meshIndex = draw.meshIndex;
-                constants.materialIndex = draw.materialIndex;
-
-                vkCmdPushConstants(
-                    cmd,
-                    pipeline->pipelineLayout,
-                    VK_SHADER_STAGE_VERTEX_BIT |
-                        VK_SHADER_STAGE_FRAGMENT_BIT,
-                    0,
-                    sizeof(constants),
-                    &constants);
-
-                vkCmdDrawIndexed(
-                    cmd,
-                    mesh.indexCount,
-                    1,
-                    mesh.firstIndex,
-                    0,
-                    0);
-            }
+                    auto it = m_uploadedModels.find(handle);
+                    return it != m_uploadedModels.end() ? &it->second : nullptr;
+                });
         }
         else if (pass && pass->drawList == DrawListKind::Skybox)
         {
@@ -924,6 +921,114 @@ namespace ic
                 nullptr);
         }
         else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::HiZDepthPyramid)
+        {
+            // Precondition: the forward pipeline must be resolvable and the
+            // per-frame scene resources present (matches the original guard).
+            const PipelineId graphicsPipelineId =
+                makePipelineId("forward_bindless");
+            GraphicsPipelineHandle graphicsHandle{};
+            if (auto it = m_pipelineHandles.find(graphicsPipelineId);
+                it != m_pipelineHandles.end())
+            {
+                graphicsHandle = it->second;
+            }
+            else if (m_pipelineLibrary)
+            {
+                GraphicsPipelineDesc desc =
+                    m_pipelineLibrary->resolveGraphics(
+                        graphicsPipelineId,
+                        RendererBackendType::Vulkan,
+                        swapchainTextureFormat());
+                graphicsHandle =
+                    m_pipelineManager.requestGraphicsPipeline(desc);
+                m_pipelineHandles.emplace(graphicsPipelineId, graphicsHandle);
+            }
+            if (!graphicsHandle || m_gpuScene.frameSlotCount() == 0)
+            {
+                return;
+            }
+
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_gpuScene.frameSlotCount());
+            VulkanGpuSceneFrameResources& frameResources =
+                m_gpuScene.frameResources(frameSlot);
+
+            VulkanPassContext passCtx{};
+            passCtx.cmd = cmd;
+            passCtx.plan = &plan;
+            passCtx.node = &node;
+            passCtx.resources = &m_graphResourceRegistry;
+            passCtx.device = m_device.device();
+
+            VulkanHiZInputs hiZ{};
+            hiZ.hiZId =
+                findNodeResource(plan, node, ResourceUsage::StorageTexture);
+            hiZ.sceneDepthId =
+                findNodeResource(plan, node, ResourceUsage::SampledTexture);
+            hiZ.hiZPool = &frameResources.hiZDescriptorPool;
+            hiZ.frameConstants = frameResources.frameConstants
+                ? frameResources.frameConstants.buffer
+                : VK_NULL_HANDLE;
+            hiZ.hiZDebugResourceOut =
+                &m_clusteredForwardResources.hiZDebugResource;
+
+            (void)recordHiZPyramid(passCtx, *pipeline, hiZ);
+            return;
+        }
+        else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::GpuFrustumCull)
+        {
+            if (!prepareSceneResources(ctx, scene, {}, false) ||
+                m_gpuScene.frameSlotCount() == 0)
+            {
+                return;
+            }
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_gpuScene.frameSlotCount());
+            VulkanGpuSceneFrameResources& frameResources =
+                m_gpuScene.frameResources(frameSlot);
+            VulkanGpuScene& g = m_gpuScene;
+
+            VulkanPassContext passCtx{};
+            passCtx.cmd = cmd;
+            passCtx.plan = &plan;
+            passCtx.node = &node;
+            passCtx.resources = &m_graphResourceRegistry;
+            passCtx.device = m_device.device();
+
+            VulkanCullBuffers cull{};
+            cull.gpuCullPool = &frameResources.gpuCullDescriptorPool;
+            cull.frameConstants = frameResources.frameConstants.buffer;
+            cull.instanceBounds = frameResources.instanceBounds.buffer;
+            cull.instanceBoundsSize = frameResources.instanceBounds.size;
+            cull.visibleInstances = g.visibleInstances.buffer;
+            cull.visibleInstancesSize = g.visibleInstances.size;
+            cull.visibleInstanceCount = g.visibleInstanceCount.buffer;
+            cull.visibleInstanceCountSize = g.visibleInstanceCount.size;
+            cull.drawInputs = frameResources.drawInputs.buffer;
+            cull.drawInputsSize = frameResources.drawInputs.size;
+            cull.indirectArguments = g.indirectArguments.buffer;
+            cull.indirectArgumentsSize = g.indirectArguments.size;
+            cull.drawMetadata = g.drawMetadata.buffer;
+            cull.drawMetadataSize = g.drawMetadata.size;
+            cull.binCounts = g.binCounts.buffer;
+            cull.binCountsSize = g.binCounts.size;
+
+            if (!recordGpuFrustumCull(passCtx, *pipeline, cull))
+            {
+                return;
+            }
+
+            if (!g.loggedGpuCull)
+            {
+                spdlog::info(
+                    "[VulkanBackend] GPU frustum culling dispatch prepared for {} instance(s)",
+                    m_gpuScene.instanceCount());
+                g.loggedGpuCull = true;
+            }
+        }
+        else if (pipeline->desc.bindingLayout ==
             PipelineBindingLayoutKind::ClusteredForward)
         {
             if (!bindClusteredForwardCompute(*pipeline, ctx, scene, cmd))
@@ -932,11 +1037,27 @@ namespace ic
             }
         }
 
-        vkCmdDispatch(
-            cmd,
-            pass->groupCountX,
-            pass->groupCountY,
-            pass->groupCountZ);
+        if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::GpuFrustumCull)
+        {
+            const uint32_t instanceCount =
+                std::min<uint32_t>(
+                    m_gpuScene.instanceCount(),
+                    ClusteredForwardMaxGpuCullInstances);
+            vkCmdDispatch(
+                cmd,
+                std::max(1u, (instanceCount + 63u) / 64u),
+                1,
+                1);
+        }
+        else
+        {
+            vkCmdDispatch(
+                cmd,
+                pass->groupCountX,
+                pass->groupCountY,
+                pass->groupCountZ);
+        }
 
         if (pipeline->desc.bindingLayout ==
             PipelineBindingLayoutKind::ComputeStorageBuffer)
@@ -995,12 +1116,56 @@ namespace ic
             vkCmdPipelineBarrier(
                 cmd,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0,
                 0, nullptr,
                 static_cast<uint32_t>(std::size(barriers)), barriers,
                 0, nullptr);
+        }
+        else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::GpuFrustumCull)
+        {
+            VkBufferMemoryBarrier barriers[5]{};
+            VkBuffer buffers[] =
+            {
+                m_gpuScene.visibleInstances.buffer,
+                m_gpuScene.visibleInstanceCount.buffer,
+                m_gpuScene.indirectArguments.buffer,
+                m_gpuScene.drawMetadata.buffer,
+                m_gpuScene.binCounts.buffer
+            };
+            VkDeviceSize sizes[] =
+            {
+                m_gpuScene.visibleInstances.size,
+                m_gpuScene.visibleInstanceCount.size,
+                m_gpuScene.indirectArguments.size,
+                m_gpuScene.drawMetadata.size,
+                m_gpuScene.binCounts.size
+            };
+            for (uint32_t i = 0; i < 5u; ++i)
+            {
+                barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+                barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                barriers[i].dstAccessMask =
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                    VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].buffer = buffers[i];
+                barriers[i].offset = 0;
+                barriers[i].size = sizes[i];
+            }
+            vkCmdPipelineBarrier(
+                cmd,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_TRANSFER_BIT |
+                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                0,
+                0, nullptr,
+                5, barriers,
+                0, nullptr);
+            readbackVisibleInstanceCount(ctx, cmd);
         }
     }
 
@@ -1229,8 +1394,7 @@ namespace ic
         vkCmdPipelineBarrier(
             cmd,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             0,
             0, nullptr,
             0, nullptr,
@@ -1262,6 +1426,14 @@ namespace ic
 
         const uint32_t cubemapSize =
             std::max(1u, scene.environment.settings.cubemapSize);
+        if (!m_environmentResources.source)
+        {
+            // IBL baking may populate the shared environment textures before
+            // the first graph conversion pass records. Adopt that source
+            // instead of destroying fresh resources and waiting the device.
+            m_environmentResources.source = scene.environment.equirectTexture;
+            m_environmentResources.cubemapSize = cubemapSize;
+        }
         if (m_environmentResources.source != scene.environment.equirectTexture ||
             m_environmentResources.cubemapSize != cubemapSize)
         {
@@ -1358,8 +1530,7 @@ namespace ic
             vkCmdPipelineBarrier(
                 cmd,
                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 0,
                 0,
                 nullptr,
@@ -1375,7 +1546,7 @@ namespace ic
         {
             const uint32_t frameCount =
                 static_cast<uint32_t>(
-                    std::max<size_t>(1, m_frameSync.size()));
+                    std::max<size_t>(1, m_frameExecutor.framesInFlight()));
             m_environmentResources.skyboxConstants.resize(frameCount);
             m_environmentResources.skyboxDescriptorSets.assign(
                 frameCount,
@@ -2258,25 +2429,7 @@ namespace ic
         }
         m_uploadedSamplers.clear();
 
-        for (FrameSceneResources& resources : m_sceneFrameResources)
-        {
-            m_resourceAllocator.destroyBuffer(resources.frameConstants);
-            m_resourceAllocator.destroyBuffer(resources.objects);
-            m_resourceAllocator.destroyBuffer(resources.materials);
-            m_resourceAllocator.destroyBuffer(resources.visibleLights);
-
-            if (resources.descriptorPool != VK_NULL_HANDLE)
-            {
-                vkDestroyDescriptorPool(
-                    m_device.device(),
-                    resources.descriptorPool,
-                    nullptr);
-            }
-
-            resources = {};
-        }
-        m_sceneFrameResources.clear();
-        m_preparedScene = {};
+        m_gpuScene.shutdown(m_device.device());
 
         m_pipelineHandles.clear();
         m_computePipelineHandles.clear();
@@ -2338,7 +2491,7 @@ namespace ic
             createTextureView(m_pathTraceResources.tonemap);
 
         const uint32_t frameCount =
-            static_cast<uint32_t>(std::max<size_t>(1, m_frameSync.size()));
+            static_cast<uint32_t>(std::max<size_t>(1, m_frameExecutor.framesInFlight()));
         m_pathTraceResources.pathTraceConstants.resize(frameCount);
         m_pathTraceResources.tonemapConstants.resize(frameCount);
         m_pathTraceResources.pathTraceDescriptorSets.assign(
@@ -3284,6 +3437,16 @@ namespace ic
             nullptr);
     }
 
+    void VulkanBackend::ensureGpuDrivenResources()
+    {
+        if (m_gpuScene.visibleInstances)
+        {
+            return;
+        }
+        const uint32_t maxInstances = ClusteredForwardMaxGpuCullInstances;
+        m_gpuScene.ensureCullBuffers(maxInstances, MaxGpuDrivenBins);
+    }
+
     void VulkanBackend::ensureClusteredForwardResources()
     {
         const VkExtent2D extent = m_swapchain.extent();
@@ -3301,6 +3464,10 @@ namespace ic
         const uint32_t clusterCountZ = ClusteredForwardSliceCountZ;
         const uint32_t clusterCount =
             clusterCountX * clusterCountY * clusterCountZ;
+        const uint32_t hiZMipCount =
+            1u + static_cast<uint32_t>(
+                std::floor(std::log2(std::max(extent.width, extent.height))));
+        const uint32_t maxInstances = ClusteredForwardMaxGpuCullInstances;
 
         if (m_clusteredForwardResources.clusterBounds &&
             m_clusteredForwardResources.width == extent.width &&
@@ -3310,6 +3477,7 @@ namespace ic
         }
 
         destroyClusteredForwardResources();
+        m_gpuScene.destroyCullBuffers();
 
         m_clusteredForwardResources.width = extent.width;
         m_clusteredForwardResources.height = extent.height;
@@ -3317,6 +3485,7 @@ namespace ic
         m_clusteredForwardResources.clusterCountY = clusterCountY;
         m_clusteredForwardResources.clusterCountZ = clusterCountZ;
         m_clusteredForwardResources.clusterCount = clusterCount;
+        m_clusteredForwardResources.hiZMipCount = hiZMipCount;
 
         const uint64_t maxClusterLightRefs =
             static_cast<uint64_t>(clusterCount) *
@@ -3350,12 +3519,56 @@ namespace ic
                 .memoryUsage = ResourceMemoryUsage::GpuOnly,
                 .debugName = "Vulkan clustered light counter"
             });
+        m_gpuScene.ensureCullBuffers(maxInstances, MaxGpuDrivenBins);
 
         spdlog::info(
-            "[VulkanBackend] Clustered forward resources: {}x{}x{} clusters",
+            "[VulkanBackend] Clustered forward resources: {}x{}x{} clusters, Hi-Z {}x{} mips={}, maxCullInstances={}",
             clusterCountX,
             clusterCountY,
-            clusterCountZ);
+            clusterCountZ,
+            extent.width,
+            extent.height,
+            hiZMipCount,
+            maxInstances);
+    }
+
+    void VulkanBackend::readbackVisibleInstanceCount(
+        const FrameContext& ctx,
+        VkCommandBuffer cmd)
+    {
+        if (!m_gpuScene.visibleInstanceCount ||
+            !m_gpuScene.visibleInstanceCountReadback)
+        {
+            return;
+        }
+        if (!m_hiZDebugViewEnabled || (ctx.frameIndex % 30u) != 0u)
+        {
+            return;
+        }
+
+        VkBufferCopy copy{};
+        copy.size = sizeof(uint32_t);
+        vkCmdCopyBuffer(
+            cmd,
+            m_gpuScene.visibleInstanceCount.buffer,
+            m_gpuScene.visibleInstanceCountReadback.buffer,
+            1,
+            &copy);
+
+        if (m_gpuScene.visibleInstanceCountReadback.mapped)
+        {
+            const uint32_t visible =
+                *static_cast<const uint32_t*>(
+                    m_gpuScene.visibleInstanceCountReadback.mapped);
+            if (visible != m_gpuScene.lastVisibleInstanceCount)
+            {
+                spdlog::info(
+                    "[VulkanBackend] GPU frustum visible instances: {} -> {}",
+                    m_gpuScene.lastVisibleInstanceCount,
+                    visible);
+                m_gpuScene.lastVisibleInstanceCount = visible;
+            }
+        }
     }
 
     bool VulkanBackend::bindClusteredForwardCompute(
@@ -3391,9 +3604,9 @@ namespace ic
 
         const uint32_t frameSlot =
             static_cast<uint32_t>(
-                ctx.frameIndex % m_sceneFrameResources.size());
+                ctx.frameIndex % m_gpuScene.frameSlotCount());
         VkDescriptorSet descriptorSet =
-            m_sceneFrameResources[frameSlot].descriptorSet;
+            m_gpuScene.frameResources(frameSlot).descriptorSet;
         if (descriptorSet == VK_NULL_HANDLE)
         {
             return false;
@@ -3416,16 +3629,16 @@ namespace ic
         const FrameContext& ctx,
         VkCommandBuffer cmd)
     {
-        if (m_sceneFrameResources.empty())
+        if (m_gpuScene.frameSlotCount() == 0)
         {
             return;
         }
 
         const uint32_t frameSlot =
             static_cast<uint32_t>(
-                ctx.frameIndex % m_sceneFrameResources.size());
+                ctx.frameIndex % m_gpuScene.frameSlotCount());
         VkDescriptorSet descriptorSet =
-            m_sceneFrameResources[frameSlot].descriptorSet;
+            m_gpuScene.frameResources(frameSlot).descriptorSet;
         if (descriptorSet == VK_NULL_HANDLE)
         {
             return;
@@ -3452,6 +3665,14 @@ namespace ic
             m_clusteredForwardResources.clusterLightIndices);
         m_resourceAllocator.destroyBuffer(
             m_clusteredForwardResources.clusterLightCounter);
+        destroyHiZDebugDescriptors();
+        if (m_clusteredForwardResources.hiZDebugSampler != VK_NULL_HANDLE)
+        {
+            vkDestroySampler(
+                m_device.device(),
+                m_clusteredForwardResources.hiZDebugSampler,
+                nullptr);
+        }
         m_clusteredForwardResources = {};
     }
 
@@ -3472,7 +3693,9 @@ namespace ic
                 .width = extent.width,
                 .height = extent.height,
                 .format = TextureFormat::D32_Float,
-                .usage = TextureUsageFlags::DepthAttachment,
+                .usage =
+                    TextureUsageFlags::DepthAttachment |
+                    TextureUsageFlags::Sampled,
                 .memoryUsage = ResourceMemoryUsage::GpuOnly,
                 .debugName = "Vulkan forward depth"
             });
@@ -3518,134 +3741,6 @@ namespace ic
         m_depthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         m_depthWidth = 0;
         m_depthHeight = 0;
-    }
-
-    VulkanBackend::GraphResourceEntry* VulkanBackend::graphResource(
-        GraphResourceId id)
-    {
-        auto it = m_graphResources.find(id);
-        return it != m_graphResources.end() ? &it->second : nullptr;
-    }
-
-    const VulkanBackend::GraphResourceEntry* VulkanBackend::graphResource(
-        GraphResourceId id) const
-    {
-        auto it = m_graphResources.find(id);
-        return it != m_graphResources.end() ? &it->second : nullptr;
-    }
-
-    GraphResourceId VulkanBackend::findGraphAttachment(
-        const CompiledGraphPlan& plan,
-        GraphNodeId node,
-        ResourceUsage usage) const
-    {
-        for (const ResourceBarrier& barrier : plan.barriers)
-        {
-            if (barrier.toNode == node && barrier.newUsage == usage)
-            {
-                return barrier.resource;
-            }
-        }
-        return InvalidGraphResourceId;
-    }
-
-    void VulkanBackend::destroyGraphResources()
-    {
-        for (auto& [id, entry] : m_graphResources)
-        {
-            if (entry.view != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(m_device.device(), entry.view, nullptr);
-                entry.view = VK_NULL_HANDLE;
-            }
-            m_resourceAllocator.destroyTexture(entry.texture);
-            m_resourceAllocator.destroyBuffer(entry.buffer);
-        }
-        m_graphResources.clear();
-    }
-
-    void VulkanBackend::materializeGraphResources(
-        const CompiledGraphPlan& plan,
-        [[maybe_unused]] VkImage swapchainImage)
-    {
-        const VkExtent2D extent = m_swapchain.extent();
-        
-        for (const GraphResource& resource : plan.resources)
-        {
-            GraphResourceEntry& entry = m_graphResources[resource.id];
-            entry.type = resource.type;
-            entry.ownership = resource.ownership;
-            entry.imported = resource.imported;
-
-            if (resource.ownership == ResourceOwnership::Imported)
-            {
-                entry.width = extent.width;
-                entry.height = extent.height;
-                continue;
-            }
-
-            if (resource.type == GraphResourceType::Texture)
-            {
-                TextureDesc desc = resource.textureDesc;
-                if (desc.width == 0) desc.width = extent.width;
-                if (desc.height == 0) desc.height = extent.height;
-
-                const bool recreate =
-                    !entry.texture ||
-                    entry.width != desc.width ||
-                    entry.height != desc.height ||
-                    entry.mipLevels != desc.mipLevels ||
-                    entry.arrayLayers != desc.arrayLayers;
-                if (!recreate)
-                {
-                    continue;
-                }
-                
-                if (entry.view != VK_NULL_HANDLE)
-                {
-                    vkDestroyImageView(m_device.device(), entry.view, nullptr);
-                    entry.view = VK_NULL_HANDLE;
-                }
-                m_resourceAllocator.destroyTexture(entry.texture);
-                entry.texture = m_resourceAllocator.createTexture(desc);
-                entry.layout = VK_IMAGE_LAYOUT_UNDEFINED;
-                entry.width = desc.width;
-                entry.height = desc.height;
-                entry.mipLevels = desc.mipLevels;
-                entry.arrayLayers = desc.arrayLayers;
-
-                VkImageViewCreateInfo viewInfo{};
-                viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-                viewInfo.image = entry.texture.image;
-                viewInfo.viewType = desc.arrayLayers > 1
-                    ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
-                    : VK_IMAGE_VIEW_TYPE_2D;
-                viewInfo.format = entry.texture.format;
-                viewInfo.subresourceRange.aspectMask =
-                    hasFlag(desc.usage, TextureUsageFlags::DepthAttachment)
-                        ? VK_IMAGE_ASPECT_DEPTH_BIT
-                        : VK_IMAGE_ASPECT_COLOR_BIT;
-                viewInfo.subresourceRange.levelCount = desc.mipLevels;
-                viewInfo.subresourceRange.layerCount = desc.arrayLayers;
-                throwIfFailed(
-                    vkCreateImageView(
-                        m_device.device(),
-                        &viewInfo,
-                        nullptr,
-                        &entry.view),
-                    "Failed to create Vulkan graph texture view.");
-            }
-            else
-            {
-                BufferDesc desc = resource.bufferDesc;
-                if (entry.buffer && entry.buffer.size == desc.size)
-                {
-                    continue;
-                }
-                m_resourceAllocator.destroyBuffer(entry.buffer);
-                entry.buffer = m_resourceAllocator.createBuffer(desc);
-            }
-        }
     }
 
     std::vector<IBLBakeResult> VulkanBackend::executeIBLBakeRequests(
@@ -4435,7 +4530,7 @@ namespace ic
         return descriptorIndex;
     }
 
-    VulkanBackend::UploadedModel* VulkanBackend::requestModel(
+    VulkanUploadedModel* VulkanBackend::requestModel(
         AssetHandle handle,
         const AssetManager& assets)
     {
@@ -4446,7 +4541,7 @@ namespace ic
 
         auto [it, inserted] =
             m_uploadedModels.try_emplace(handle);
-        UploadedModel& uploaded = it->second;
+        VulkanUploadedModel& uploaded = it->second;
         if (uploaded.uploaded)
         {
             return &uploaded;
@@ -4710,6 +4805,12 @@ namespace ic
                 gpuMesh.indexCount = primitive.indexCount;
                 gpuMesh.firstIndex = primitive.firstIndex;
                 gpuMesh.vertexOffset = primitive.firstVertex;
+                const glm::vec3 center =
+                    (primitive.bounds.min + primitive.bounds.max) * 0.5f;
+                const glm::vec3 extent =
+                    (primitive.bounds.max - primitive.bounds.min) * 0.5f;
+                gpuMesh.bounds.centerRadius =
+                    glm::vec4(center, glm::length(extent));
                 uploaded.meshes.push_back(gpuMesh);
                 uploaded.meshTransforms.push_back(
                     meshNodeTransforms[meshIndex]);
@@ -4723,216 +4824,134 @@ namespace ic
     bool VulkanBackend::prepareSceneResources(
         const FrameContext& ctx,
         const SceneRenderView& scene,
-        GraphicsPipelineHandle pipelineHandle)
+        GraphicsPipelineHandle pipelineHandle,
+        bool updateGraphicsDescriptors)
     {
-        if (m_preparedScene.frameIndex == ctx.frameIndex &&
-            m_preparedScene.valid)
-        {
-            if (m_sceneFrameResources.empty())
-            {
-                return false;
-            }
-
-            const uint32_t frameSlot =
-                static_cast<uint32_t>(
-                    ctx.frameIndex % m_sceneFrameResources.size());
-            FrameSceneResources& frameResources =
-                m_sceneFrameResources[frameSlot];
-            VulkanGraphicsPipeline* pipeline =
-                m_pipelineManager.graphicsPipeline(pipelineHandle);
-            if (frameResources.descriptorSet == VK_NULL_HANDLE ||
-                (pipeline &&
-                    frameResources.descriptorLayout !=
-                    pipeline->desc.bindingLayout))
-            {
-                updateFrameDescriptors(frameResources, pipelineHandle);
-            }
-            return true;
-        }
-
-        m_preparedScene.frameIndex = ctx.frameIndex;
-        m_preparedScene.valid = false;
-        m_preparedScene.draws.clear();
-        m_preparedScene.objects.clear();
-        m_preparedScene.materials.clear();
-        m_preparedScene.materialOffsets.clear();
-
-        if (!ctx.services ||
-            !ctx.services->assetManager ||
-            scene.camera.valid == 0 ||
-            m_sceneFrameResources.empty())
+        if (!ctx.services || !ctx.services->assetManager)
         {
             return false;
         }
-
         AssetManager& assets = *ctx.services->assetManager;
-        std::vector<DrawItem>& draws = m_preparedScene.draws;
-        std::vector<GpuObjectData>& objects = m_preparedScene.objects;
-        std::vector<GpuMaterialData>& materials = m_preparedScene.materials;
-        std::vector<GpuVisibleLight> visibleLights;
-        auto& materialOffsets = m_preparedScene.materialOffsets;
+
+        if (m_gpuScene.frameSlotCount() == 0)
+        {
+            return false;
+        }
+        const uint32_t frameSlot = static_cast<uint32_t>(
+            ctx.frameIndex % m_gpuScene.frameSlotCount());
 
         m_uploadedModels.reserve(
             m_uploadedModels.size() + scene.models.size());
-        objects.reserve(scene.models.size());
-        materialOffsets.reserve(scene.models.size());
 
-        for (const SceneModelRenderItem& item : scene.models)
-        {
-            UploadedModel* model = requestModel(item.model, assets);
-            if (!model)
+        const VulkanGpuScene::PrepareResult result = m_gpuScene.prepare(
+            ctx.frameIndex,
+            scene,
+            frameSlot,
+            [this, &assets](AssetHandle handle) -> GpuSceneModelView
             {
-                continue;
-            }
-
-            uint32_t materialOffset = 0;
-            if (auto it = materialOffsets.find(item.model);
-                it != materialOffsets.end())
+                VulkanUploadedModel* model = requestModel(handle, assets);
+                if (!model)
+                {
+                    return {};
+                }
+                return GpuSceneModelView{
+                    handle, model->meshes, model->meshTransforms,
+                    model->materials };
+            },
+            [this, &ctx, &scene](
+                uint32_t visibleLightCount,
+                uint32_t instanceBoundsCount,
+                uint32_t geometryBinCount) -> GpuFrameData
             {
-                materialOffset = it->second;
-            }
-            else
-            {
-                materialOffset = static_cast<uint32_t>(materials.size());
-                materialOffsets.emplace(item.model, materialOffset);
-                materials.insert(
-                    materials.end(),
-                    model->materials.begin(),
-                    model->materials.end());
-            }
+                // Reads cluster grid dimensions this call establishes, so it
+                // must run before the fields below are consumed.
+                ensureClusteredForwardResources();
 
-            for (uint32_t meshIndex = 0;
-                 meshIndex < model->meshes.size();
-                 ++meshIndex)
-            {
-                const GpuMesh& mesh = model->meshes[meshIndex];
-                const glm::mat4 meshWorld =
-                    meshIndex < model->meshTransforms.size()
-                        ? item.world * model->meshTransforms[meshIndex]
-                        : item.world;
+                GpuFrameData frameData{};
+                frameData.view = scene.camera.view;
+                frameData.projection = glm::perspectiveRH_ZO(
+                    scene.camera.verticalFovRadians,
+                    scene.camera.aspectRatio,
+                    scene.camera.nearPlane,
+                    scene.camera.farPlane);
+                frameData.projection[1][1] *= -1.0f;
+                frameData.viewProjection = frameData.projection * frameData.view;
+                frameData.cameraPosition = scene.camera.position;
+                frameData.time = ctx.timeSinceStart;
+                frameData.environmentEnabled =
+                    m_environmentResources.iblBaked ? 1u : 0u;
+                frameData.prefilteredMipCount =
+                    m_environmentResources.prefilterMipCount;
+                frameData.environmentIntensity =
+                    scene.environment.settings.intensity;
+                frameData.environmentExposure =
+                    scene.environment.settings.skyboxExposure;
 
-                const uint32_t objectIndex =
-                    static_cast<uint32_t>(objects.size());
+                for (const SceneLightRenderItem& light : scene.lights)
+                {
+                    if (light.type == LightType::Directional)
+                    {
+                        frameData.lightDirection = light.direction;
+                        frameData.lightColor = light.color;
+                        frameData.lightIntensity = light.intensity;
+                        break;
+                    }
+                }
+                for (const SceneLightRenderItem& light : scene.lights)
+                {
+                    if (light.type != LightType::Point ||
+                        frameData.pointLightCount >= MaxGpuPointLights)
+                    {
+                        continue;
+                    }
 
-                GpuObjectData object{};
-                object.world = meshWorld;
-                object.inverseTransposeWorld =
-                    glm::inverseTranspose(meshWorld);
-                objects.push_back(object);
+                    const uint32_t lightIndex = frameData.pointLightCount++;
+                    frameData.pointLightPositionRange[lightIndex] =
+                        glm::vec4(light.position, light.range);
+                    frameData.pointLightColorIntensity[lightIndex] =
+                        glm::vec4(light.color, light.intensity);
+                }
+                frameData.pointLightCount =
+                    std::min<uint32_t>(
+                        visibleLightCount, ClusteredForwardMaxVisibleLights);
+                frameData.clusterDimensions = glm::uvec4(
+                    m_clusteredForwardResources.clusterCountX,
+                    m_clusteredForwardResources.clusterCountY,
+                    m_clusteredForwardResources.clusterCountZ,
+                    m_clusteredForwardResources.clusterCount);
+                frameData.clusterConfig = glm::uvec4(
+                    ClusteredForwardTileSizeX,
+                    ClusteredForwardTileSizeY,
+                    ClusteredForwardMaxLightsPerCluster,
+                    m_clusteredForwardHeatmapEnabled ? 1u : 0u);
+                frameData.renderExtentAndHiZ = glm::uvec4(
+                    m_clusteredForwardResources.width,
+                    m_clusteredForwardResources.height,
+                    m_clusteredForwardResources.hiZMipCount,
+                    0u);
+                frameData.cullingConfig = glm::uvec4(
+                    std::min<uint32_t>(
+                        instanceBoundsCount, ClusteredForwardMaxGpuCullInstances),
+                    1u,
+                    geometryBinCount,
+                    0u);
+                frameData.cameraNearFar = glm::vec4(
+                    scene.camera.nearPlane, scene.camera.farPlane, 0.0f, 0.0f);
+                return frameData;
+            });
 
-                DrawItem draw{};
-                draw.model = model;
-                draw.objectIndex = objectIndex;
-                draw.meshIndex = meshIndex;
-                draw.materialIndex = materialOffset + mesh.materialIndex;
-                draws.push_back(draw);
-            }
-        }
-
-        if (draws.empty())
+        if (!result.hasData)
         {
             return false;
         }
 
-        if (materials.empty())
-        {
-            materials.push_back(GpuMaterialData{});
-        }
-
-        visibleLights.reserve(
-            std::min<size_t>(
-                scene.lights.size(),
-                ClusteredForwardMaxVisibleLights));
-        for (const SceneLightRenderItem& light : scene.lights)
-        {
-            if (light.type != LightType::Point ||
-                visibleLights.size() >= ClusteredForwardMaxVisibleLights)
-            {
-                continue;
-            }
-
-            GpuVisibleLight gpuLight{};
-            gpuLight.positionRange = glm::vec4(light.position, light.range);
-            gpuLight.colorIntensity = glm::vec4(light.color, light.intensity);
-            visibleLights.push_back(gpuLight);
-        }
-        if (visibleLights.empty())
-        {
-            visibleLights.push_back(GpuVisibleLight{});
-        }
-
-        const uint32_t frameSlot =
-            static_cast<uint32_t>(
-                ctx.frameIndex % m_sceneFrameResources.size());
-        FrameSceneResources& frameResources =
-            m_sceneFrameResources[frameSlot];
-
-        if (!frameResources.frameConstants)
-        {
-            frameResources.frameConstants =
-                m_resourceAllocator.createBuffer({
-                    .size = sizeof(GpuFrameData),
-                    .usage = BufferUsageFlags::Constant,
-                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                    .mappedAtCreation = true,
-                    .debugName = "Vulkan frame constants"
-                });
-        }
-
-        bool descriptorsDirty = false;
-        if (objects.size() > frameResources.objectCapacity)
-        {
-            m_resourceAllocator.destroyBuffer(frameResources.objects);
-            frameResources.objects =
-                m_resourceAllocator.createBuffer({
-                    .size = objects.size() * sizeof(GpuObjectData),
-                    .usage = BufferUsageFlags::Storage,
-                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                    .mappedAtCreation = true,
-                    .debugName = "Vulkan object data"
-                });
-            frameResources.objectCapacity =
-                static_cast<uint32_t>(objects.size());
-            descriptorsDirty = true;
-        }
-
-        if (materials.size() > frameResources.materialCapacity)
-        {
-            m_resourceAllocator.destroyBuffer(frameResources.materials);
-            frameResources.materials =
-                m_resourceAllocator.createBuffer({
-                    .size = materials.size() * sizeof(GpuMaterialData),
-                    .usage = BufferUsageFlags::Storage,
-                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                    .mappedAtCreation = true,
-                    .debugName = "Vulkan material data"
-                });
-            frameResources.materialCapacity =
-                static_cast<uint32_t>(materials.size());
-            descriptorsDirty = true;
-        }
-
-        if (visibleLights.size() > frameResources.visibleLightCapacity)
-        {
-            m_resourceAllocator.destroyBuffer(frameResources.visibleLights);
-            frameResources.visibleLights =
-                m_resourceAllocator.createBuffer({
-                    .size = visibleLights.size() * sizeof(GpuVisibleLight),
-                    .usage = BufferUsageFlags::Storage,
-                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                    .mappedAtCreation = true,
-                    .debugName = "Vulkan clustered visible lights"
-                });
-            frameResources.visibleLightCapacity =
-                static_cast<uint32_t>(visibleLights.size());
-            descriptorsDirty = true;
-        }
-
-        ensureClusteredForwardResources();
-
-        VulkanGraphicsPipeline* pipeline =
-            m_pipelineManager.graphicsPipeline(pipelineHandle);
-        if (descriptorsDirty ||
+        VulkanGpuSceneFrameResources& frameResources =
+            m_gpuScene.frameResources(frameSlot);
+        VulkanGraphicsPipeline* pipeline = updateGraphicsDescriptors
+            ? m_pipelineManager.graphicsPipeline(pipelineHandle)
+            : nullptr;
+        if (updateGraphicsDescriptors &&
+            (result.descriptorsDirty ||
             frameResources.descriptorSet == VK_NULL_HANDLE ||
             (pipeline &&
                 frameResources.descriptorLayout !=
@@ -4940,113 +4959,18 @@ namespace ic
             frameResources.bindlessTextureCount != m_uploadedTextures.size() ||
             frameResources.bindlessSamplerCount != m_uploadedSamplers.size() ||
             frameResources.environmentVersion != scene.environment.version ||
-            frameResources.iblBaked != m_environmentResources.iblBaked)
+            frameResources.iblBaked != m_environmentResources.iblBaked))
         {
             updateFrameDescriptors(frameResources, pipelineHandle);
             frameResources.environmentVersion = scene.environment.version;
             frameResources.iblBaked = m_environmentResources.iblBaked;
         }
 
-        GpuFrameData frameData{};
-        frameData.view = scene.camera.view;
-        frameData.projection = glm::perspectiveRH_ZO(
-            scene.camera.verticalFovRadians,
-            scene.camera.aspectRatio,
-            scene.camera.nearPlane,
-            scene.camera.farPlane);
-        frameData.projection[1][1] *= -1.0f;
-        frameData.viewProjection = frameData.projection * frameData.view;
-        frameData.cameraPosition = scene.camera.position;
-        frameData.time = ctx.timeSinceStart;
-        frameData.environmentEnabled =
-            m_environmentResources.iblBaked ? 1u : 0u;
-        frameData.prefilteredMipCount =
-            m_environmentResources.prefilterMipCount;
-        frameData.environmentIntensity =
-            scene.environment.settings.intensity;
-        frameData.environmentExposure =
-            scene.environment.settings.skyboxExposure;
-
-        for (const SceneLightRenderItem& light : scene.lights)
-        {
-            if (light.type == LightType::Directional)
-            {
-                frameData.lightDirection = light.direction;
-                frameData.lightColor = light.color;
-                frameData.lightIntensity = light.intensity;
-                break;
-            }
-        }
-        for (const SceneLightRenderItem& light : scene.lights)
-        {
-            if (light.type != LightType::Point ||
-                frameData.pointLightCount >= MaxGpuPointLights)
-            {
-                continue;
-            }
-
-            const uint32_t lightIndex = frameData.pointLightCount++;
-            frameData.pointLightPositionRange[lightIndex] =
-                glm::vec4(light.position, light.range);
-            frameData.pointLightColorIntensity[lightIndex] =
-                glm::vec4(light.color, light.intensity);
-        }
-        frameData.pointLightCount =
-            static_cast<uint32_t>(
-                std::min<size_t>(
-                    visibleLights.size(),
-                    ClusteredForwardMaxVisibleLights));
-        frameData.clusterDimensions = glm::uvec4(
-            m_clusteredForwardResources.clusterCountX,
-            m_clusteredForwardResources.clusterCountY,
-            m_clusteredForwardResources.clusterCountZ,
-            m_clusteredForwardResources.clusterCount);
-        frameData.clusterConfig = glm::uvec4(
-            ClusteredForwardTileSizeX,
-            ClusteredForwardTileSizeY,
-            ClusteredForwardMaxLightsPerCluster,
-            m_clusteredForwardHeatmapEnabled ? 1u : 0u);
-
-        std::memcpy(
-            frameResources.frameConstants.mapped,
-            &frameData,
-            sizeof(frameData));
-        std::memcpy(
-            frameResources.objects.mapped,
-            objects.data(),
-            objects.size() * sizeof(GpuObjectData));
-        std::memcpy(
-            frameResources.materials.mapped,
-            materials.data(),
-            materials.size() * sizeof(GpuMaterialData));
-        std::memcpy(
-            frameResources.visibleLights.mapped,
-            visibleLights.data(),
-            visibleLights.size() * sizeof(GpuVisibleLight));
-
-        m_resourceAllocator.flush(
-            frameResources.frameConstants,
-            0,
-            sizeof(frameData));
-        m_resourceAllocator.flush(
-            frameResources.objects,
-            0,
-            objects.size() * sizeof(GpuObjectData));
-        m_resourceAllocator.flush(
-            frameResources.materials,
-            0,
-            materials.size() * sizeof(GpuMaterialData));
-        m_resourceAllocator.flush(
-            frameResources.visibleLights,
-            0,
-            visibleLights.size() * sizeof(GpuVisibleLight));
-
-        m_preparedScene.valid = true;
         return true;
     }
 
     void VulkanBackend::updateFrameDescriptors(
-        FrameSceneResources& resources,
+        VulkanGpuSceneFrameResources& resources,
         GraphicsPipelineHandle pipelineHandle)
     {
         VulkanGraphicsPipeline* pipeline =
@@ -5074,7 +4998,7 @@ namespace ic
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         poolSizes[0].descriptorCount = 1;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        poolSizes[1].descriptorCount = clusteredLayout ? 7u : 2u;
+        poolSizes[1].descriptorCount = clusteredLayout ? 8u : 3u;
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
         poolSizes[2].descriptorCount = MaxBindlessTextures + 3u;
         poolSizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
@@ -5176,6 +5100,18 @@ namespace ic
         writes[2].descriptorCount = 1;
         writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         writes[2].pBufferInfo = &materialInfo;
+
+        VkDescriptorBufferInfo drawMetadataInfo{};
+        drawMetadataInfo.buffer = m_gpuScene.drawMetadata.buffer;
+        drawMetadataInfo.range = m_gpuScene.drawMetadata.size;
+        VkWriteDescriptorSet drawMetadataWrite{};
+        drawMetadataWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        drawMetadataWrite.dstSet = resources.descriptorSet;
+        drawMetadataWrite.dstBinding = 25;
+        drawMetadataWrite.descriptorCount = 1;
+        drawMetadataWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        drawMetadataWrite.pBufferInfo = &drawMetadataInfo;
+        writes.push_back(drawMetadataWrite);
 
         VkDescriptorBufferInfo clusterBoundsInfo{};
         VkDescriptorBufferInfo clusterGridInfo{};
@@ -5408,6 +5344,169 @@ namespace ic
         return true;
     }
 
+    void VulkanBackend::ensureHiZDebugDescriptors(VulkanGraphResourceEntry& hiZ)
+    {
+        if (!m_imguiEnabled || hiZ.mipViews.empty())
+        {
+            return;
+        }
+
+        // Rebuild when the Hi-Z image was recreated (e.g. on resize): the
+        // cached debug views/descriptors reference the retired image.
+        if (!m_clusteredForwardResources.hiZDebugDescriptors.empty())
+        {
+            if (m_clusteredForwardResources.hiZDebugGeneration == hiZ.generation)
+            {
+                return;
+            }
+            destroyHiZDebugDescriptors();
+        }
+        m_clusteredForwardResources.hiZDebugGeneration = hiZ.generation;
+
+        if (m_clusteredForwardResources.hiZDebugSampler == VK_NULL_HANDLE)
+        {
+            VkSamplerCreateInfo samplerInfo{};
+            samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            samplerInfo.magFilter = VK_FILTER_LINEAR;
+            samplerInfo.minFilter = VK_FILTER_LINEAR;
+            samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            samplerInfo.maxLod = 0.0f;
+            if (vkCreateSampler(
+                    m_device.device(),
+                    &samplerInfo,
+                    nullptr,
+                    &m_clusteredForwardResources.hiZDebugSampler) !=
+                VK_SUCCESS)
+            {
+                return;
+            }
+        }
+
+        m_clusteredForwardResources.hiZDebugViews.reserve(hiZ.mipViews.size());
+        m_clusteredForwardResources.hiZDebugDescriptors.reserve(hiZ.mipViews.size());
+        for (uint32_t mip = 0; mip < hiZ.mipLevels; ++mip)
+        {
+            VkImageViewCreateInfo viewInfo{};
+            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewInfo.image = hiZ.texture.image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = hiZ.texture.format;
+            viewInfo.components.r = VK_COMPONENT_SWIZZLE_R;
+            viewInfo.components.g = VK_COMPONENT_SWIZZLE_R;
+            viewInfo.components.b = VK_COMPONENT_SWIZZLE_R;
+            viewInfo.components.a = VK_COMPONENT_SWIZZLE_ONE;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.baseMipLevel = mip;
+            viewInfo.subresourceRange.levelCount = 1;
+            viewInfo.subresourceRange.baseArrayLayer = 0;
+            viewInfo.subresourceRange.layerCount = 1;
+
+            VkImageView debugView = VK_NULL_HANDLE;
+            if (vkCreateImageView(
+                    m_device.device(),
+                    &viewInfo,
+                    nullptr,
+                    &debugView) != VK_SUCCESS)
+            {
+                continue;
+            }
+
+            m_clusteredForwardResources.hiZDebugViews.push_back(debugView);
+            m_clusteredForwardResources.hiZDebugDescriptors.push_back(
+                ImGui_ImplVulkan_AddTexture(
+                    debugView,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+        }
+
+    }
+
+    void VulkanBackend::destroyHiZDebugDescriptors()
+    {
+        for (VkDescriptorSet set :
+             m_clusteredForwardResources.hiZDebugDescriptors)
+        {
+            if (set != VK_NULL_HANDLE && m_imguiEnabled)
+            {
+                ImGui_ImplVulkan_RemoveTexture(set);
+            }
+        }
+        m_clusteredForwardResources.hiZDebugDescriptors.clear();
+
+        for (VkImageView view : m_clusteredForwardResources.hiZDebugViews)
+        {
+            if (view != VK_NULL_HANDLE)
+            {
+                vkDestroyImageView(m_device.device(), view, nullptr);
+            }
+        }
+        m_clusteredForwardResources.hiZDebugViews.clear();
+    }
+
+    void VulkanBackend::drawHiZDebugWindow()
+    {
+        if (!m_hiZDebugViewEnabled)
+        {
+            return;
+        }
+
+        ImGui::SetNextWindowSize(ImVec2(360.0f, 260.0f), ImGuiCond_FirstUseEver);
+        if (!ImGui::Begin("Hi-Z Depth Pyramid", &m_hiZDebugViewEnabled))
+        {
+            ImGui::End();
+            return;
+        }
+
+        VulkanGraphResourceEntry* hiZ =
+            m_graphResourceRegistry.entry(
+                m_clusteredForwardResources.hiZDebugResource);
+
+        if (hiZ)
+        {
+            ensureHiZDebugDescriptors(*hiZ);
+        }
+
+        const auto& descriptors =
+            m_clusteredForwardResources.hiZDebugDescriptors;
+        if (!hiZ || descriptors.empty())
+        {
+            ImGui::TextUnformatted("Waiting for Hi-Z pyramid...");
+            ImGui::End();
+            return;
+        }
+
+        const uint32_t mip =
+            std::min<uint32_t>(
+                m_hiZDebugMip,
+                static_cast<uint32_t>(descriptors.size() - 1u));
+        const uint32_t mipWidth = std::max(1u, hiZ->width >> mip);
+        const uint32_t mipHeight = std::max(1u, hiZ->height >> mip);
+        const ImVec2 available = ImGui::GetContentRegionAvail();
+        const float maxWidth = std::max(1.0f, available.x);
+        const float maxHeight = std::max(1.0f, available.y - 8.0f);
+        const float aspect =
+            static_cast<float>(mipWidth) / static_cast<float>(mipHeight);
+        float width = maxWidth;
+        float height = width / aspect;
+        if (height > maxHeight)
+        {
+            height = maxHeight;
+            width = height * aspect;
+        }
+
+        ImGui::Text("Mip %u / %u", mip, static_cast<uint32_t>(descriptors.size()));
+        ImGui::Text(
+            "%ux%u",
+            mipWidth,
+            mipHeight);
+        ImGui::Image(
+            (ImTextureID)descriptors[mip],
+            ImVec2(width, height));
+        ImGui::End();
+    }
+
     void VulkanBackend::endDebugGuiFrame()
     {
         if (!m_imguiFrameActive)
@@ -5415,6 +5514,7 @@ namespace ic
             return;
         }
 
+        drawHiZDebugWindow();
         ImGui::Render();
         m_imguiFrameActive = false;
     }
@@ -5438,7 +5538,7 @@ namespace ic
 
         auto lease =
             m_commandSystem.acquireFrameCommandBuffer(
-                static_cast<uint32_t>(ctx.frameIndex % m_frameSync.size()),
+                static_cast<uint32_t>(ctx.frameIndex % m_frameExecutor.framesInFlight()),
                 0);
 
         VkCommandBuffer cmd = lease.commandBuffer();
@@ -5451,6 +5551,32 @@ namespace ic
         {
             throw std::runtime_error(
                 "Failed to begin Vulkan ImGui command buffer.");
+        }
+
+        VulkanGraphResourceEntry* hiZDebugResource = nullptr;
+        if (m_hiZDebugViewEnabled)
+        {
+            hiZDebugResource =
+                m_graphResourceRegistry.entry(
+                    m_clusteredForwardResources.hiZDebugResource);
+        }
+
+        // ImGui is an external consumer of the compiled frame graph. Acquire
+        // the pyramid for sampling here, then restore the graph's GENERAL
+        // layout below so the next frame starts from its compiled state.
+        if (hiZDebugResource && hiZDebugResource->texture.image != VK_NULL_HANDLE)
+        {
+            transitionImage(
+                cmd,
+                hiZDebugResource->texture.image,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                0,
+                VK_ACCESS_SHADER_READ_BIT,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                hiZDebugResource->mipLevels);
         }
 
         transitionImage(
@@ -5467,7 +5593,7 @@ namespace ic
         colorAttachment.sType =
             VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         colorAttachment.imageView =
-            m_swapchain.imageView(m_currentSwapchainImage);
+            m_swapchain.imageView(m_frameExecutor.currentSwapchainImage());
         colorAttachment.imageLayout =
             VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -5483,6 +5609,21 @@ namespace ic
         vkCmdBeginRendering(cmd, &renderingInfo);
         ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
         vkCmdEndRendering(cmd);
+
+        if (hiZDebugResource && hiZDebugResource->texture.image != VK_NULL_HANDLE)
+        {
+            transitionImage(
+                cmd,
+                hiZDebugResource->texture.image,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_IMAGE_LAYOUT_GENERAL,
+                VK_ACCESS_SHADER_READ_BIT,
+                0,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0,
+                hiZDebugResource->mipLevels);
+        }
 
         transitionImage(
             cmd,
@@ -5525,6 +5666,32 @@ namespace ic
     void VulkanBackend::setClusteredForwardHeatmapEnabled(bool enabled)
     {
         m_clusteredForwardHeatmapEnabled = enabled;
+    }
+
+    bool VulkanBackend::hiZDebugViewEnabled() const
+    {
+        return m_hiZDebugViewEnabled;
+    }
+
+    void VulkanBackend::setHiZDebugViewEnabled(bool enabled)
+    {
+        if (m_hiZDebugViewEnabled != enabled)
+        {
+            spdlog::info(
+                "[VulkanBackend] Hi-Z debug view {}",
+                enabled ? "enabled" : "disabled");
+        }
+        m_hiZDebugViewEnabled = enabled;
+    }
+
+    uint32_t VulkanBackend::hiZDebugMip() const
+    {
+        return m_hiZDebugMip;
+    }
+
+    void VulkanBackend::setHiZDebugMip(uint32_t mip)
+    {
+        m_hiZDebugMip = mip;
     }
 
 
@@ -5611,6 +5778,9 @@ namespace ic
             case ResourceUsage::StorageTexture:
                 return VK_ACCESS_SHADER_READ_BIT;
 
+            case ResourceUsage::IndirectArgument:
+                return VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+
             case ResourceUsage::TransferSrc:
                 return VK_ACCESS_TRANSFER_READ_BIT;
 
@@ -5666,6 +5836,9 @@ namespace ic
         case ResourceUsage::StorageBuffer:
             return VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 
+        case ResourceUsage::IndirectArgument:
+            return VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+
         case ResourceUsage::VertexBuffer:
         case ResourceUsage::IndexBuffer:
             return VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
@@ -5712,7 +5885,9 @@ namespace ic
         VkAccessFlags srcAccess,
         VkAccessFlags dstAccess,
         VkPipelineStageFlags srcStage,
-        VkPipelineStageFlags dstStage)
+        VkPipelineStageFlags dstStage,
+        uint32_t baseMipLevel,
+        uint32_t levelCount)
     {
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -5726,7 +5901,8 @@ namespace ic
         barrier.image = image;
 
         barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseMipLevel = baseMipLevel;
+        barrier.subresourceRange.levelCount = levelCount;
         barrier.subresourceRange.layerCount = 1;
 
         barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -5747,134 +5923,11 @@ namespace ic
             : AccessType::Read;
     }
 
-    void VulkanBackend::initFrameSync(const RendererSpecification& spec)
-    {
-        const uint32_t framesInFlight =
-            spec.framesInFlight == 0 ? 1 : spec.framesInFlight;
-
-        m_frameSync.resize(framesInFlight);
-
-        for (auto& fs : m_frameSync)
-        {
-            VkSemaphoreCreateInfo semInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-
-            if (vkCreateSemaphore(
-                m_device.device(),
-                &semInfo,
-                nullptr,
-                &fs.imageAvailable) != VK_SUCCESS)
-            {
-                throw std::runtime_error(
-                    "Failed to create Vulkan image-available semaphore.");
-            }
-
-            VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
-            fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-
-            if (vkCreateFence(
-                m_device.device(),
-                &fenceInfo,
-                nullptr,
-                &fs.inFlightFence) != VK_SUCCESS)
-            {
-                throw std::runtime_error(
-                    "Failed to create Vulkan frame fence.");
-            }
-        }
-
-        initSwapchainSync();
-    }
-
-    void VulkanBackend::initSwapchainSync()
-    {
-        destroySwapchainSync();
-
-        const size_t imageCount =
-            m_swapchain.images().size();
-
-        m_imageRenderFinished.resize(imageCount, VK_NULL_HANDLE);
-        m_imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
-        m_swapchainImageLayouts.assign(
-            imageCount,
-            VK_IMAGE_LAYOUT_UNDEFINED);
-
-        VkSemaphoreCreateInfo semInfo{ VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-
-        for (VkSemaphore& semaphore : m_imageRenderFinished)
-        {
-            if (vkCreateSemaphore(
-                m_device.device(),
-                &semInfo,
-                nullptr,
-                &semaphore) != VK_SUCCESS)
-            {
-                throw std::runtime_error(
-                    "Failed to create Vulkan render-finished semaphore.");
-            }
-        }
-    }
-
-    void VulkanBackend::destroyFrameSync()
-    {
-        VkDevice device = m_device.device();
-
-        if (device == VK_NULL_HANDLE)
-            return;
-
-        for (FrameSync& fs : m_frameSync)
-        {
-            if (fs.imageAvailable != VK_NULL_HANDLE)
-            {
-                vkDestroySemaphore(
-                    device,
-                    fs.imageAvailable,
-                    nullptr);
-
-                fs.imageAvailable = VK_NULL_HANDLE;
-            }
-
-            if (fs.inFlightFence != VK_NULL_HANDLE)
-            {
-                vkDestroyFence(
-                    device,
-                    fs.inFlightFence,
-                    nullptr);
-
-                fs.inFlightFence = VK_NULL_HANDLE;
-            }
-        }
-
-        m_frameSync.clear();
-    }
-
-    void VulkanBackend::destroySwapchainSync()
-    {
-        VkDevice device = m_device.device();
-
-        if (device == VK_NULL_HANDLE)
-            return;
-
-        for (VkSemaphore semaphore : m_imageRenderFinished)
-        {
-            if (semaphore != VK_NULL_HANDLE)
-            {
-                vkDestroySemaphore(
-                    device,
-                    semaphore,
-                    nullptr);
-            }
-        }
-
-        m_imageRenderFinished.clear();
-        m_imagesInFlight.clear();
-        m_swapchainImageLayouts.clear();
-    }
-
     void VulkanBackend::onSwapchainRecreated()
     {
         vkDeviceWaitIdle(m_device.device());
         destroySceneResources();
-        destroyGraphResources();
+        m_graphResourceRegistry.reset();
         m_pipelineManager.shutdown();
 
         m_swapchain.recreate();
@@ -5882,9 +5935,9 @@ namespace ic
         if (!m_swapchain.validForRendering())
             return;
 
-        initSwapchainSync();
+        m_frameExecutor.initSwapchainSync();
         m_pipelineManager.init(m_device.device());
-        m_sceneFrameResources.resize(m_frameSync.size());
+        m_gpuScene.init(m_resourceAllocator, m_frameExecutor.framesInFlight());
         m_imageStates.clear();
     }
 

@@ -14,12 +14,16 @@ namespace ic
             const FrameGraphBuilder& builder)
     {
         m_nodes.clear();
+        m_resourceAccesses.clear();
         m_barriers.clear();
         m_resourceLifetimes.clear();
         m_dependencies.clear();
         m_executionOrder.clear();
         m_executionLevels.clear();
         m_executionLevelNodes.clear();
+        m_queueSubmissions.clear();
+        m_queueSubmissionNodes.clear();
+        m_queueSubmissionWaits.clear();
         m_chainMap.clear();
         m_resourceChains.clear();
         m_nodeSchedules.clear();
@@ -41,6 +45,19 @@ namespace ic
             compiledNode.type = node.graphNode.type;
             compiledNode.payloadIndex = node.graphNode.payloadIndex;
 
+            compiledNode.firstResourceAccess =
+                static_cast<uint32_t>(m_resourceAccesses.size());
+            for (const ResourceAccess& access : builder.accesses())
+            {
+                if (access.node == compiledNode.nodeId)
+                {
+                    m_resourceAccesses.push_back(access);
+                }
+            }
+            compiledNode.resourceAccessCount =
+                static_cast<uint32_t>(m_resourceAccesses.size()) -
+                compiledNode.firstResourceAccess;
+
             m_nodes.push_back(compiledNode);
         }
 
@@ -49,6 +66,7 @@ namespace ic
         buildAdjacencyLists();
         buildExecutionOrder();
         buildExecutionLevels();
+        buildQueueSubmissions();
         buildResourceLifetimes();
         buildBarriers();
         buildNodeSchedules();
@@ -68,12 +86,16 @@ namespace ic
             .executionOrder = std::span<const GraphNodeId>(m_executionOrder),
             .executionLevels = std::span<const ExecutionLevel>(m_executionLevels),
             .executionLevelNodes = std::span<const GraphNodeId>(m_executionLevelNodes),
+            .queueSubmissions = std::span<const QueueSubmissionBatch>(m_queueSubmissions),
+            .queueSubmissionNodes = std::span<const GraphNodeId>(m_queueSubmissionNodes),
+            .queueSubmissionWaits = std::span<const QueueSubmissionWait>(m_queueSubmissionWaits),
             .dependencies = std::span<const Dependency>(m_dependencies),
             .barriers = std::span<const ResourceBarrier>(m_barriers),
             .nodeSchedules = std::span<const NodeSchedule>(m_nodeSchedules),
             .incomingBarrierIndices = std::span<const uint32_t>(m_incomingBarrierIndices),
             .outgoingBarrierIndices = std::span<const uint32_t>(m_outgoingBarrierIndices),
             .resourceLifetimes = std::span<const ResourceLifetime>(m_resourceLifetimes),
+            .resourceAccesses = std::span<const ResourceAccess>(m_resourceAccesses),
             .resources = std::span<const GraphResource>(resources),
             .payloads = std::span<const PassPayload>(payloads)
         };
@@ -89,40 +111,54 @@ namespace ic
             bool valid = false;
         };
 
-        std::pmr::unordered_map<
-            GraphResourceId,
-            LastWriter> lastWriterMap;
-
         for (const auto& chain : m_resourceChains)
         {
             LastWriter lastWriter{};
+            std::pmr::vector<GraphNodeId> readers(
+                m_nodes.get_allocator());
 
             for (const auto& access : chain.accesses)
             {
-                auto& lw = lastWriterMap[chain.resource];
-
-                if (access.access == AccessType::Write)
+                if (access.access == AccessType::Write ||
+                    access.access == AccessType::ReadWrite)
                 {
-                    // write-after-write OR write-after-read
-                    if (lw.valid && lw.node != access.node)
+                    if (lastWriter.valid &&
+                        lastWriter.node != access.node)
                     {
                         m_dependencies.push_back({
-                            .source = lw.node,
+                            .source = lastWriter.node,
                             .destination = access.node
                             });
                     }
-
-                    lw = { access.node, true };
+                    for (GraphNodeId reader : readers)
+                    {
+                        if (reader != access.node)
+                        {
+                            m_dependencies.push_back({
+                                .source = reader,
+                                .destination = access.node
+                                });
+                        }
+                    }
+                    readers.clear();
+                    lastWriter = { access.node, true };
                 }
                 else // Read
                 {
-                    // read-after-write dependency
-                    if (lw.valid && lw.node != access.node)
+                    if (lastWriter.valid &&
+                        lastWriter.node != access.node)
                     {
                         m_dependencies.push_back({
-                            .source = lw.node,
+                            .source = lastWriter.node,
                             .destination = access.node
                             });
+                    }
+                    if (!access.external &&
+                        std::find(
+                            readers.begin(), readers.end(), access.node) ==
+                            readers.end())
+                    {
+                        readers.push_back(access.node);
                     }
                 }
             }
@@ -307,6 +343,104 @@ namespace ic
             "FrameGraph contains dependency cycle");
     }
 
+    void FrameGraphCompiler::buildQueueSubmissions()
+    {
+        m_queueSubmissions.clear();
+        m_queueSubmissionNodes.clear();
+        m_queueSubmissionWaits.clear();
+
+        std::pmr::vector<uint32_t> nodeSubmission(
+            m_nodes.size(), UINT32_MAX, m_nodes.get_allocator());
+
+        for (uint32_t levelIndex = 0;
+             levelIndex < m_executionLevels.size();
+             ++levelIndex)
+        {
+            const ExecutionLevel& level = m_executionLevels[levelIndex];
+            for (QueueType queue : {
+                     QueueType::Graphics,
+                     QueueType::Compute,
+                     QueueType::Transfer })
+            {
+                QueueSubmissionBatch batch{};
+                batch.queue = queue;
+                batch.levelIndex = levelIndex;
+                batch.firstNode =
+                    static_cast<uint32_t>(m_queueSubmissionNodes.size());
+
+                for (uint32_t i = 0; i < level.nodeCount; ++i)
+                {
+                    const GraphNodeId node =
+                        m_executionLevelNodes[level.firstNode + i];
+                    if (m_nodes[node].queue == queue)
+                    {
+                        m_queueSubmissionNodes.push_back(node);
+                    }
+                }
+
+                batch.nodeCount =
+                    static_cast<uint32_t>(m_queueSubmissionNodes.size()) -
+                    batch.firstNode;
+                if (batch.nodeCount == 0)
+                {
+                    continue;
+                }
+
+                const uint32_t submissionIndex =
+                    static_cast<uint32_t>(m_queueSubmissions.size());
+                m_queueSubmissions.push_back(batch);
+                for (uint32_t i = 0; i < batch.nodeCount; ++i)
+                {
+                    nodeSubmission[
+                        m_queueSubmissionNodes[batch.firstNode + i]] =
+                        submissionIndex;
+                }
+            }
+        }
+
+        std::vector<std::vector<uint32_t>> waits(
+            m_queueSubmissions.size());
+        for (const Dependency& dependency : m_dependencies)
+        {
+            const uint32_t source = nodeSubmission[dependency.source];
+            const uint32_t destination = nodeSubmission[dependency.destination];
+            if (source == UINT32_MAX || destination == UINT32_MAX ||
+                source == destination ||
+                m_queueSubmissions[source].queue ==
+                    m_queueSubmissions[destination].queue)
+            {
+                continue;
+            }
+
+            auto& destinationWaits = waits[destination];
+            if (std::find(
+                    destinationWaits.begin(),
+                    destinationWaits.end(),
+                    source) == destinationWaits.end())
+            {
+                destinationWaits.push_back(source);
+            }
+        }
+
+        for (uint32_t submissionIndex = 0;
+             submissionIndex < m_queueSubmissions.size();
+             ++submissionIndex)
+        {
+            QueueSubmissionBatch& batch =
+                m_queueSubmissions[submissionIndex];
+            batch.firstWait =
+                static_cast<uint32_t>(m_queueSubmissionWaits.size());
+            std::sort(waits[submissionIndex].begin(),
+                      waits[submissionIndex].end());
+            for (uint32_t dependency : waits[submissionIndex])
+            {
+                m_queueSubmissionWaits.push_back({ dependency });
+            }
+            batch.waitCount =
+                static_cast<uint32_t>(waits[submissionIndex].size());
+        }
+    }
+
     void FrameGraphCompiler::buildResourceLifetimes()
     {
         m_resourceLifetimes.clear();
@@ -381,26 +515,19 @@ namespace ic
         {
             const auto& resource = resources[chain.resource];
 
-            if (resource.ownership != ResourceOwnership::Imported)
-                continue;
-
             if (chain.accesses.empty())
                 continue;
 
-
-            if (resource.ownership == ResourceOwnership::Imported)
-            {
-                ResourceAccess initial{};
-                initial.node = chain.accesses.front().node;
-                initial.resource = chain.resource;
-
-                initial.access = resource.initialAccess;
-                initial.usage = resource.initialUsage;
-                initial.external = true;
-                initial.firstUse = true;
-
-                chain.accesses.insert(chain.accesses.begin(), initial);
-            }
+            ResourceAccess initial{};
+            initial.node = chain.accesses.front().node;
+            initial.resource = chain.resource;
+            initial.access = resource.ownership == ResourceOwnership::Imported
+                ? resource.initialAccess : AccessType::Read;
+            initial.usage = resource.ownership == ResourceOwnership::Imported
+                ? resource.initialUsage : chain.accesses.front().usage;
+            initial.external = true;
+            initial.firstUse = true;
+            chain.accesses.insert(chain.accesses.begin(), initial);
         }
     }
 
@@ -446,8 +573,8 @@ namespace ic
                 const auto& curr = sorted[i];
 
                 const bool needsBarrier =
-                    prev.access == AccessType::Write ||
-                    curr.access == AccessType::Write ||
+                    prev.access != AccessType::Read ||
+                    curr.access != AccessType::Read ||
                     prev.usage != curr.usage;
 
                 if (needsBarrier)
@@ -459,7 +586,8 @@ namespace ic
                         .fromAccess = prev.access,
                         .toAccess = curr.access,
                         .oldUsage = prev.usage,
-                        .newUsage = curr.usage
+                        .newUsage = curr.usage,
+                        .firstUse = prev.firstUse
                         });
                 }
 
@@ -568,6 +696,7 @@ namespace ic
         case ResourceUsage::SampledTexture:  return "SampledTexture";
         case ResourceUsage::ConstantBuffer: return "ConstantBuffer";
         case ResourceUsage::StorageBuffer: return "StorageBuffer";
+        case ResourceUsage::IndirectArgument: return "IndirectArgument";
         case ResourceUsage::StorageTexture: return "StorageTexture";
         case ResourceUsage::TransferDst: return "TransferDst";
         case ResourceUsage::TransferSrc: return "TransferSrc";

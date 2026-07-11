@@ -35,11 +35,12 @@ namespace ic
 
         if (enableValidation)
         {
-            Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
-            if (SUCCEEDED(m_device.As(&infoQueue)))
+            if (SUCCEEDED(m_device.As(&m_infoQueue)))
             {
-                infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, TRUE);
-                infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, TRUE);
+                m_infoQueue->SetBreakOnSeverity(
+                    D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+                m_infoQueue->SetBreakOnSeverity(
+                    D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
             }
         }
 
@@ -76,10 +77,35 @@ namespace ic
         m_copyQueue.Reset();
         m_computeQueue.Reset();
         m_graphicsQueue.Reset();
+        m_infoQueue.Reset();
         m_device.Reset();
         m_features = {};
         m_rtvDescriptorSize = 0;
         spdlog::info("[DX12Device] Shutdown");
+    }
+
+    void DX12Device::logValidationMessages()
+    {
+        if (!m_infoQueue)
+        {
+            return;
+        }
+
+        const uint64_t count = m_infoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
+        for (uint64_t i = 0; i < count; ++i)
+        {
+            SIZE_T size = 0;
+            m_infoQueue->GetMessage(i, nullptr, &size);
+            std::vector<std::byte> storage(size);
+            auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+            if (SUCCEEDED(m_infoQueue->GetMessage(i, message, &size)))
+            {
+                spdlog::error(
+                    "[DX12 Validation] {}",
+                    message->pDescription ? message->pDescription : "<empty>");
+            }
+        }
+        m_infoQueue->ClearStoredMessages();
     }
 
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> DX12Device::createQueue(

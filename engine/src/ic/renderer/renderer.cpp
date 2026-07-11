@@ -17,6 +17,7 @@
 #include "ic/scene/scene_render_view.h"
 
 #include <spdlog/spdlog.h>
+#include <imgui.h>
 
 #ifdef _WIN32
 #include "ic/renderer/dx12_backend/dx12_backend.h"
@@ -103,8 +104,8 @@ namespace ic
             workerCount);
 
         m_runtime->renderExtent = {
-            std::max(1u, window.getHeight()),
-            std::max(1u, window.getWidth())
+            std::max(1u, window.getWidth()),
+            std::max(1u, window.getHeight())            
         };
 
         buildOrRebuildFrameGraph();
@@ -129,6 +130,23 @@ namespace ic
 
         syncSceneEnvironmentIBL(frame, scene);
         processPendingRendererJobs(frame);
+
+        if (scene.camera.valid == 0u)
+        {
+            return;
+        }
+        if (frame.services && frame.services->assetManager)
+        {
+            for (const SceneModelRenderItem& item : scene.models)
+            {
+                const AssetState state =
+                    frame.services->assetManager->state(item.model);
+                if (state != AssetState::Loaded && state != AssetState::Failed)
+                {
+                    return;
+                }
+            }
+        }
 
         runtime.backend->execute(
             runtime.compiledGraphPlan,
@@ -209,8 +227,123 @@ namespace ic
     {
         if (m_runtime && m_runtime->backend)
         {
+            drawFrameGraphDebugWindow();
             m_runtime->backend->endDebugGuiFrame();
         }
+    }
+
+    void Renderer::drawFrameGraphDebugWindow()
+    {
+        if (!ImGui::GetCurrentContext() || !m_runtime)
+        {
+            return;
+        }
+
+        static bool open = true;
+        if (!open)
+        {
+            return;
+        }
+        if (!ImGui::Begin("Frame Graph Queues", &open))
+        {
+            ImGui::End();
+            return;
+        }
+
+        const CompiledGraphPlan& plan = m_runtime->compiledGraphPlan;
+        ImGui::Text("Passes %u | Levels %u | Batches %u",
+            static_cast<uint32_t>(plan.nodes.size()),
+            static_cast<uint32_t>(plan.executionLevels.size()),
+            static_cast<uint32_t>(plan.queueSubmissions.size()));
+        ImGui::TextDisabled(
+            "CPU Parallel = recorded together. GPU Async = different queues may overlap.");
+
+        auto queueName = [](QueueType queue)
+        {
+            switch (queue)
+            {
+            case QueueType::Graphics: return "Graphics";
+            case QueueType::Compute: return "Compute";
+            case QueueType::Transfer: return "Transfer";
+            }
+            return "Unknown";
+        };
+
+        auto passName = [&plan](GraphNodeId node) -> const char*
+        {
+            if (node >= plan.nodes.size()) return "Invalid";
+            const ExecutionNode& execution = plan.nodes[node];
+            if (execution.payloadIndex >= plan.payloads.size()) return "Unnamed";
+            const PassPayload& payload = plan.payloads[execution.payloadIndex];
+            if (const auto* pass = std::get_if<GraphicsPassData>(&payload))
+                return pass->name.c_str();
+            if (const auto* pass = std::get_if<ComputePassData>(&payload))
+                return pass->name.c_str();
+            if (const auto* pass = std::get_if<TransferPassData>(&payload))
+                return pass->name.c_str();
+            if (std::holds_alternative<EnvironmentConvertPassData>(payload))
+                return "EnvironmentConvert";
+            if (std::holds_alternative<PathTracePassData>(payload))
+                return "PathTrace";
+            if (std::holds_alternative<TonemapPassData>(payload))
+                return "Tonemap";
+            if (std::holds_alternative<PresentPassData>(payload))
+                return "Present";
+            return "Unnamed";
+        };
+
+        if (ImGui::BeginTable("GraphQueueSchedule", 7,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+        {
+            ImGui::TableSetupColumn("Level");
+            ImGui::TableSetupColumn("Queue");
+            ImGui::TableSetupColumn("Pass");
+            ImGui::TableSetupColumn("Waits");
+            ImGui::TableSetupColumn("CPU Parallel");
+            ImGui::TableSetupColumn("GPU Async");
+            ImGui::TableSetupColumn("Node");
+            ImGui::TableHeadersRow();
+
+            for (const QueueSubmissionBatch& batch : plan.queueSubmissions)
+            {
+                uint32_t batchesInLevel = 0;
+                for (const QueueSubmissionBatch& other : plan.queueSubmissions)
+                {
+                    batchesInLevel +=
+                        other.levelIndex == batch.levelIndex ? 1u : 0u;
+                }
+
+                const bool cpuParallel =
+                    batch.levelIndex < plan.executionLevels.size() &&
+                    plan.executionLevels[batch.levelIndex].nodeCount > 1;
+                for (uint32_t i = 0; i < batch.nodeCount; ++i)
+                {
+                    const GraphNodeId node =
+                        plan.queueSubmissionNodes[batch.firstNode + i];
+                    ImGui::TableNextRow();
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", batch.levelIndex);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(queueName(batch.queue));
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(passName(node));
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", batch.waitCount);
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(cpuParallel ? "Yes" : "No");
+                    ImGui::TableNextColumn();
+                    if (batchesInLevel > 1)
+                        ImGui::TextColored(
+                            ImVec4(0.25f, 0.9f, 0.35f, 1.0f), "Eligible");
+                    else
+                        ImGui::TextDisabled("No");
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", node);
+                }
+            }
+            ImGui::EndTable();
+        }
+        ImGui::End();
     }
 
     bool Renderer::vsyncEnabled() const
@@ -240,6 +373,36 @@ namespace ic
         if (m_runtime && m_runtime->backend)
         {
             m_runtime->backend->setClusteredForwardHeatmapEnabled(enabled);
+        }
+    }
+
+    bool Renderer::hiZDebugViewEnabled() const
+    {
+        return m_runtime &&
+            m_runtime->backend &&
+            m_runtime->backend->hiZDebugViewEnabled();
+    }
+
+    void Renderer::setHiZDebugViewEnabled(bool enabled)
+    {
+        if (m_runtime && m_runtime->backend)
+        {
+            m_runtime->backend->setHiZDebugViewEnabled(enabled);
+        }
+    }
+
+    uint32_t Renderer::hiZDebugMip() const
+    {
+        return m_runtime && m_runtime->backend
+            ? m_runtime->backend->hiZDebugMip()
+            : 0u;
+    }
+
+    void Renderer::setHiZDebugMip(uint32_t mip)
+    {
+        if (m_runtime && m_runtime->backend)
+        {
+            m_runtime->backend->setHiZDebugMip(mip);
         }
     }
 

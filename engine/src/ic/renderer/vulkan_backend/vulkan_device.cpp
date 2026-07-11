@@ -86,8 +86,10 @@ namespace ic
 
         if (!m_info.supportedFeatures.dynamicRendering ||
             !m_info.supportedFeatures.synchronization2 ||
+            !m_info.supportedFeatures.timelineSemaphore ||
             !m_info.supportedFeatures.descriptorIndexing ||
-            !m_info.supportedFeatures.bufferDeviceAddress)
+            !m_info.supportedFeatures.bufferDeviceAddress ||
+            !m_info.supportedFeatures.drawIndirectCount)
         {
             throw std::runtime_error(
                 "Selected Vulkan device does not support required renderer features.");
@@ -95,43 +97,37 @@ namespace ic
 
         VkPhysicalDeviceFeatures deviceFeatures{};
 
-        VkPhysicalDeviceDescriptorIndexingFeatures enabledDescriptorIndexing{};
-        enabledDescriptorIndexing.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
-        enabledDescriptorIndexing.shaderUniformBufferArrayNonUniformIndexing =
-            m_info.descriptorIndexingFeatures.shaderUniformBufferArrayNonUniformIndexing;
-        enabledDescriptorIndexing.shaderSampledImageArrayNonUniformIndexing =
+        VkPhysicalDeviceVulkan12Features enabledVulkan12{};
+        enabledVulkan12.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        enabledVulkan12.shaderUniformBufferArrayNonUniformIndexing =
+            m_info.vulkan12Features.shaderUniformBufferArrayNonUniformIndexing;
+        enabledVulkan12.shaderSampledImageArrayNonUniformIndexing =
             VK_TRUE;
-        enabledDescriptorIndexing.shaderStorageBufferArrayNonUniformIndexing =
+        enabledVulkan12.shaderStorageBufferArrayNonUniformIndexing =
             VK_TRUE;
-        enabledDescriptorIndexing.shaderStorageImageArrayNonUniformIndexing =
+        enabledVulkan12.shaderStorageImageArrayNonUniformIndexing =
             VK_TRUE;
-        enabledDescriptorIndexing.descriptorBindingSampledImageUpdateAfterBind =
-            m_info.descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind;
-        enabledDescriptorIndexing.descriptorBindingStorageImageUpdateAfterBind =
-            m_info.descriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind;
-        enabledDescriptorIndexing.descriptorBindingStorageBufferUpdateAfterBind =
-            m_info.descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind;
-        enabledDescriptorIndexing.descriptorBindingUpdateUnusedWhilePending =
+        enabledVulkan12.descriptorBindingSampledImageUpdateAfterBind =
+            m_info.vulkan12Features.descriptorBindingSampledImageUpdateAfterBind;
+        enabledVulkan12.descriptorBindingStorageImageUpdateAfterBind =
+            m_info.vulkan12Features.descriptorBindingStorageImageUpdateAfterBind;
+        enabledVulkan12.descriptorBindingStorageBufferUpdateAfterBind =
+            m_info.vulkan12Features.descriptorBindingStorageBufferUpdateAfterBind;
+        enabledVulkan12.descriptorBindingUpdateUnusedWhilePending =
             VK_TRUE;
-        enabledDescriptorIndexing.descriptorBindingPartiallyBound =
+        enabledVulkan12.descriptorBindingPartiallyBound =
             VK_TRUE;
-        enabledDescriptorIndexing.descriptorBindingVariableDescriptorCount =
-            m_info.descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount;
-        enabledDescriptorIndexing.runtimeDescriptorArray =
+        enabledVulkan12.descriptorBindingVariableDescriptorCount =
+            m_info.vulkan12Features.descriptorBindingVariableDescriptorCount;
+        enabledVulkan12.runtimeDescriptorArray =
             VK_TRUE;
-
-        VkPhysicalDeviceBufferDeviceAddressFeatures enabledBda{};
-        enabledBda.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-        enabledBda.bufferDeviceAddress =
+        enabledVulkan12.bufferDeviceAddress =
             VK_TRUE;
-
-        VkPhysicalDeviceTimelineSemaphoreFeatures enabledTimeline{};
-        enabledTimeline.sType =
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
-        enabledTimeline.timelineSemaphore =
+        enabledVulkan12.timelineSemaphore =
             m_info.supportedFeatures.timelineSemaphore ? VK_TRUE : VK_FALSE;
+        enabledVulkan12.drawIndirectCount =
+            m_info.supportedFeatures.drawIndirectCount ? VK_TRUE : VK_FALSE;
 
         VkPhysicalDeviceVulkan13Features enabledVulkan13Features{};
         enabledVulkan13Features.sType =
@@ -149,9 +145,7 @@ namespace ic
             m_info.supportedFeatures.descriptorBuffer ? VK_TRUE : VK_FALSE;
 #endif
 
-        enabledDescriptorIndexing.pNext = &enabledBda;
-        enabledBda.pNext = &enabledTimeline;
-        enabledTimeline.pNext = &enabledVulkan13Features;
+        enabledVulkan12.pNext = &enabledVulkan13Features;
 
 #ifdef VK_EXT_descriptor_buffer
         enabledVulkan13Features.pNext = &enabledDescriptorBuffer;
@@ -172,7 +166,7 @@ namespace ic
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
         createInfo.pNext =
-            &enabledDescriptorIndexing;
+            &enabledVulkan12;
 
         createInfo.queueCreateInfoCount =
             static_cast<uint32_t>(queueCreateInfos.size());

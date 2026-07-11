@@ -71,6 +71,20 @@ namespace ic
                         m_renderer->setClusteredForwardHeatmapEnabled(
                             heatmap);
                     }
+
+                    bool hiZDebug = m_renderer->hiZDebugViewEnabled();
+                    if (ImGui::Checkbox("Hi-Z Debug View", &hiZDebug))
+                    {
+                        m_renderer->setHiZDebugViewEnabled(hiZDebug);
+                    }
+
+                    int hiZMip =
+                        static_cast<int>(m_renderer->hiZDebugMip());
+                    if (ImGui::SliderInt("Hi-Z Mip", &hiZMip, 0, 15))
+                    {
+                        m_renderer->setHiZDebugMip(
+                            static_cast<uint32_t>(std::max(0, hiZMip)));
+                    }
                 }
             }
 

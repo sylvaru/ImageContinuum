@@ -88,6 +88,8 @@ namespace ic
 
 		m_info.features.sType =
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+		m_info.vulkan12Features.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
 
 		m_info.descriptorIndexingFeatures.sType =
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
@@ -106,13 +108,11 @@ namespace ic
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT;
 #endif
 
-		m_info.features.pNext = &m_info.descriptorIndexingFeatures;
-		m_info.descriptorIndexingFeatures.pNext = &m_info.bufferDeviceAddressFeatures;
-		m_info.bufferDeviceAddressFeatures.pNext = &m_info.vulkan13Features;
-		m_info.vulkan13Features.pNext = &m_info.timelineSemaphoreFeatures;
+		m_info.features.pNext = &m_info.vulkan12Features;
+		m_info.vulkan12Features.pNext = &m_info.vulkan13Features;
 
 #ifdef VK_EXT_descriptor_buffer
-		m_info.timelineSemaphoreFeatures.pNext = &m_info.descriptorBufferFeatures;
+		m_info.vulkan13Features.pNext = &m_info.descriptorBufferFeatures;
 #endif
 
 		vkGetPhysicalDeviceFeatures2(
@@ -129,18 +129,21 @@ namespace ic
 			m_info.vulkan13Features.synchronization2 == VK_TRUE;
 
 		m_info.supportedFeatures.timelineSemaphore =
-			m_info.timelineSemaphoreFeatures.timelineSemaphore == VK_TRUE;
+			m_info.vulkan12Features.timelineSemaphore == VK_TRUE;
 
 		m_info.supportedFeatures.bufferDeviceAddress =
-			m_info.bufferDeviceAddressFeatures.bufferDeviceAddress == VK_TRUE;
+			m_info.vulkan12Features.bufferDeviceAddress == VK_TRUE;
+
+		m_info.supportedFeatures.drawIndirectCount =
+			m_info.vulkan12Features.drawIndirectCount == VK_TRUE;
 
 		m_info.supportedFeatures.descriptorIndexing =
-			m_info.descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE &&
-			m_info.descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE &&
-			m_info.descriptorIndexingFeatures.descriptorBindingUpdateUnusedWhilePending == VK_TRUE &&
-			m_info.descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing == VK_TRUE &&
-			m_info.descriptorIndexingFeatures.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE &&
-			m_info.descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
+			m_info.vulkan12Features.runtimeDescriptorArray == VK_TRUE &&
+			m_info.vulkan12Features.descriptorBindingPartiallyBound == VK_TRUE &&
+			m_info.vulkan12Features.descriptorBindingUpdateUnusedWhilePending == VK_TRUE &&
+			m_info.vulkan12Features.shaderSampledImageArrayNonUniformIndexing == VK_TRUE &&
+			m_info.vulkan12Features.shaderStorageBufferArrayNonUniformIndexing == VK_TRUE &&
+			m_info.vulkan12Features.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
 
 #ifdef VK_EXT_descriptor_buffer
 		m_info.supportedFeatures.descriptorBuffer =
@@ -274,22 +277,10 @@ namespace ic
 
 		for (uint32_t i = 0; i < count; ++i)
 		{
-			if (queues[i].queueFlags &
-				VK_QUEUE_GRAPHICS_BIT)
+			if (indices.graphics == UINT32_MAX &&
+				(queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
 			{
 				indices.graphics = i;
-			}
-
-			if (queues[i].queueFlags &
-				VK_QUEUE_COMPUTE_BIT)
-			{
-				indices.compute = i;
-			}
-
-			if (queues[i].queueFlags &
-				VK_QUEUE_TRANSFER_BIT)
-			{
-				indices.transfer = i;
 			}
 
 			VkBool32 presentSupport = false;
@@ -300,10 +291,63 @@ namespace ic
 				m_surface,
 				&presentSupport);
 
-			if (presentSupport)
+			if (presentSupport && indices.present == UINT32_MAX)
 			{
 				indices.present = i;
 			}
+		}
+
+		// Prefer dedicated asynchronous families, then progressively fall back
+		// to more general queues. This decision becomes the physical mapping
+		// for frame-graph QueueType values.
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			const VkQueueFlags flags = queues[i].queueFlags;
+			if ((flags & VK_QUEUE_COMPUTE_BIT) &&
+				!(flags & VK_QUEUE_GRAPHICS_BIT))
+			{
+				indices.compute = i;
+				break;
+			}
+		}
+		if (indices.compute == UINT32_MAX)
+		{
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				if (queues[i].queueFlags & VK_QUEUE_COMPUTE_BIT)
+				{
+					indices.compute = i;
+					break;
+				}
+			}
+		}
+
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			const VkQueueFlags flags = queues[i].queueFlags;
+			if ((flags & VK_QUEUE_TRANSFER_BIT) &&
+				!(flags & VK_QUEUE_GRAPHICS_BIT) &&
+				!(flags & VK_QUEUE_COMPUTE_BIT))
+			{
+				indices.transfer = i;
+				break;
+			}
+		}
+		if (indices.transfer == UINT32_MAX)
+		{
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				if ((queues[i].queueFlags & VK_QUEUE_TRANSFER_BIT) &&
+					!(queues[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
+				{
+					indices.transfer = i;
+					break;
+				}
+			}
+		}
+		if (indices.transfer == UINT32_MAX)
+		{
+			indices.transfer = indices.graphics;
 		}
 
 		return indices;

@@ -156,7 +156,11 @@ namespace ic
                 desc.depth > 1 ? desc.depth : desc.arrayLayers);
         resourceDesc.MipLevels =
             static_cast<UINT16>(desc.mipLevels);
-        resourceDesc.Format = toDxgiFormat(desc.format);
+        resourceDesc.Format =
+            desc.format == TextureFormat::D32_Float &&
+                hasFlag(desc.usage, TextureUsageFlags::Sampled)
+                ? DXGI_FORMAT_R32_TYPELESS
+                : toDxgiFormat(desc.format);
         resourceDesc.SampleDesc.Count = 1;
         resourceDesc.SampleDesc.Quality = 0;
         resourceDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -173,7 +177,7 @@ namespace ic
 
         if (hasFlag(desc.usage, TextureUsageFlags::DepthAttachment))
         {
-            clearValue.Format = resourceDesc.Format;
+            clearValue.Format = toDxgiFormat(desc.format);
             clearValue.DepthStencil.Depth = 1.0f;
             clearValue.DepthStencil.Stencil = 0;
             optimizedClearValue = &clearValue;
@@ -356,6 +360,8 @@ namespace ic
             return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
         case TextureFormat::D32_Float:
             return DXGI_FORMAT_D32_FLOAT;
+        case TextureFormat::R32_Float:
+            return DXGI_FORMAT_R32_FLOAT;
         case TextureFormat::Unknown:
             break;
         }

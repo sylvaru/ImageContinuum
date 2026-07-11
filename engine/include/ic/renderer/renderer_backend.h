@@ -83,5 +83,23 @@ namespace ic
         virtual void setClusteredForwardHeatmapEnabled(bool)
         {
         }
+
+        virtual bool hiZDebugViewEnabled() const
+        {
+            return false;
+        }
+
+        virtual void setHiZDebugViewEnabled(bool)
+        {
+        }
+
+        virtual uint32_t hiZDebugMip() const
+        {
+            return 0;
+        }
+
+        virtual void setHiZDebugMip(uint32_t)
+        {
+        }
     };
 }

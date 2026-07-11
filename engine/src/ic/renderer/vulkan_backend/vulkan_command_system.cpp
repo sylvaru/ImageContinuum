@@ -7,41 +7,62 @@
 
 namespace ic
 {
+    namespace
+    {
+        uint32_t queueIndex(QueueType queue)
+        {
+            return static_cast<uint32_t>(queue);
+        }
+
+        uint32_t queueFamily(
+            const QueueFamilyIndices& families,
+            QueueType queue)
+        {
+            switch (queue)
+            {
+            case QueueType::Compute: return families.compute;
+            case QueueType::Transfer: return families.transfer;
+            case QueueType::Graphics: return families.graphics;
+            }
+            return families.graphics;
+        }
+    }
+
     void VulkanCommandSystem::init(
         VkDevice device,
-        uint32_t graphicsQueueFamily,
+        const QueueFamilyIndices& queueFamilies,
         uint32_t maxFramesInFlight,
         uint32_t maxWorkers)
     {
         m_device = device;
-        m_graphicsQueueFamily = graphicsQueueFamily;
+        m_queueFamilies = queueFamilies;
 
         m_frames.resize(maxFramesInFlight);
 
         for (auto& frame : m_frames)
         {
-            frame.workerPools.resize(maxWorkers);
-
-            for (std::unique_ptr<WorkerPool>& workerPtr : frame.workerPools)
+            for (uint32_t queue = 0; queue < frame.queuePools.size(); ++queue)
             {
-                workerPtr = std::make_unique<WorkerPool>();
-                WorkerPool& worker = *workerPtr;
+                auto& workers = frame.queuePools[queue];
+                workers.resize(maxWorkers);
+                for (std::unique_ptr<WorkerPool>& workerPtr : workers)
+                {
+                    workerPtr = std::make_unique<WorkerPool>();
+                    WorkerPool& worker = *workerPtr;
 
                 VkCommandPoolCreateInfo poolInfo{};
                 poolInfo.sType =
                     VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
 
-                poolInfo.queueFamilyIndex =
-                    graphicsQueueFamily;
+                    poolInfo.queueFamilyIndex = queueFamily(
+                        queueFamilies, static_cast<QueueType>(queue));
 
                 poolInfo.flags =
                     VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
-                vkCreateCommandPool(
-                    m_device,
-                    &poolInfo,
-                    nullptr,
-                    &worker.pool);
+                    vkCreateCommandPool(
+                        m_device, &poolInfo, nullptr, &worker.pool);
+                }
             }
         }
 
@@ -49,7 +70,7 @@ namespace ic
         immediatePoolInfo.sType =
             VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         immediatePoolInfo.queueFamilyIndex =
-            graphicsQueueFamily;
+            queueFamilies.graphics;
         immediatePoolInfo.flags =
             VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
@@ -110,7 +131,8 @@ namespace ic
 
         for (auto& frame : m_frames)
         {
-            for (std::unique_ptr<WorkerPool>& workerPtr : frame.workerPools)
+            for (auto& workers : frame.queuePools)
+            for (std::unique_ptr<WorkerPool>& workerPtr : workers)
             {
                 WorkerPool& worker = *workerPtr;
 
@@ -148,7 +170,8 @@ namespace ic
 
     void VulkanCommandSystem::beginFrame(uint32_t frameIndex)
     {
-        for (std::unique_ptr<WorkerPool>& workerPtr : m_frames[frameIndex].workerPools)
+        for (auto& workers : m_frames[frameIndex].queuePools)
+        for (std::unique_ptr<WorkerPool>& workerPtr : workers)
         {
             WorkerPool& worker = *workerPtr;
             std::scoped_lock lock(worker.mutex);
@@ -163,13 +186,14 @@ namespace ic
     VulkanCommandSystem::RecordingLease
         VulkanCommandSystem::acquireFrameCommandBuffer(
             uint32_t frameIndex,
-            uint32_t workerIndex)
+            uint32_t workerIndex,
+            QueueType queue)
     {
         FrameData& frame =
             m_frames[frameIndex % m_frames.size()];
 
         WorkerPool& pool =
-            *frame.workerPools[workerIndex];
+            *frame.queuePools[queueIndex(queue)][workerIndex];
 
         std::unique_lock lock(pool.mutex);
 
@@ -209,7 +233,7 @@ namespace ic
             m_frames[frameIndex % m_frames.size()];
 
         WorkerPool& pool =
-            *frame.workerPools[workerIndex];
+            *frame.queuePools[queueIndex(QueueType::Graphics)][workerIndex];
 
         if (pool.primary == VK_NULL_HANDLE)
         {
@@ -238,7 +262,7 @@ namespace ic
 
         allocInfo.commandPool =
             m_frames[frameIndex]
-            .workerPools[workerIndex]
+            .queuePools[queueIndex(QueueType::Graphics)][workerIndex]
             ->pool;
 
         allocInfo.level =

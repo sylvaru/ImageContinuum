@@ -744,6 +744,12 @@ namespace ic
 
                 if (options.loadReferencedAssets)
                 {
+                    spdlog::info(
+                        "[SceneManager] Queueing model entity='{}' path='{}' exists={}",
+                        entityDesc.name,
+                        entityDesc.modelPath.string(),
+                        std::filesystem::exists(entityDesc.modelPath));
+
                     entityDesc.modelHandle =
                         assets.loadModelAsync(entityDesc.modelPath);
                 }

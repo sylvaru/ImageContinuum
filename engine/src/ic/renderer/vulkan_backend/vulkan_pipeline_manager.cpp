@@ -563,6 +563,74 @@ namespace ic
             return setLayout;
         }
 
+        if (layout == PipelineBindingLayoutKind::HiZDepthPyramid)
+        {
+            VkDescriptorSetLayoutBinding bindings[3]{};
+            bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[1] = { 20, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[2] = { 21, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{};
+            layoutInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            layoutInfo.bindingCount =
+                static_cast<uint32_t>(std::size(bindings));
+            layoutInfo.pBindings = bindings;
+
+            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            throwIfFailed(
+                vkCreateDescriptorSetLayout(
+                    m_device,
+                    &layoutInfo,
+                    nullptr,
+                    &setLayout),
+                "Failed to create Vulkan Hi-Z descriptor set layout.");
+
+            return setLayout;
+        }
+
+        if (layout == PipelineBindingLayoutKind::GpuFrustumCull)
+        {
+            VkDescriptorSetLayoutBinding bindings[8]{};
+            bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[1] = { 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[2] = { 23, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[3] = { 24, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[4] = { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[5] = { 26, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[6] = { 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[7] = { 28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{};
+            layoutInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            layoutInfo.bindingCount =
+                static_cast<uint32_t>(std::size(bindings));
+            layoutInfo.pBindings = bindings;
+
+            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            throwIfFailed(
+                vkCreateDescriptorSetLayout(
+                    m_device,
+                    &layoutInfo,
+                    nullptr,
+                    &setLayout),
+                "Failed to create Vulkan GPU frustum cull descriptor set layout.");
+
+            return setLayout;
+        }
+
         if (layout == PipelineBindingLayoutKind::Skybox)
         {
             VkDescriptorSetLayoutBinding bindings[3]{};
@@ -603,7 +671,7 @@ namespace ic
 
         if (layout == PipelineBindingLayoutKind::ClusteredForward)
         {
-            VkDescriptorSetLayoutBinding bindings[14]{};
+            VkDescriptorSetLayoutBinding bindings[15]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -632,6 +700,8 @@ namespace ic
                 VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
             bindings[13] = { 14, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[14] = { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_VERTEX_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{};
             layoutInfo.sType =
@@ -658,7 +728,7 @@ namespace ic
                 "Unsupported Vulkan pipeline binding layout.");
         }
 
-        VkDescriptorSetLayoutBinding bindings[9]{};
+        VkDescriptorSetLayoutBinding bindings[10]{};
         bindings[0].binding = 0;
         bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         bindings[0].descriptorCount = 1;
@@ -706,6 +776,11 @@ namespace ic
         bindings[8].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
         bindings[8].descriptorCount = 1;
         bindings[8].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        bindings[9].binding = 25;
+        bindings[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[9].descriptorCount = 1;
+        bindings[9].stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
 
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType =
@@ -833,6 +908,8 @@ namespace ic
             return VK_FORMAT_B8G8R8A8_SRGB;
         case TextureFormat::D32_Float:
             return VK_FORMAT_D32_SFLOAT;
+        case TextureFormat::R32_Float:
+            return VK_FORMAT_R32_SFLOAT;
         case TextureFormat::Unknown:
             break;
         }

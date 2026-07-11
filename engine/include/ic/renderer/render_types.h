@@ -14,6 +14,7 @@ namespace ic
     constexpr uint32_t ClusteredForwardSliceCountZ = 24;
     constexpr uint32_t ClusteredForwardMaxLightsPerCluster = 128;
     constexpr uint32_t ClusteredForwardMaxVisibleLights = 256;
+    constexpr uint32_t ClusteredForwardMaxGpuCullInstances = 65536;
 
     enum class ResourceMemoryUsage : uint8_t
     {
@@ -101,6 +102,15 @@ namespace ic
     static_assert(sizeof(GpuVisibleLight) == 32);
     static_assert(alignof(GpuVisibleLight) == 16);
 
+    struct alignas(16) GpuInstanceBounds
+    {
+        // xyz = world-space sphere center, w = sphere radius.
+        glm::vec4 centerRadius = glm::vec4(0.0f);
+    };
+
+    static_assert(sizeof(GpuInstanceBounds) == 16);
+    static_assert(alignof(GpuInstanceBounds) == 16);
+
 
 
     constexpr BufferUsageFlags operator|(
@@ -176,13 +186,47 @@ namespace ic
         const char* debugName = nullptr;
     };
 
-    // A single, tightly packed indirect draw command (12 bytes)
-    // Fed to GPU via DrawIndexedIndirect or ExecuteIndirect
+    // Engine-side draw classification metadata. This is intentionally not an
+    // API indirect argument structure.
     struct DrawCommand 
     {
         uint32_t pipelineIndex;
         uint32_t materialIndex; // Index into a global SSBO (Bindless)
         uint32_t meshIndex;     // Index into global vertex/index buffer (BDA)
+    };
+
+    // Common binary layout shared by VkDrawIndexedIndirectCommand and
+    // D3D12_DRAW_INDEXED_ARGUMENTS. Keep API types out of renderer paths.
+    struct GpuIndexedIndirectArguments
+    {
+        uint32_t indexCount = 0;
+        uint32_t instanceCount = 0;
+        uint32_t firstIndex = 0;
+        int32_t vertexOffset = 0;
+        uint32_t firstInstance = 0;
+    };
+    static_assert(sizeof(GpuIndexedIndirectArguments) == 20);
+
+    struct GpuDrawMetadata
+    {
+        uint32_t meshIndex = 0;
+        uint32_t materialIndex = 0;
+        uint32_t transformIndex = 0;
+        uint32_t instanceIndex = 0;
+
+        uint32_t geometryRangeIndex = 0;
+        uint32_t pipelineBinIndex = 0;
+        uint32_t materialBinIndex = 0;
+        uint32_t geometryBinIndex = 0;
+    };
+
+    struct GpuDrawInput
+    {
+        GpuDrawMetadata metadata = {};
+        uint32_t indexCount = 0;
+        uint32_t firstIndex = 0;
+        int32_t vertexOffset = 0;
+        uint32_t commandBinOffset = 0;
     };
 
     // GPU Ring buffer

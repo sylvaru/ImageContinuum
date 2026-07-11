@@ -24,6 +24,7 @@ namespace ic
         bool descriptorBuffer = false;
         bool bufferDeviceAddress = false;
         bool timelineSemaphore = false;
+        bool drawIndirectCount = false;
         bool maintenance5 = false;
         bool extendedFlags = false;
     };
@@ -66,6 +67,7 @@ namespace ic
 
         VulkanFeatureSupport supportedFeatures;
 
+        VkPhysicalDeviceVulkan12Features vulkan12Features{};
         VkPhysicalDeviceDescriptorIndexingFeatures descriptorIndexingFeatures{};
         VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures{};
         VkPhysicalDeviceVulkan13Features vulkan13Features{};

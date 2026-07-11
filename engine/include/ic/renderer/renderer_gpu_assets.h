@@ -44,6 +44,9 @@ namespace ic
 
         glm::uvec4 clusterDimensions = glm::uvec4(0);
         glm::uvec4 clusterConfig = glm::uvec4(0);
+        glm::uvec4 renderExtentAndHiZ = glm::uvec4(0);
+        glm::uvec4 cullingConfig = glm::uvec4(0);
+        glm::vec4 cameraNearFar = glm::vec4(0.0f);
     };
 
     struct GpuObjectData
@@ -84,16 +87,18 @@ namespace ic
     {
         uint32_t vertexBufferIndex = 0;
         uint32_t indexBufferIndex = 0;
-        uint32_t materialIndex = 0;
-        uint32_t indexCount = 0;
+            uint32_t materialIndex = 0;
+            uint32_t indexCount = 0;
 
-        uint32_t firstIndex = 0;
-        uint32_t vertexOffset = 0;
-        uint32_t padding0 = 0;
-        uint32_t padding1 = 0;
+            uint32_t firstIndex = 0;
+            uint32_t vertexOffset = 0;
+            uint32_t padding0 = 0;
+            uint32_t padding1 = 0;
 
-        uint64_t vertexBufferAddress = 0;
-        uint64_t indexBufferAddress = 0;
+            uint64_t vertexBufferAddress = 0;
+            uint64_t indexBufferAddress = 0;
+
+        GpuInstanceBounds bounds = {};
     };
 
     struct DrawConstants

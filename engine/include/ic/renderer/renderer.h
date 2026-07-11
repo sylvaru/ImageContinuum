@@ -40,6 +40,10 @@ namespace ic
         void setVsyncEnabled(bool enabled);
         [[nodiscard]] bool clusteredForwardHeatmapEnabled() const;
         void setClusteredForwardHeatmapEnabled(bool enabled);
+        [[nodiscard]] bool hiZDebugViewEnabled() const;
+        void setHiZDebugViewEnabled(bool enabled);
+        [[nodiscard]] uint32_t hiZDebugMip() const;
+        void setHiZDebugMip(uint32_t mip);
         [[nodiscard]] RenderPathType renderPathType() const;
         
         void buildOrRebuildFrameGraph();
@@ -64,6 +68,7 @@ namespace ic
 
         void processPendingRendererJobs(
             FrameContext& frame);
+        void drawFrameGraphDebugWindow();
 
         struct Runtime;
         Scope<Runtime> m_runtime;

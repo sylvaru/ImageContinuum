@@ -27,7 +27,9 @@ private:
         AppConfigLoadDesc desc{};
         desc.defaultConfigPath =
             //"demo/res/configs/forward.toml";
+            //"demo/res/configs/forward_dx12.toml";
             "demo/res/configs/clustered_forward.toml";
+            //"demo/res/configs/clustered_forward_dx12.toml";
             //"demo/res/configs/path_traced.toml";
         desc.fallbackApp = createFallbackSpecification();
         desc.fallbackStartupScenePath =
@@ -56,8 +58,7 @@ private:
     explicit DemoApp(AppConfig config)
         : AppBase(config.app)
         , m_config(std::move(config))
-    {
-    }
+    {}
 
     AppConfig m_config;
 	GameLayer* m_gameLayer = nullptr;

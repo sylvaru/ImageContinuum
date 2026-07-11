@@ -17,9 +17,10 @@ struct VertexOutput
     float4 position : SV_Position;
 };
 
-VertexOutput VSMain(VertexInput input)
+VertexOutput VSMain(VertexInput input, uint instanceId : SV_InstanceID)
 {
-    const ObjectData objectData = gObjects[gDraw.objectIndex];
+    const DrawMetadata draw = resolveDrawMetadata(instanceId);
+    const ObjectData objectData = gObjects[draw.transformIndex];
 
     const float4 worldPosition =
         mul(objectData.world, float4(input.position, 1.0f));

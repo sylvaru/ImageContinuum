@@ -13,6 +13,22 @@ namespace
             throw std::runtime_error(message);
         }
     }
+
+    uint32_t queueIndex(ic::QueueType queue)
+    {
+        return static_cast<uint32_t>(queue);
+    }
+
+    D3D12_COMMAND_LIST_TYPE commandListType(ic::QueueType queue)
+    {
+        switch (queue)
+        {
+        case ic::QueueType::Compute: return D3D12_COMMAND_LIST_TYPE_COMPUTE;
+        case ic::QueueType::Transfer: return D3D12_COMMAND_LIST_TYPE_COPY;
+        case ic::QueueType::Graphics: return D3D12_COMMAND_LIST_TYPE_DIRECT;
+        }
+        return D3D12_COMMAND_LIST_TYPE_DIRECT;
+    }
 }
 
 namespace ic
@@ -36,34 +52,35 @@ namespace ic
 
         for (FrameCommands& frame : m_frames)
         {
-            frame.workers.resize(workers);
-
-            for (std::unique_ptr<WorkerCommands>& workerPtr : frame.workers)
+            for (uint32_t queue = 0; queue < frame.queues.size(); ++queue)
             {
-                workerPtr = std::make_unique<WorkerCommands>();
-                WorkerCommands& worker = *workerPtr;
+                auto& queueWorkers = frame.queues[queue];
+                queueWorkers.resize(workers);
+                for (std::unique_ptr<WorkerCommands>& workerPtr : queueWorkers)
+                {
+                    workerPtr = std::make_unique<WorkerCommands>();
+                    WorkerCommands& worker = *workerPtr;
 
-                worker.slots.emplace_back(std::make_unique<CommandSlot>());
-                CommandSlot& slot = *worker.slots.back();
+                    worker.slots.emplace_back(std::make_unique<CommandSlot>());
+                    CommandSlot& slot = *worker.slots.back();
+                    const auto type = commandListType(
+                        static_cast<QueueType>(queue));
 
-                throwIfFailed(
-                    m_device->CreateCommandAllocator(
-                        D3D12_COMMAND_LIST_TYPE_DIRECT,
-                        IID_PPV_ARGS(&slot.allocator)),
-                    "Failed to create D3D12 command allocator.");
+                    throwIfFailed(
+                        m_device->CreateCommandAllocator(
+                            type, IID_PPV_ARGS(&slot.allocator)),
+                        "Failed to create D3D12 command allocator.");
 
-                throwIfFailed(
-                    m_device->CreateCommandList(
-                        0,
-                        D3D12_COMMAND_LIST_TYPE_DIRECT,
-                        slot.allocator.Get(),
-                        nullptr,
-                        IID_PPV_ARGS(&slot.list)),
-                    "Failed to create D3D12 command list.");
+                    throwIfFailed(
+                        m_device->CreateCommandList(
+                            0, type, slot.allocator.Get(), nullptr,
+                            IID_PPV_ARGS(&slot.list)),
+                        "Failed to create D3D12 command list.");
 
-                throwIfFailed(
-                    slot.list->Close(),
-                    "Failed to close initial D3D12 command list.");
+                    throwIfFailed(
+                        slot.list->Close(),
+                        "Failed to close initial D3D12 command list.");
+                }
             }
         }
 
@@ -89,7 +106,8 @@ namespace ic
 
         FrameCommands& frame = m_frames[frameIndex];
 
-        for (const std::unique_ptr<WorkerCommands>& workerPtr : frame.workers)
+        for (auto& queueWorkers : frame.queues)
+        for (const std::unique_ptr<WorkerCommands>& workerPtr : queueWorkers)
         {
             WorkerCommands& worker = *workerPtr;
             std::scoped_lock lock(worker.mutex);
@@ -107,7 +125,8 @@ namespace ic
     DX12CommandSystem::RecordingLease
         DX12CommandSystem::acquireFrameCommandList(
             uint32_t frameIndex,
-            uint32_t workerIndex)
+            uint32_t workerIndex,
+            QueueType queue)
     {
         if (frameIndex >= m_frames.size())
         {
@@ -116,28 +135,30 @@ namespace ic
 
         FrameCommands& frame = m_frames[frameIndex];
 
-        if (workerIndex >= frame.workers.size())
+        auto& workers = frame.queues[queueIndex(queue)];
+        if (workerIndex >= workers.size())
         {
             throw std::runtime_error("DX12 worker index out of range.");
         }
 
-        WorkerCommands& worker = *frame.workers[workerIndex];
+        WorkerCommands& worker = *workers[workerIndex];
         std::unique_lock lock(worker.mutex);
 
         if (worker.nextSlot >= worker.slots.size())
         {
             auto slot = std::make_unique<CommandSlot>();
 
+            const auto type = commandListType(queue);
             throwIfFailed(
                 m_device->CreateCommandAllocator(
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    type,
                     IID_PPV_ARGS(&slot->allocator)),
                 "Failed to create D3D12 command allocator.");
 
             throwIfFailed(
                 m_device->CreateCommandList(
                     0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    type,
                     slot->allocator.Get(),
                     nullptr,
                     IID_PPV_ARGS(&slot->list)),
@@ -171,12 +192,13 @@ namespace ic
 
         FrameCommands& frame = m_frames[frameIndex];
 
-        if (workerIndex >= frame.workers.size())
+        auto& workers = frame.queues[queueIndex(QueueType::Graphics)];
+        if (workerIndex >= workers.size())
         {
             throw std::runtime_error("DX12 worker index out of range.");
         }
 
-        WorkerCommands& worker = *frame.workers[workerIndex];
+        WorkerCommands& worker = *workers[workerIndex];
         std::scoped_lock lock(worker.mutex);
 
         if (worker.slots.empty())

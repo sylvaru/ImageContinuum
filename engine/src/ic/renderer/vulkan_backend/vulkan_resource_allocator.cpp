@@ -62,6 +62,22 @@ namespace ic
         m_device = device;
         m_bufferDeviceAddress =
             info.supportedFeatures.bufferDeviceAddress;
+        m_queueFamilyCount = 0;
+        for (uint32_t family : {
+                 info.queueFamilies.graphics,
+                 info.queueFamilies.compute,
+                 info.queueFamilies.transfer })
+        {
+            bool duplicate = false;
+            for (uint32_t i = 0; i < m_queueFamilyCount; ++i)
+            {
+                duplicate |= m_queueFamilies[i] == family;
+            }
+            if (!duplicate)
+            {
+                m_queueFamilies[m_queueFamilyCount++] = family;
+            }
+        }
 
         VmaAllocatorCreateInfo createInfo{};
         createInfo.instance = instance;
@@ -96,6 +112,7 @@ namespace ic
 
         m_device = VK_NULL_HANDLE;
         m_bufferDeviceAddress = false;
+        m_queueFamilyCount = 0;
 
         spdlog::info("[VulkanResourceAllocator] Shutdown");
 	}
@@ -111,7 +128,13 @@ namespace ic
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bufferInfo.size = desc.size;
         bufferInfo.usage = toVkBufferUsage(desc.usage);
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        bufferInfo.sharingMode = m_queueFamilyCount > 1
+            ? VK_SHARING_MODE_CONCURRENT
+            : VK_SHARING_MODE_EXCLUSIVE;
+        bufferInfo.queueFamilyIndexCount = m_queueFamilyCount > 1
+            ? m_queueFamilyCount : 0;
+        bufferInfo.pQueueFamilyIndices = m_queueFamilyCount > 1
+            ? m_queueFamilies.data() : nullptr;
 
         if (m_bufferDeviceAddress ||
             hasFlag(desc.usage, BufferUsageFlags::ShaderDeviceAddress))
@@ -209,7 +232,13 @@ namespace ic
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         imageInfo.usage = toVkImageUsage(desc.usage);
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.sharingMode = m_queueFamilyCount > 1
+            ? VK_SHARING_MODE_CONCURRENT
+            : VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.queueFamilyIndexCount = m_queueFamilyCount > 1
+            ? m_queueFamilyCount : 0;
+        imageInfo.pQueueFamilyIndices = m_queueFamilyCount > 1
+            ? m_queueFamilies.data() : nullptr;
 
         VmaAllocationCreateInfo allocationInfo{};
         allocationInfo.usage = toVmaUsage(desc.memoryUsage);
@@ -439,6 +468,8 @@ namespace ic
             return VK_FORMAT_B8G8R8A8_SRGB;
         case TextureFormat::D32_Float:
             return VK_FORMAT_D32_SFLOAT;
+        case TextureFormat::R32_Float:
+            return VK_FORMAT_R32_SFLOAT;
         case TextureFormat::Unknown:
             break;
         }

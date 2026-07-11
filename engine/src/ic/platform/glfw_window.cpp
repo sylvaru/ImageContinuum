@@ -2,6 +2,8 @@
 #include "ic/common/ic_pch.h"
 #include "ic/platform/glfw_window.h"
 #include "ic/core/events.h"
+#include <spdlog/spdlog.h>
+
 
 namespace ic
 {
@@ -206,6 +208,11 @@ namespace ic
             {
                 auto* self = static_cast<GLFWWindow*>(glfwGetWindowUserPointer(w));
                 if (!self || !self->m_eventCallback) return;
+
+                if (key == GLFW_KEY_UNKNOWN)
+                {
+                    return;
+                }
 
                 switch (action)
                 {

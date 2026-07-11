@@ -4,6 +4,7 @@
 #include "ic/renderer/vulkan_backend/vulkan_common.h"
 
 #include <mutex>
+#include <array>
 #include <utility>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
@@ -178,6 +179,8 @@ namespace ic
         VkDevice m_device = VK_NULL_HANDLE;
         VmaAllocator m_allocator = VK_NULL_HANDLE;
         bool m_bufferDeviceAddress = false;
+        std::array<uint32_t, 3> m_queueFamilies{};
+        uint32_t m_queueFamilyCount = 0;
         std::mutex m_mutex;
 	};
 }

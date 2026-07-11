@@ -999,20 +999,66 @@ namespace ic
         std::filesystem::path path,
         ModelLoadOptions options)
     {
+
+        spdlog::info(
+            "[AssetManager] Queueing model load handle={}:{} path='{}'",
+            handle.index,
+            handle.generation,
+            path.string());
+
         JobTask task = JobTask::make([this, handle, path = std::move(path), options]()
         {
             AssetCompletion completion{};
             completion.handle = handle;
             completion.kind = AssetKind::Model;
 
+
+            spdlog::info(
+                "[AssetManager] Model load job started handle={}:{} path='{}'",
+                handle.index,
+                handle.generation,
+                path.string());
+
             try
             {
-                completion.data = std::make_shared<AssetData>(decodeModel(path, options));
+                spdlog::info(
+                    "[AssetManager] Decoding model handle={}:{} path='{}'",
+                    handle.index,
+                    handle.generation,
+                    path.string());
+
+                ModelAsset model = decodeModel(path, options);
+
+                spdlog::info(
+                    "[AssetManager] Decoded model handle={}:{} path='{}': "
+                    "{} vertices, {} indices, {} meshes, {} materials, "
+                    "{} images, {} textures, {} samplers, {} nodes, {} scenes",
+                    handle.index,
+                    handle.generation,
+                    path.string(),
+                    model.vertices.size(),
+                    model.indices.size(),
+                    model.meshes.size(),
+                    model.materials.size(),
+                    model.images.size(),
+                    model.textures.size(),
+                    model.samplers.size(),
+                    model.nodes.size(),
+                    model.scenes.size());
+
+                completion.data = std::make_shared<AssetData>(std::move(model));
                 completion.success = true;
             }
             catch (const std::exception& e)
             {
                 completion.error = e.what();
+                completion.success = false;
+                spdlog::error(
+                    "[AssetManager] Model load failed handle={}:{} path='{}': {}",
+                    handle.index,
+                    handle.generation,
+                    path.string(),
+                    e.what());
             }
 
             m_completed.enqueue(std::move(completion));
@@ -1023,6 +1069,14 @@ namespace ic
         {
             m_jobs->kickTasks(&task, 1, &r->counter);
         }
+        else
+        {
+            spdlog::error(
+                "[AssetManager] Could not kick model load; missing record handle={}:{} path='{}'",
+                handle.index,
+                handle.generation,
+                path.string());
+        }
     }
 
     void AssetManager::kickBinaryLoad(
@@ -1030,22 +1084,51 @@ namespace ic
         std::filesystem::path path,
         BinaryLoadOptions options)
     {
+        spdlog::info(
+            "[AssetManager] Queueing binary load handle={}:{} path='{}'",
+            handle.index,
+            handle.generation,
+            path.string());
+
+
         JobTask task = JobTask::make([this, handle, path = std::move(path), options]()
         {
             AssetCompletion completion{};
             completion.handle = handle;
             completion.kind = AssetKind::Binary;
 
+            spdlog::info(
+                "[AssetManager] Binary load job started handle={}:{} path='{}'",
+                handle.index,
+                handle.generation,
+                path.string());
+
             try
             {
                 BinaryAsset binary{};
                 binary.bytes = readWholeFile(path, options.nullTerminate);
+
+                spdlog::info(
+                    "[AssetManager] Binary load succeeded handle={}:{} path='{}' bytes={}",
+                    handle.index,
+                    handle.generation,
+                    path.string(),
+                    binary.bytes.size());
+
                 completion.data = std::make_shared<AssetData>(std::move(binary));
                 completion.success = true;
             }
             catch (const std::exception& e)
             {
+                completion.success = false;
                 completion.error = e.what();
+
+                spdlog::error(
+                    "[AssetManager] Binary load failed handle={}:{} path='{}': {}",
+                    handle.index,
+                    handle.generation,
+                    path.string(),
+                    e.what());
             }
 
             m_completed.enqueue(std::move(completion));
@@ -1055,6 +1138,14 @@ namespace ic
         if (r)
         {
             m_jobs->kickTasks(&task, 1, &r->counter);
+        }
+        else
+        {
+            spdlog::error(
+                "[AssetManager] Could not kick binary load; missing record handle={}:{} path='{}'",
+                handle.index,
+                handle.generation,
+                path.string());
         }
     }
 
@@ -1242,7 +1333,20 @@ namespace ic
             fastgltf::Options::LoadExternalImages |
             fastgltf::Options::DecomposeNodeMatrices;
 
-        fastgltf::Parser parser{};
+        constexpr fastgltf::Extensions supportedExtensions =
+            fastgltf::Extensions::KHR_texture_transform |
+            fastgltf::Extensions::KHR_mesh_quantization |
+            fastgltf::Extensions::KHR_lights_punctual |
+            fastgltf::Extensions::KHR_materials_sheen |
+            fastgltf::Extensions::KHR_materials_specular |
+            fastgltf::Extensions::KHR_materials_ior |
+            fastgltf::Extensions::KHR_materials_clearcoat |
+            fastgltf::Extensions::KHR_materials_emissive_strength |
+            fastgltf::Extensions::KHR_materials_unlit |
+            fastgltf::Extensions::KHR_materials_variants;
+
+
+        fastgltf::Parser parser(supportedExtensions);
         auto assetResult = parser.loadGltf(
             data.get(),
             path.parent_path(),
@@ -1251,7 +1355,11 @@ namespace ic
 
         if (assetResult.error() != fastgltf::Error::None)
         {
-            throw std::runtime_error("fastgltf parse failed for: " + path.string());
+            throw std::runtime_error(
+                fmt::format(
+                    "fastgltf parse failed for: '{}' error={}",
+                    path.string(),
+                    static_cast<int>(assetResult.error())));
         }
 
         fastgltf::Asset gltf = std::move(assetResult.get());

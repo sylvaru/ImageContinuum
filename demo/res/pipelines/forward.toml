@@ -136,3 +136,23 @@ compute = "demo/res/compiled_shaders/dx12/independent_compute_test.cs.dxil"
 
 [pipelines.independent_compute_test.shaders.vulkan]
 compute = "demo/res/compiled_shaders/vulkan/independent_compute_test.comp.spv"
+
+[pipelines.gpu_frustum_cull]
+type = "Compute"
+bindingLayout = "GpuFrustumCull"
+
+[pipelines.gpu_frustum_cull.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gpu_frustum_cull.cs.dxil"
+
+[pipelines.gpu_frustum_cull.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gpu_frustum_cull.comp.spv"
+
+[pipelines.reset_visible_instance_count]
+type = "Compute"
+bindingLayout = "GpuFrustumCull"
+
+[pipelines.reset_visible_instance_count.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/reset_visible_instance_count.cs.dxil"
+
+[pipelines.reset_visible_instance_count.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/reset_visible_instance_count.comp.spv"

@@ -10,6 +10,9 @@
 #include "ic/renderer/dx12_backend/dx12_descriptor_system.h"
 #include "ic/renderer/dx12_backend/dx12_pipeline_manager.h"
 #include "ic/renderer/dx12_backend/dx12_resource_allocator.h"
+#include "ic/renderer/dx12_backend/dx12_graph_resource_registry.h"
+#include "ic/renderer/dx12_backend/dx12_frame_executor.h"
+#include "ic/renderer/dx12_backend/dx12_gpu_scene.h"
 #include "ic/renderer/renderer_gpu_assets.h"
 #include "ic/renderer/path_tracing/path_tracer_types.h"
 
@@ -50,6 +53,10 @@ namespace ic
         void setVsyncEnabled(bool enabled) override;
         bool clusteredForwardHeatmapEnabled() const override;
         void setClusteredForwardHeatmapEnabled(bool enabled) override;
+        bool hiZDebugViewEnabled() const override;
+        void setHiZDebugViewEnabled(bool enabled) override;
+        uint32_t hiZDebugMip() const override;
+        void setHiZDebugMip(uint32_t mip) override;
 
         DX12ResourceAllocator& resourceAllocator()
         {
@@ -62,27 +69,10 @@ namespace ic
         }
 
     private:
-        struct FrameSync
-        {
-            uint64_t fenceValue = 0;
-        };
-
         struct ResourceState
         {
             D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
             AccessType access = AccessType::Read;
-        };
-
-        struct UploadedModel
-        {
-            DX12Buffer vertexBuffer;
-            DX12Buffer indexBuffer;
-            std::vector<GpuMesh> meshes;
-            std::vector<glm::mat4> meshTransforms;
-            std::vector<GpuMaterialData> materials;
-            std::vector<uint32_t> textureDescriptorIndices;
-            std::vector<uint32_t> samplerDescriptorIndices;
-            bool uploaded = false;
         };
 
         struct UploadedTexture
@@ -95,58 +85,6 @@ namespace ic
         struct UploadedSampler
         {
             DX12DescriptorAllocation descriptor;
-        };
-
-        struct GraphResourceEntry
-        {
-            GraphResourceType type = GraphResourceType::Texture;
-            ResourceOwnership ownership = ResourceOwnership::Transient;
-            ImportedResource imported = ImportedResource::None;
-            DX12Texture texture;
-            DX12Buffer buffer;
-            DX12DescriptorAllocation rtv;
-            DX12DescriptorAllocation dsv;
-            DX12DescriptorAllocation srvUav;
-            D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
-            uint32_t width = 0;
-            uint32_t height = 0;
-            uint32_t mipLevels = 1;
-            uint32_t arrayLayers = 1;
-        };
-
-        struct FrameSceneResources
-        {
-            DX12Buffer frameConstants;
-            DX12Buffer objects;
-            DX12Buffer materials;
-            DX12Buffer visibleLights;
-
-            DX12DescriptorAllocation objectSrv;
-            DX12DescriptorAllocation materialSrv;
-
-            uint32_t objectCapacity = 0;
-            uint32_t materialCapacity = 0;
-            uint32_t visibleLightCapacity = 0;
-        };
-
-        struct DrawItem
-        {
-            UploadedModel* model = nullptr;
-            uint32_t objectIndex = 0;
-            uint32_t meshIndex = 0;
-            uint32_t materialIndex = 0;
-        };
-
-        struct PreparedSceneFrame
-        {
-            uint64_t frameIndex = UINT64_MAX;
-            bool valid = false;
-
-            std::vector<DrawItem> draws;
-            std::vector<GpuObjectData> objects;
-            std::vector<GpuMaterialData> materials;
-            std::unordered_map<AssetHandle, uint32_t, AssetHandleHash>
-                materialOffsets;
         };
 
         struct PathTraceResources
@@ -219,6 +157,9 @@ namespace ic
             bool iblBaked = false;
         };
 
+        // Clustered-light-grid resources. The GPU-driven cull/indirect-draw
+        // buffers live in DX12GpuScene (m_gpuScene) instead, since they are a
+        // separate concern (draw submission, not light clustering).
         struct ClusteredForwardResources
         {
             DX12Buffer clusterBounds;
@@ -231,6 +172,10 @@ namespace ic
             D3D12_RESOURCE_STATES counterState = D3D12_RESOURCE_STATE_COMMON;
             uint32_t width = 0;
             uint32_t height = 0;
+            uint32_t hiZMipCount = 0;
+            GraphResourceId hiZDebugResource = InvalidGraphResourceId;
+            bool loggedHiZ = false;
+            bool loggedHiZDebugResource = false;
             uint32_t clusterCountX = 0;
             uint32_t clusterCountY = 0;
             uint32_t clusterCountZ = 0;
@@ -261,7 +206,10 @@ namespace ic
             ID3D12GraphicsCommandList4* cmd,
             const ResourceBarrier& barrier,
             std::span<const GraphResource> resources,
-            ID3D12Resource* swapchainImage);
+            ID3D12Resource* swapchainImage,
+            bool crossQueueRelease = false,
+            bool crossQueueAcquire = false,
+            QueueType commandQueue = QueueType::Graphics);
 
         void dispatchNode(
             const CompiledGraphPlan& plan,
@@ -340,16 +288,7 @@ namespace ic
             ID3D12GraphicsCommandList4* cmd);
         void ensureDepthTarget();
         void destroyDepthTarget();
-        void materializeGraphResources(
-            const CompiledGraphPlan& plan,
-            ID3D12Resource* swapchainImage);
-        void destroyGraphResources();
-        GraphResourceEntry* graphResource(GraphResourceId id);
-        const GraphResourceEntry* graphResource(GraphResourceId id) const;
-        GraphResourceId findGraphAttachment(
-            const CompiledGraphPlan& plan,
-            GraphNodeId node,
-            ResourceUsage usage) const;
+        void drawHiZDebugWindow();
         void ensureComputeTestBuffer();
         void ensureClusteredForwardResources();
         bool bindClusteredForwardCompute(
@@ -361,9 +300,12 @@ namespace ic
             const DX12GraphicsPipeline& pipeline,
             const FrameContext& ctx,
             ID3D12GraphicsCommandList4* cmd);
+        void readbackVisibleInstanceCount(
+            const FrameContext& ctx,
+            ID3D12GraphicsCommandList4* cmd);
         void destroyClusteredForwardResources();
 
-        UploadedModel* requestModel(
+        DX12UploadedModel* requestModel(
             AssetHandle handle,
             const AssetManager& assets);
 
@@ -396,11 +338,6 @@ namespace ic
         D3D12_RESOURCE_STATES usageToState(ResourceUsage usage) const;
         D3D12_RESOURCE_STATES getOrInitResourceState(ID3D12Resource* resource);
 
-        void initFrameSync(const RendererSpecification& spec);
-        void destroyFrameSync();
-        void waitForFrame(uint32_t frameSlot);
-        void signalFrame(uint32_t frameSlot);
-        void waitForGpu();
         void recreateSwapchain();
         TextureFormat swapchainTextureFormat() const;
 
@@ -415,6 +352,7 @@ namespace ic
 
         DX12Texture m_depthTexture;
         DX12DescriptorAllocation m_depthDsv;
+        DX12DescriptorAllocation m_depthSrv;
         D3D12_RESOURCE_STATES m_depthState = D3D12_RESOURCE_STATE_COMMON;
         uint32_t m_depthWidth = 0;
         uint32_t m_depthHeight = 0;
@@ -428,23 +366,20 @@ namespace ic
         const PipelineLibrary* m_pipelineLibrary = nullptr;
         std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash> m_pipelineHandles;
         std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash> m_computePipelineHandles;
-        std::unordered_map<AssetHandle, UploadedModel, AssetHandleHash> m_uploadedModels;
+        std::unordered_map<AssetHandle, DX12UploadedModel, AssetHandleHash> m_uploadedModels;
         std::unordered_map<uint64_t, UploadedTexture> m_uploadedTextures;
         std::unordered_map<uint64_t, UploadedSampler> m_uploadedSamplers;
-        std::unordered_map<GraphResourceId, GraphResourceEntry>
-            m_graphResources;
-        std::vector<FrameSceneResources> m_sceneFrameResources;
-        PreparedSceneFrame m_preparedScene;
+        DX12GraphResourceRegistry m_graphResourceRegistry;
+        DX12GpuScene m_gpuScene;
 
-        Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
-        HANDLE m_fenceEvent = nullptr;
-        uint64_t m_nextFenceValue = 1;
+        DX12FrameExecutor m_frameExecutor;
         uint32_t m_workerSlots = 1;
-        std::vector<FrameSync> m_frameSync;
         std::unordered_map<ID3D12Resource*, ResourceState> m_resourceStates;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;
         bool m_clusteredForwardHeatmapEnabled = false;
+        bool m_hiZDebugViewEnabled = false;
+        uint32_t m_hiZDebugMip = 0;
         std::string m_imguiIniPath;
 	};
 }

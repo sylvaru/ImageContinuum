@@ -64,6 +64,8 @@ namespace ic
         EnvironmentConvert,
         Skybox,
         ClusteredForward,
+        HiZDepthPyramid,
+        GpuFrustumCull,
         PathTrace,
         PathTraceTonemap
     };

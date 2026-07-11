@@ -2,7 +2,9 @@
 
 #include <memory>
 #include <mutex>
+#include <array>
 #include <vector>
+#include "ic/renderer/frame_graph/frame_graph_types.h"
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -56,7 +58,8 @@ namespace ic
 
         RecordingLease acquireFrameCommandList(
             uint32_t frameIndex,
-            uint32_t workerIndex);
+            uint32_t workerIndex,
+            QueueType queue = QueueType::Graphics);
 
         ID3D12GraphicsCommandList4* beginFrameCommandList(
             uint32_t frameIndex,
@@ -78,7 +81,8 @@ namespace ic
 
         struct FrameCommands
         {
-            std::vector<std::unique_ptr<WorkerCommands>> workers;
+            std::array<
+                std::vector<std::unique_ptr<WorkerCommands>>, 3> queues;
         };
 
         ID3D12Device* m_device = nullptr;

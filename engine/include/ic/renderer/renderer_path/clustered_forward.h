@@ -3,6 +3,8 @@
 #include "renderer_path.h"
 #include "ic/renderer/frame_graph/frame_graph_types.h"
 #include "ic/renderer/frame_graph/frame_graph_builder.h"
+#include "ic/renderer/gpu_driven_submission.h"
+
 
 namespace ic
 {
@@ -19,6 +21,7 @@ namespace ic
         GraphResourceId clusterLightIndexBuffer;
         GraphResourceId clusterLightCounterBuffer;
         GraphResourceId visibleLightBuffer;
+        GpuDrivenGraphResources gpuDriven;
 
         GraphResourceId environmentCubemap;
 
@@ -162,7 +165,11 @@ namespace ic
                 environmentCubemap,
                 ResourceUsage::StorageTexture);
 
-            // Depth prepass
+            gpuDriven = declareGpuDrivenResources(builder);
+            addGpuDrivenCullPasses(builder, gpuDriven);
+
+            // Frustum culling is deliberately before depth. A previous-frame
+            // Hi-Z input can be inserted into the shared cull stage later.
 
             auto depthPrepassNode =
                 builder.addGraphicsPass("DepthPrepass")
@@ -170,17 +177,15 @@ namespace ic
                 .drawList(DrawListKind::SceneGeometry)
                 .depthLoadOp(AttachmentLoadOp::Clear)
                 .depth(sceneDepth);
+            readGpuDrivenStream(builder, depthPrepassNode, gpuDriven);
 
 
-            // Later, enable this and make CullLightsToClusters read depthPyramid
-#if IC_ENABLE_HIZ_FOR_CLUSTERED_FORWARD
             auto hiZNode =
-                builder.addComputePass("BuildHiZDepthPyramid")
-                .pipeline("build_hiz_depth_pyramid")
+                builder.addComputePass("BuildHiZ")
+                .pipeline("build_hiz")
                 .dispatch((renderWidth + 7) / 8, (renderHeight + 7) / 8, 1)
                 .read(sceneDepth, ResourceUsage::SampledTexture)
                 .write(depthPyramid, ResourceUsage::StorageTexture);
-#endif
 
             // Build clusters
             //
@@ -219,14 +224,6 @@ namespace ic
                 .write(clusterLightCounterBuffer, ResourceUsage::StorageBuffer);
 
 
-
-#if IC_ENABLE_HIZ_FOR_CLUSTERED_FORWARD
-            builder.read(
-                lightCullNode,
-                depthPyramid,
-                ResourceUsage::SampledTexture);
-#endif
-
             // Opaque clustered forward pass
             auto opaqueNode =
                 builder.addGraphicsPass("ClusteredForwardOpaque")
@@ -236,6 +233,7 @@ namespace ic
                 .depthLoadOp(AttachmentLoadOp::Load)
                 .color(backBuffer)
                 .depth(sceneDepth);
+            readGpuDrivenStream(builder, opaqueNode, gpuDriven);
 
             builder.read(
                 opaqueNode,
@@ -271,35 +269,6 @@ namespace ic
                 skyboxNode,
                 environmentCubemap,
                 ResourceUsage::SampledTexture);
-
-            // Transparent pass: skip until the draw-list system supports it cleanly.
-            // Do not let this block the first clustered forward milestone.
-
-#if IC_ENABLE_CLUSTERED_TRANSPARENCY
-            auto transparentNode =
-                builder.addGraphicsPass("ClusteredForwardTransparent")
-                .pipeline("clustered_forward_transparent")
-                .drawList(DrawListKind::TransparentGeometry)
-                .colorLoadOp(AttachmentLoadOp::Load)
-                .depthLoadOp(AttachmentLoadOp::Load)
-                .color(backBuffer)
-                .depth(sceneDepth);
-
-            builder.read(
-                transparentNode,
-                clusterLightGridBuffer,
-                ResourceUsage::StorageBuffer);
-
-            builder.read(
-                transparentNode,
-                clusterLightIndexBuffer,
-                ResourceUsage::StorageBuffer);
-
-            builder.read(
-                transparentNode,
-                environmentCubemap,
-                ResourceUsage::SampledTexture);
-#endif
 
             // Present
 

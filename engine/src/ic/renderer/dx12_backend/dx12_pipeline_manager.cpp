@@ -560,9 +560,143 @@ namespace ic
             return rootSignature;
         }
 
+        if (layout == PipelineBindingLayoutKind::HiZDepthPyramid)
+        {
+            D3D12_ROOT_PARAMETER rootParameters[3]{};
+
+            rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rootParameters[0].Descriptor.ShaderRegister = 0;
+            rootParameters[0].Descriptor.RegisterSpace = 0;
+            rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_DESCRIPTOR_RANGE sourceRange{};
+            sourceRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            sourceRange.NumDescriptors = 1;
+            sourceRange.BaseShaderRegister = 20;
+            sourceRange.RegisterSpace = 0;
+            sourceRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[1].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[1].DescriptorTable.pDescriptorRanges = &sourceRange;
+            rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_DESCRIPTOR_RANGE outputRange{};
+            outputRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            outputRange.NumDescriptors = 1;
+            outputRange.BaseShaderRegister = 21;
+            outputRange.RegisterSpace = 0;
+            outputRange.OffsetInDescriptorsFromTableStart = 0;
+
+            rootParameters[2].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[2].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[2].DescriptorTable.pDescriptorRanges = &outputRange;
+            rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+            rootDesc.NumParameters =
+                static_cast<UINT>(std::size(rootParameters));
+            rootDesc.pParameters = rootParameters;
+
+            Microsoft::WRL::ComPtr<ID3DBlob> signature;
+            Microsoft::WRL::ComPtr<ID3DBlob> error;
+            HRESULT hr = D3D12SerializeRootSignature(
+                &rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &signature,
+                &error);
+            if (FAILED(hr))
+            {
+                const char* message = error
+                    ? static_cast<const char*>(error->GetBufferPointer())
+                    : "Failed to serialize DX12 Hi-Z root signature.";
+                throw std::runtime_error(message);
+            }
+
+            Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+            throwIfFailed(
+                m_device->CreateRootSignature(
+                    0,
+                    signature->GetBufferPointer(),
+                    signature->GetBufferSize(),
+                    IID_PPV_ARGS(&rootSignature)),
+                "Failed to create DX12 Hi-Z root signature.");
+            return rootSignature;
+        }
+
+        if (layout == PipelineBindingLayoutKind::GpuFrustumCull)
+        {
+            D3D12_ROOT_PARAMETER rootParameters[8]{};
+            rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rootParameters[0].Descriptor.ShaderRegister = 0;
+            rootParameters[0].Descriptor.RegisterSpace = 0;
+            rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParameters[1].Descriptor.ShaderRegister = 22;
+            rootParameters[1].Descriptor.RegisterSpace = 0;
+            rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameters[2].Descriptor.ShaderRegister = 23;
+            rootParameters[2].Descriptor.RegisterSpace = 0;
+            rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameters[3].Descriptor.ShaderRegister = 24;
+            rootParameters[3].Descriptor.RegisterSpace = 0;
+            rootParameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            const UINT registers[] = { 25u, 26u, 27u, 28u };
+            const D3D12_ROOT_PARAMETER_TYPE types[] = {
+                D3D12_ROOT_PARAMETER_TYPE_SRV,
+                D3D12_ROOT_PARAMETER_TYPE_UAV,
+                D3D12_ROOT_PARAMETER_TYPE_UAV,
+                D3D12_ROOT_PARAMETER_TYPE_UAV };
+            for (UINT i = 0; i < 4u; ++i)
+            {
+                rootParameters[4u + i].ParameterType = types[i];
+                rootParameters[4u + i].Descriptor.ShaderRegister = registers[i];
+                rootParameters[4u + i].Descriptor.RegisterSpace = 0;
+                rootParameters[4u + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
+
+            D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+            rootDesc.NumParameters =
+                static_cast<UINT>(std::size(rootParameters));
+            rootDesc.pParameters = rootParameters;
+
+            Microsoft::WRL::ComPtr<ID3DBlob> signature;
+            Microsoft::WRL::ComPtr<ID3DBlob> error;
+            HRESULT hr = D3D12SerializeRootSignature(
+                &rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &signature,
+                &error);
+            if (FAILED(hr))
+            {
+                const char* message = error
+                    ? static_cast<const char*>(error->GetBufferPointer())
+                    : "Failed to serialize DX12 GPU frustum cull root signature.";
+                throw std::runtime_error(message);
+            }
+
+            Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+            throwIfFailed(
+                m_device->CreateRootSignature(
+                    0,
+                    signature->GetBufferPointer(),
+                    signature->GetBufferSize(),
+                    IID_PPV_ARGS(&rootSignature)),
+                "Failed to create DX12 GPU frustum cull root signature.");
+            return rootSignature;
+        }
+
         if (layout == PipelineBindingLayoutKind::ClusteredForward)
         {
-            D3D12_ROOT_PARAMETER rootParameters[18]{};
+            D3D12_ROOT_PARAMETER rootParameters[19]{};
 
             // 0: Frame constants, b0 space0
             rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -744,6 +878,11 @@ namespace ic
             rootParameters[17].Descriptor.RegisterSpace = 2;
             rootParameters[17].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
+            rootParameters[18].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParameters[18].Descriptor.ShaderRegister = 25;
+            rootParameters[18].Descriptor.RegisterSpace = 0;
+            rootParameters[18].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
             D3D12_ROOT_SIGNATURE_DESC rootDesc{};
             rootDesc.NumParameters =
                 static_cast<UINT>(std::size(rootParameters));
@@ -785,7 +924,7 @@ namespace ic
                 "Unsupported DX12 pipeline binding layout.");
         }
 
-        D3D12_ROOT_PARAMETER rootParameters[10]{};
+        D3D12_ROOT_PARAMETER rootParameters[11]{};
 
         rootParameters[0].ParameterType =
             D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -920,6 +1059,11 @@ namespace ic
         rootParameters[9].ShaderVisibility =
             D3D12_SHADER_VISIBILITY_PIXEL;
 
+        rootParameters[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        rootParameters[10].Descriptor.ShaderRegister = 25;
+        rootParameters[10].Descriptor.RegisterSpace = 0;
+        rootParameters[10].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
         D3D12_ROOT_SIGNATURE_DESC rootDesc{};
         rootDesc.NumParameters =
             static_cast<UINT>(std::size(rootParameters));
@@ -1044,6 +1188,8 @@ namespace ic
             return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
         case TextureFormat::D32_Float:
             return DXGI_FORMAT_D32_FLOAT;
+        case TextureFormat::R32_Float:
+            return DXGI_FORMAT_R32_FLOAT;
         case TextureFormat::Unknown:
             break;
         }

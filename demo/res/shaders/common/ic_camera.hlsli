@@ -31,6 +31,9 @@ struct FrameConstants
 
     uint4 clusterDimensions;
     uint4 clusterConfig;
+    uint4 renderExtentAndHiZ; // x width, y height, z hi-z mip count, w reversed-Z flag.
+    uint4 cullingConfig;      // x object count, y visible count/debug, z/w reserved.
+    float4 cameraNearFar;     // x near, y far, z/w reserved.
 };
 
 ConstantBuffer<FrameConstants> gFrame : register(b0, space0);

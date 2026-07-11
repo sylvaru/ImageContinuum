@@ -188,19 +188,29 @@ namespace ic
         const auto& queues =
             m_adapter->info().queueFamilies;
 
-        uint32_t queueFamilyIndices[] =
+        uint32_t queueFamilyIndices[3]{};
+        uint32_t queueFamilyCount = 0;
+        for (uint32_t family : {
+                 queues.graphics, queues.present, queues.transfer })
         {
-            queues.graphics,
-            queues.present
-        };
+            bool duplicate = false;
+            for (uint32_t i = 0; i < queueFamilyCount; ++i)
+            {
+                duplicate |= queueFamilyIndices[i] == family;
+            }
+            if (!duplicate)
+            {
+                queueFamilyIndices[queueFamilyCount++] = family;
+            }
+        }
 
-        if (queues.graphics != queues.present)
+        if (queueFamilyCount > 1)
         {
             createInfo.imageSharingMode =
                 VK_SHARING_MODE_CONCURRENT;
 
             createInfo.queueFamilyIndexCount =
-                2;
+                queueFamilyCount;
 
             createInfo.pQueueFamilyIndices =
                 queueFamilyIndices;

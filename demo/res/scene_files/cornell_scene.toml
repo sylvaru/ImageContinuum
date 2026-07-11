@@ -33,7 +33,6 @@ pitch = 0.0
 capture_mouse = true
 
 
-
 [[entities]]
 id = 2
 name = "Cornell Box"
@@ -43,7 +42,6 @@ model = "CornellBox-Original.gltf"
 translation = [2.35, -0.75, 0.35]
 rotation = [0.0, 90.0, 0.0, 1.0]
 scale = [1.0, 1.0, 1.0]
-
 
 [[entities]]
 id = 3

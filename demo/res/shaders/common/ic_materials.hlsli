@@ -43,12 +43,42 @@ struct DrawConstants
     uint flags;
 };
 
+struct DrawMetadata
+{
+    uint meshIndex;
+    uint materialIndex;
+    uint transformIndex;
+    uint instanceIndex;
+    uint geometryRangeIndex;
+    uint pipelineBinIndex;
+    uint materialBinIndex;
+    uint geometryBinIndex;
+};
+
 StructuredBuffer<ObjectData> gObjects : register(t0, space0);
 StructuredBuffer<MaterialData> gMaterials : register(t1, space0);
+#if defined(IC_TARGET_VULKAN)
+[[vk::binding(25, 0)]]
+#endif
+StructuredBuffer<DrawMetadata> gDrawMetadata : register(t25, space0);
 
 #if defined(IC_TARGET_VULKAN)
 [[vk::push_constant]]
 #endif
 ConstantBuffer<DrawConstants> gDraw : register(b1, space0);
+
+DrawMetadata resolveDrawMetadata(uint instanceId)
+{
+    if (gFrame.cullingConfig.y != 0u)
+    {
+        return gDrawMetadata[instanceId];
+    }
+    DrawMetadata result = (DrawMetadata)0;
+    result.meshIndex = gDraw.meshIndex;
+    result.materialIndex = gDraw.materialIndex;
+    result.transformIndex = gDraw.objectIndex;
+    result.instanceIndex = gDraw.objectIndex;
+    return result;
+}
 
 #endif

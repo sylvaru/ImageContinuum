@@ -4,6 +4,9 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <array>
+#include "ic/renderer/frame_graph/frame_graph_types.h"
+#include "vulkan_common.h"
 
 /*
 
@@ -40,7 +43,7 @@ namespace ic
 
         void init(
             VkDevice device,
-            uint32_t graphicsQueueFamily,
+            const QueueFamilyIndices& queueFamilies,
             uint32_t maxFramesInFlight,
             uint32_t maxWorkers);
 
@@ -84,7 +87,8 @@ namespace ic
 
         RecordingLease acquireFrameCommandBuffer(
             uint32_t frameIndex,
-            uint32_t workerIndex);
+            uint32_t workerIndex,
+            QueueType queue = QueueType::Graphics);
 
         VkCommandBuffer beginFrameCommandBuffer(
             uint32_t frameIndex,
@@ -112,11 +116,12 @@ namespace ic
 
         struct FrameData
         {
-            std::vector<std::unique_ptr<WorkerPool>> workerPools;
+            std::array<
+                std::vector<std::unique_ptr<WorkerPool>>, 3> queuePools;
         };
 
         VkDevice m_device = VK_NULL_HANDLE;
-        uint32_t m_graphicsQueueFamily = 0;
+        QueueFamilyIndices m_queueFamilies{};
 
         std::vector<FrameData> m_frames;
 
