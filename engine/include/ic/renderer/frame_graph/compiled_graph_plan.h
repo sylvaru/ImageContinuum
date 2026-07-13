@@ -42,6 +42,19 @@ namespace ic
         std::span<const PassPayload> payloads;
     };
 
+    struct GraphExecutionContext
+    {
+        // Empty means execute every node, preserving compatibility for tools
+        // and callers that do not use frequency scheduling.
+        std::span<const uint8_t> executeNodes;
+
+        [[nodiscard]] bool shouldExecute(GraphNodeId node) const noexcept
+        {
+            return executeNodes.empty() ||
+                (node < executeNodes.size() && executeNodes[node] != 0);
+        }
+    };
+
     [[nodiscard]] inline GraphResourceId findNodeResource(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
@@ -64,6 +77,29 @@ namespace ic
             }
         }
         return InvalidGraphResourceId;
+    }
+
+    [[nodiscard]] inline bool nodeUsesResourceSemantic(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        GraphResourceSemantic semantic) noexcept
+    {
+        if (node.firstResourceAccess > plan.resourceAccesses.size() ||
+            node.resourceAccessCount >
+                plan.resourceAccesses.size() - node.firstResourceAccess)
+        {
+            return false;
+        }
+        for (const ResourceAccess& access : plan.resourceAccesses.subspan(
+                 node.firstResourceAccess, node.resourceAccessCount))
+        {
+            if (access.resource < plan.resources.size() &&
+                plan.resources[access.resource].semantic == semantic)
+            {
+                return true;
+            }
+        }
+        return false;
     }
 
 }

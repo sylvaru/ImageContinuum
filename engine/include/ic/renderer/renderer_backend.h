@@ -10,6 +10,7 @@
 namespace ic 
 {
     struct CompiledGraphPlan;
+    struct GraphExecutionContext;
     struct FrameContext;
     struct SceneRenderView;
 
@@ -31,8 +32,9 @@ namespace ic
         ) = 0;
         virtual void shutdown() = 0;
 
-        virtual void execute(
+        [[nodiscard]] virtual bool execute(
             const CompiledGraphPlan& plan,
+            const GraphExecutionContext& execution,
             const FrameContext& frame,
             const SceneRenderView& scene) = 0;
 

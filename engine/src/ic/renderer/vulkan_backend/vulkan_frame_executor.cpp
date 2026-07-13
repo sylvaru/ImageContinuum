@@ -173,12 +173,12 @@ namespace ic
         {
             return;
         }
-        vkWaitForFences(
-            m_device->device(),
-            1,
-            &m_frameSync[frameSlot].inFlightFence,
-            VK_TRUE,
-            UINT64_MAX);
+        throwIfFailed(
+            vkWaitForFences(
+                m_device->device(), 1,
+                &m_frameSync[frameSlot].inFlightFence,
+                VK_TRUE, UINT64_MAX),
+            "Failed to wait for Vulkan frame-slot fence.");
     }
 
     VulkanFrameExecutor::AcquiredFrame VulkanFrameExecutor::acquire(
@@ -207,17 +207,18 @@ namespace ic
 
         if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE)
         {
-            vkWaitForFences(
-                m_device->device(),
-                1,
-                &m_imagesInFlight[imageIndex],
-                VK_TRUE,
-                UINT64_MAX);
+            throwIfFailed(
+                vkWaitForFences(
+                    m_device->device(), 1,
+                    &m_imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX),
+                "Failed to wait for Vulkan swapchain-image fence.");
         }
 
         m_imagesInFlight[imageIndex] = sync.inFlightFence;
 
-        vkResetFences(m_device->device(), 1, &sync.inFlightFence);
+        throwIfFailed(
+            vkResetFences(m_device->device(), 1, &sync.inFlightFence),
+            "Failed to reset Vulkan frame-slot fence.");
 
         return frame;
     }
@@ -225,7 +226,8 @@ namespace ic
     bool VulkanFrameExecutor::submitAndPresent(
         const CompiledGraphPlan& plan,
         std::span<const VkCommandBuffer> commandBuffers,
-        uint32_t frameSlot)
+        uint32_t frameSlot,
+        VulkanUploadDependency uploadDependency)
     {
         FrameSync& sync = m_frameSync[frameSlot];
         const uint32_t imageIndex = m_currentSwapchainImage;
@@ -262,6 +264,34 @@ namespace ic
             plan.queueSubmissions.size());
         std::array<uint64_t, 3> lastQueueSignals{};
         bool imageAvailableConsumed = false;
+        std::vector<VkQueue> uploadWaitedQueues;
+
+        const auto batchTouchesSwapchain = [&plan](
+            const QueueSubmissionBatch& batch)
+        {
+            for (uint32_t i = 0; i < batch.nodeCount; ++i)
+            {
+                const GraphNodeId nodeId =
+                    plan.queueSubmissionNodes[batch.firstNode + i];
+                const ExecutionNode& node = plan.nodes[nodeId];
+                const auto accesses = plan.resourceAccesses.subspan(
+                    node.firstResourceAccess, node.resourceAccessCount);
+                for (const ResourceAccess& access : accesses)
+                {
+                    if (access.resource < plan.resources.size())
+                    {
+                        const GraphResource& resource =
+                            plan.resources[access.resource];
+                        if (resource.ownership == ResourceOwnership::Imported &&
+                            resource.imported == ImportedResource::Swapchain)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        };
 
         for (uint32_t submissionIndex = 0;
              submissionIndex < plan.queueSubmissions.size();
@@ -274,6 +304,17 @@ namespace ic
             std::vector<VkSemaphore> waitSemaphores;
             std::vector<uint64_t> waitValues;
             std::vector<VkPipelineStageFlags> waitStages;
+            const VkQueue batchQueue = queueFor(batch.queue);
+            if (uploadDependency.value != 0 &&
+                batchQueue != uploadDependency.queue &&
+                std::ranges::find(uploadWaitedQueues, batchQueue) ==
+                    uploadWaitedQueues.end())
+            {
+                waitSemaphores.push_back(uploadDependency.timeline);
+                waitValues.push_back(uploadDependency.value);
+                waitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                uploadWaitedQueues.push_back(batchQueue);
+            }
             for (uint32_t i = 0; i < batch.waitCount; ++i)
             {
                 const uint32_t dependency =
@@ -281,13 +322,20 @@ namespace ic
                         batch.firstWait + i].submissionIndex;
                 const SubmissionSignal& source =
                     submissionSignals[dependency];
+                if (queueFor(source.queue) == queueFor(batch.queue))
+                {
+                    // Submissions to the same physical queue are already
+                    // ordered; a timeline wait only adds driver overhead.
+                    continue;
+                }
                 waitSemaphores.push_back(
                     m_graphTimelines[queueIndex(source.queue)]);
                 waitValues.push_back(source.value);
                 waitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
             if (batch.levelIndex == 0 &&
-                m_lastGraphCompletionValue != 0)
+                m_lastGraphCompletionValue != 0 &&
+                queueFor(batch.queue) != m_device->graphicsQueue())
             {
                 waitSemaphores.push_back(
                     m_graphTimelines[
@@ -295,8 +343,10 @@ namespace ic
                 waitValues.push_back(m_lastGraphCompletionValue);
                 waitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
-            if (batch.queue == QueueType::Graphics &&
-                !imageAvailableConsumed)
+            // Do not stall unrelated compute/transfer work on image acquire.
+            // Consume the binary semaphore at the first batch that actually
+            // accesses the imported swapchain image.
+            if (!imageAvailableConsumed && batchTouchesSwapchain(batch))
             {
                 waitSemaphores.push_back(sync.imageAvailable);
                 waitValues.push_back(0);
@@ -358,9 +408,21 @@ namespace ic
         std::vector<VkSemaphore> finalWaitSemaphores;
         std::vector<uint64_t> finalWaitValues;
         std::vector<VkPipelineStageFlags> finalWaitStages;
+        if (uploadDependency.value != 0 &&
+            uploadDependency.queue != m_device->graphicsQueue() &&
+            std::ranges::find(
+                uploadWaitedQueues, m_device->graphicsQueue()) ==
+                uploadWaitedQueues.end())
+        {
+            finalWaitSemaphores.push_back(uploadDependency.timeline);
+            finalWaitValues.push_back(uploadDependency.value);
+            finalWaitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+        }
         for (uint32_t queue = 0; queue < lastQueueSignals.size(); ++queue)
         {
-            if (lastQueueSignals[queue] != 0)
+            if (lastQueueSignals[queue] != 0 &&
+                queueFor(static_cast<QueueType>(queue)) !=
+                    m_device->graphicsQueue())
             {
                 finalWaitSemaphores.push_back(m_graphTimelines[queue]);
                 finalWaitValues.push_back(lastQueueSignals[queue]);

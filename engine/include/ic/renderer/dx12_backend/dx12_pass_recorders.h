@@ -44,10 +44,6 @@ namespace ic
         D3D12_RESOURCE_STATES* indirectArgumentsState = nullptr;
         D3D12_GPU_VIRTUAL_ADDRESS indirectArgumentsAddr = 0;
 
-        ID3D12Resource* drawMetadata = nullptr;
-        D3D12_RESOURCE_STATES* drawMetadataState = nullptr;
-        D3D12_GPU_VIRTUAL_ADDRESS drawMetadataAddr = 0;
-
         ID3D12Resource* binCounts = nullptr;
         D3D12_RESOURCE_STATES* binCountsState = nullptr;
         D3D12_GPU_VIRTUAL_ADDRESS binCountsAddr = 0;
@@ -87,13 +83,13 @@ namespace ic
         const DX12PassContext& ctx,
         const DX12CullBuffers& buffers);
 
-    // Native indirect-draw stream consumed when GPU-driven ExecuteIndirect
-    // consumption is active (currently guarded off; see the caller).
+    // Native indirect-draw stream consumed by GPU-driven ExecuteIndirect.
     struct DX12IndirectDrawStream
     {
         ID3D12CommandSignature* commandSignature = nullptr;
         ID3D12Resource* indirectArguments = nullptr;
         ID3D12Resource* binCounts = nullptr;
+        uint32_t commandStride = 0;
     };
 
     // Resolves a scene draw's AssetHandle to its uploaded native model

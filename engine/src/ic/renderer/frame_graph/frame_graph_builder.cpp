@@ -1,6 +1,6 @@
 #include "ic/common/ic_pch.h"
 #include "ic/renderer/frame_graph/frame_graph_builder.h"
-#include "ic/core/memory/frame_arena.h"
+#include "ic/core/frame_memory/frame_arena.h"
 #include <algorithm>
 
 namespace ic
@@ -50,6 +50,72 @@ namespace ic
             resource,
             ResourceUsage::ColorAttachment);
         return *this;
+    }
+
+    FrameGraphBuilder::GraphicsPassBuilder&
+        FrameGraphBuilder::GraphicsPassBuilder::cadence(
+            PassCadence cadence)
+    {
+        m_builder.setPassCadence(m_node, cadence);
+        return *this;
+    }
+
+    FrameGraphBuilder::GraphicsPassBuilder&
+        FrameGraphBuilder::GraphicsPassBuilder::onInvalidation(
+            PassInvalidation reasons)
+    {
+        m_builder.setPassInvalidation(m_node, reasons);
+        return *this;
+    }
+
+    FrameGraphBuilder::GraphicsPassBuilder&
+        FrameGraphBuilder::GraphicsPassBuilder::once()
+    {
+        return cadence(PassCadence::Once);
+    }
+
+    FrameGraphBuilder::ComputePassBuilder&
+        FrameGraphBuilder::ComputePassBuilder::cadence(
+            PassCadence cadence)
+    {
+        m_builder.setPassCadence(m_node, cadence);
+        return *this;
+    }
+
+    FrameGraphBuilder::ComputePassBuilder&
+        FrameGraphBuilder::ComputePassBuilder::onInvalidation(
+            PassInvalidation reasons)
+    {
+        m_builder.setPassInvalidation(m_node, reasons);
+        return *this;
+    }
+
+    FrameGraphBuilder::ComputePassBuilder&
+        FrameGraphBuilder::ComputePassBuilder::once()
+    {
+        return cadence(PassCadence::Once);
+    }
+
+    FrameGraphBuilder::TransferPassBuilder&
+        FrameGraphBuilder::TransferPassBuilder::cadence(
+            PassCadence cadence)
+    {
+        m_builder.setPassCadence(m_node, cadence);
+        return *this;
+    }
+
+    FrameGraphBuilder::TransferPassBuilder&
+        FrameGraphBuilder::TransferPassBuilder::onInvalidation(
+            PassInvalidation reasons)
+    {
+        m_builder.setPassInvalidation(m_node, reasons);
+        return *this;
+    }
+
+    FrameGraphBuilder::TransferPassBuilder&
+        FrameGraphBuilder::TransferPassBuilder::once()
+    {
+        return cadence(PassCadence::Once);
     }
 
     FrameGraphBuilder::GraphicsPassBuilder&
@@ -153,6 +219,24 @@ namespace ic
         return *this;
     }
 
+    FrameGraphBuilder::TransferPassBuilder&
+        FrameGraphBuilder::TransferPassBuilder::copy(
+            GraphResourceId source,
+            GraphResourceId destination)
+    {
+        m_builder.setTransferCopy(m_node, source, destination);
+        m_builder.read(m_node, source, ResourceUsage::TransferSrc);
+        m_builder.write(m_node, destination, ResourceUsage::TransferDst);
+        return *this;
+    }
+
+    FrameGraphBuilder::TransferPassBuilder&
+        FrameGraphBuilder::TransferPassBuilder::queue(QueueType queue)
+    {
+        m_builder.setNodeQueue(m_node, queue);
+        return *this;
+    }
+
     FrameGraphBuilder::TransferPassBuilder
         FrameGraphBuilder::addTransferPass(std::string_view name)
     {
@@ -209,6 +293,32 @@ namespace ic
 
 		return id;
 	}
+
+    GraphResourceId FrameGraphBuilder::createPersistentTexture(
+        const TextureDesc& desc)
+    {
+        const GraphResourceId id = createTexture(desc);
+        m_resources[id].ownership = ResourceOwnership::Persistent;
+        return id;
+    }
+
+    GraphResourceId FrameGraphBuilder::createPersistentBuffer(
+        const BufferDesc& desc)
+    {
+        const GraphResourceId id = createBuffer(desc);
+        m_resources[id].ownership = ResourceOwnership::Persistent;
+        return id;
+    }
+
+    void FrameGraphBuilder::setResourceSemantic(
+        GraphResourceId resource,
+        GraphResourceSemantic semantic)
+    {
+        if (resource < m_resources.size())
+        {
+            m_resources[resource].semantic = semantic;
+        }
+    }
 
 	GraphResourceId FrameGraphBuilder::importTexture(
 		ImportedResourceDesc desc)
@@ -404,5 +514,104 @@ namespace ic
             data->groupCountY = groupCountY;
             data->groupCountZ = groupCountZ;
         }
+    }
+
+    void FrameGraphBuilder::setTransferCopy(
+        GraphNodeId node,
+        GraphResourceId source,
+        GraphResourceId destination)
+    {
+        if (node >= m_nodes.size())
+        {
+            return;
+        }
+
+        const uint32_t payloadIndex = m_nodes[node].graphNode.payloadIndex;
+        if (payloadIndex >= m_payloads.size())
+        {
+            return;
+        }
+
+        if (TransferPassData* data =
+            std::get_if<TransferPassData>(&m_payloads[payloadIndex]))
+        {
+            data->source = source;
+            data->destination = destination;
+        }
+    }
+
+    void FrameGraphBuilder::setNodeQueue(
+        GraphNodeId node,
+        QueueType queue)
+    {
+        if (node < m_nodes.size())
+        {
+            m_nodes[node].graphNode.queue = queue;
+        }
+    }
+
+    void FrameGraphBuilder::setPassCadence(
+        GraphNodeId node,
+        PassCadence cadence)
+    {
+        if (node >= m_nodes.size())
+        {
+            return;
+        }
+
+        const uint32_t payloadIndex =
+            m_nodes[node].graphNode.payloadIndex;
+        if (payloadIndex >= m_payloads.size())
+        {
+            return;
+        }
+
+        PassPayload& payload = m_payloads[payloadIndex];
+        if (GraphicsPassData* graphics =
+                std::get_if<GraphicsPassData>(&payload))
+        {
+            graphics->execution.cadence = cadence;
+            graphics->execution.invalidation = cadence == PassCadence::OnResize
+                ? PassInvalidation::Resize : PassInvalidation::None;
+        }
+        else if (ComputePassData* compute =
+                     std::get_if<ComputePassData>(&payload))
+        {
+            compute->execution.cadence = cadence;
+            compute->execution.invalidation = cadence == PassCadence::OnResize
+                ? PassInvalidation::Resize : PassInvalidation::None;
+        }
+        else if (TransferPassData* transfer =
+                     std::get_if<TransferPassData>(&payload))
+        {
+            transfer->execution.cadence = cadence;
+            transfer->execution.invalidation = cadence == PassCadence::OnResize
+                ? PassInvalidation::Resize : PassInvalidation::None;
+        }
+    }
+
+    void FrameGraphBuilder::setPassInvalidation(
+        GraphNodeId node,
+        PassInvalidation reasons)
+    {
+        if (node >= m_nodes.size())
+        {
+            return;
+        }
+        const uint32_t payloadIndex = m_nodes[node].graphNode.payloadIndex;
+        if (payloadIndex >= m_payloads.size())
+        {
+            return;
+        }
+
+        auto set = [reasons](auto& pass)
+        {
+            pass.execution.cadence = PassCadence::OnInvalidation;
+            pass.execution.invalidation = reasons;
+        };
+        PassPayload& payload = m_payloads[payloadIndex];
+        if (auto* graphics = std::get_if<GraphicsPassData>(&payload)) set(*graphics);
+        else if (auto* compute = std::get_if<ComputePassData>(&payload)) set(*compute);
+        else if (auto* transfer = std::get_if<TransferPassData>(&payload)) set(*transfer);
     }
 }

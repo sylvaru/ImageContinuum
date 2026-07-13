@@ -41,17 +41,8 @@ namespace ic
                 .debugName = "Environment.PathTracerCubemap"
                 });
 
-            EnvironmentConvertPassData environmentConvert{};
-            environmentConvert.outputCubemap = environmentCubemap;
-            auto environmentNode =
-                builder.addGraphNode(
-                    environmentConvert,
-                    GraphNodeType::Compute,
-                    QueueType::Compute);
-            builder.write(
-                environmentNode,
-                environmentCubemap,
-                ResourceUsage::StorageTexture);
+            // Environment conversion is submitted only when the source or bake
+            // settings change by Renderer::IBLBaker, outside the recurrent graph.
 
             accumulationTexture = builder.createTexture({
                 .width = 1,
@@ -113,26 +104,16 @@ namespace ic
                 tonemapTexture,
                 ResourceUsage::StorageTexture);
 
-            TransferPassData copy{};
-            copy.name = "PathTracer.CopyToBackBuffer";
-            copy.source = tonemapTexture;
-            copy.destination = backBuffer;
-
-            copyNode =
-                builder.addGraphNode(
-                    copy,
-                    GraphNodeType::Transfer,
-                    QueueType::Transfer);
-
-            builder.read(
-                copyNode,
+            builder.setResourceSemantic(
                 tonemapTexture,
-                ResourceUsage::TransferSrc);
+                GraphResourceSemantic::PathTraceTonemap);
 
-            builder.write(
-                copyNode,
-                backBuffer,
-                ResourceUsage::TransferDst);
+            // Swapchain resources require a graphics/direct queue on D3D12.
+            // Ordinary runtime copies retain the transfer-queue default.
+            copyNode = builder
+                .addTransferPass("PathTracer.CopyToBackBuffer")
+                .copy(tonemapTexture, backBuffer)
+                .queue(QueueType::Graphics);
 
             presentNode =
                 builder.addGraphNode(

@@ -29,6 +29,8 @@ namespace ic
 
         VulkanTexture texture;
         VulkanBuffer buffer;
+        TextureDesc textureDesc = {};
+        BufferDesc bufferDesc = {};
         VkImageView view = VK_NULL_HANDLE;
         std::vector<VkImageView> mipViews;
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;

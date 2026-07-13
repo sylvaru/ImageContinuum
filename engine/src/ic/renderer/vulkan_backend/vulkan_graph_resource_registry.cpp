@@ -132,6 +132,24 @@ namespace ic
                 materializeBuffer(entry, resource);
             }
         }
+
+        // Plans may shrink or replace their resource set. Retire entries that
+        // are no longer described by this plan instead of retaining native
+        // allocations and descriptors indefinitely.
+        for (auto it = m_entries.begin(); it != m_entries.end();)
+        {
+            const GraphResourceId id = it->first;
+            const bool active = id < plan.resources.size() &&
+                plan.resources[id].id == id;
+            if (active)
+            {
+                ++it;
+                continue;
+            }
+
+            retireEntry(std::move(it->second), frameSlot);
+            it = m_entries.erase(it);
+        }
     }
 
     VulkanGraphResourceEntry* VulkanGraphResourceRegistry::entry(
@@ -157,14 +175,22 @@ namespace ic
         if (resource.type == GraphResourceType::Texture)
         {
             return static_cast<bool>(entry.texture) &&
-                   entry.width == resolvedWidth &&
-                   entry.height == resolvedHeight &&
-                   entry.mipLevels == resource.textureDesc.mipLevels &&
-                   entry.arrayLayers == resource.textureDesc.arrayLayers;
+                   entry.textureDesc.width == resolvedWidth &&
+                   entry.textureDesc.height == resolvedHeight &&
+                   entry.textureDesc.depth == resource.textureDesc.depth &&
+                   entry.textureDesc.mipLevels == resource.textureDesc.mipLevels &&
+                   entry.textureDesc.arrayLayers == resource.textureDesc.arrayLayers &&
+                   entry.textureDesc.cubeCompatible == resource.textureDesc.cubeCompatible &&
+                   entry.textureDesc.format == resource.textureDesc.format &&
+                   entry.textureDesc.usage == resource.textureDesc.usage &&
+                   entry.textureDesc.memoryUsage == resource.textureDesc.memoryUsage;
         }
 
         return static_cast<bool>(entry.buffer) &&
-               entry.buffer.size == resource.bufferDesc.size;
+               entry.bufferDesc.size == resource.bufferDesc.size &&
+               entry.bufferDesc.usage == resource.bufferDesc.usage &&
+               entry.bufferDesc.memoryUsage == resource.bufferDesc.memoryUsage &&
+               entry.bufferDesc.mappedAtCreation == resource.bufferDesc.mappedAtCreation;
     }
 
     void VulkanGraphResourceRegistry::materializeTexture(
@@ -176,6 +202,7 @@ namespace ic
         TextureDesc desc = resource.textureDesc;
         desc.width = resolvedWidth;
         desc.height = resolvedHeight;
+        entry.textureDesc = desc;
 
         entry.texture = m_resourceAllocator->createTexture(desc);
         entry.layout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -221,6 +248,7 @@ namespace ic
         VulkanGraphResourceEntry& entry,
         const GraphResource& resource)
     {
+        entry.bufferDesc = resource.bufferDesc;
         entry.buffer = m_resourceAllocator->createBuffer(resource.bufferDesc);
         entry.generation = nextGeneration();
     }

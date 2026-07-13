@@ -13,7 +13,9 @@ namespace
     {
         if (FAILED(hr))
         {
-            throw std::runtime_error(message);
+            throw std::runtime_error(
+                std::string(message) + " (HRESULT=" +
+                std::to_string(static_cast<uint32_t>(hr)) + ")");
         }
     }
 

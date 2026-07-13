@@ -1,4 +1,5 @@
 #include "ic/core/asset_manager.h"
+#include "ic/core/task.h"
 
 #include <algorithm>
 #include <cassert>
@@ -772,7 +773,9 @@ namespace ic
 
         if (r->state.load(std::memory_order_acquire) == AssetState::Loading)
         {
-            m_jobs->waitForCounter(&r->counter);
+            sync_wait(
+                *m_jobs,
+                waitForCounterAsync(*m_jobs, r->counter));
             update();
         }
 
@@ -800,7 +803,17 @@ namespace ic
 
         if (r->state.load(std::memory_order_acquire) == AssetState::Loading)
         {
-            m_jobs->waitForCounter(&r->counter);
+            // Coroutine form of the wait. Where the old path spun on the counter
+            // with _mm_pause (waitForCounter), we now express the wait as a
+            // coroutine that SUSPENDS on the counter and is resumed via the job
+            // queue the instant the counter hits zero. sync_wait drives it from
+            // this synchronous call site, pumping the queue so the calling thread
+            // still helps drain work and cannot deadlock. Behaviour is identical
+            // to before (block until loaded, then flush completions); the wait is
+            // just no longer a busy spin.
+            sync_wait(
+                *m_jobs,
+                waitForCounterAsync(*m_jobs, r->counter));
             update();
         }
     }

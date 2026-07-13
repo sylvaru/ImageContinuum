@@ -181,37 +181,4 @@ namespace ic
         return RecordingLease(slot.list.Get(), std::move(lock));
     }
 
-    ID3D12GraphicsCommandList4* DX12CommandSystem::beginFrameCommandList(
-        uint32_t frameIndex,
-        uint32_t workerIndex)
-    {
-        if (frameIndex >= m_frames.size())
-        {
-            throw std::runtime_error("DX12 frame index out of range.");
-        }
-
-        FrameCommands& frame = m_frames[frameIndex];
-
-        auto& workers = frame.queues[queueIndex(QueueType::Graphics)];
-        if (workerIndex >= workers.size())
-        {
-            throw std::runtime_error("DX12 worker index out of range.");
-        }
-
-        WorkerCommands& worker = *workers[workerIndex];
-        std::scoped_lock lock(worker.mutex);
-
-        if (worker.slots.empty())
-        {
-            throw std::runtime_error("DX12 worker has no command slots.");
-        }
-
-        CommandSlot& slot = *worker.slots[0];
-
-        throwIfFailed(
-            slot.list->Reset(slot.allocator.Get(), nullptr),
-            "Failed to reset D3D12 command list.");
-
-        return slot.list.Get();
-    }
 }

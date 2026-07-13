@@ -628,7 +628,7 @@ namespace ic
 
         if (layout == PipelineBindingLayoutKind::GpuFrustumCull)
         {
-            D3D12_ROOT_PARAMETER rootParameters[8]{};
+            D3D12_ROOT_PARAMETER rootParameters[7]{};
             rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             rootParameters[0].Descriptor.ShaderRegister = 0;
             rootParameters[0].Descriptor.RegisterSpace = 0;
@@ -649,13 +649,12 @@ namespace ic
             rootParameters[3].Descriptor.RegisterSpace = 0;
             rootParameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-            const UINT registers[] = { 25u, 26u, 27u, 28u };
+            const UINT registers[] = { 25u, 26u, 28u };
             const D3D12_ROOT_PARAMETER_TYPE types[] = {
                 D3D12_ROOT_PARAMETER_TYPE_SRV,
                 D3D12_ROOT_PARAMETER_TYPE_UAV,
-                D3D12_ROOT_PARAMETER_TYPE_UAV,
                 D3D12_ROOT_PARAMETER_TYPE_UAV };
-            for (UINT i = 0; i < 4u; ++i)
+            for (UINT i = 0; i < 3u; ++i)
             {
                 rootParameters[4u + i].ParameterType = types[i];
                 rootParameters[4u + i].Descriptor.ShaderRegister = registers[i];
@@ -696,7 +695,7 @@ namespace ic
 
         if (layout == PipelineBindingLayoutKind::ClusteredForward)
         {
-            D3D12_ROOT_PARAMETER rootParameters[19]{};
+            D3D12_ROOT_PARAMETER rootParameters[18]{};
 
             // 0: Frame constants, b0 space0
             rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -878,11 +877,6 @@ namespace ic
             rootParameters[17].Descriptor.RegisterSpace = 2;
             rootParameters[17].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 
-            rootParameters[18].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-            rootParameters[18].Descriptor.ShaderRegister = 25;
-            rootParameters[18].Descriptor.RegisterSpace = 0;
-            rootParameters[18].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
-
             D3D12_ROOT_SIGNATURE_DESC rootDesc{};
             rootDesc.NumParameters =
                 static_cast<UINT>(std::size(rootParameters));
@@ -924,7 +918,7 @@ namespace ic
                 "Unsupported DX12 pipeline binding layout.");
         }
 
-        D3D12_ROOT_PARAMETER rootParameters[11]{};
+        D3D12_ROOT_PARAMETER rootParameters[10]{};
 
         rootParameters[0].ParameterType =
             D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -1058,11 +1052,6 @@ namespace ic
             &iblSamplerRange;
         rootParameters[9].ShaderVisibility =
             D3D12_SHADER_VISIBILITY_PIXEL;
-
-        rootParameters[10].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
-        rootParameters[10].Descriptor.ShaderRegister = 25;
-        rootParameters[10].Descriptor.RegisterSpace = 0;
-        rootParameters[10].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
         D3D12_ROOT_SIGNATURE_DESC rootDesc{};
         rootDesc.NumParameters =

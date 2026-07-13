@@ -1,6 +1,6 @@
 // ic/core/memory/frame_memory_types.h
 #pragma once
-
+#include <cstdint>
 
 namespace ic
 {

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <spdlog/spdlog.h>
 
 namespace ic
 {
@@ -35,6 +36,15 @@ namespace ic
                 IID_PPV_ARGS(&m_fence)),
             "Failed to create DX12 frame fence.");
 
+        for (auto& queueFence : m_queueFences)
+        {
+            throwIfFailed(
+                device.device()->CreateFence(
+                    0, D3D12_FENCE_FLAG_NONE,
+                    IID_PPV_ARGS(&queueFence)),
+                "Failed to create DX12 queue fence.");
+        }
+
         m_fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (!m_fenceEvent)
         {
@@ -42,6 +52,7 @@ namespace ic
         }
 
         m_nextFenceValue = 1;
+        m_nextQueueFenceValues = { 1, 1, 1 };
         m_lastGraphCompletionValue = 0;
     }
 
@@ -54,8 +65,13 @@ namespace ic
         }
 
         m_fence.Reset();
+        for (auto& queueFence : m_queueFences)
+        {
+            queueFence.Reset();
+        }
         m_frameSync.clear();
         m_nextFenceValue = 1;
+        m_nextQueueFenceValues = { 1, 1, 1 };
         m_lastGraphCompletionValue = 0;
         m_device = nullptr;
         m_swapchain = nullptr;
@@ -125,10 +141,51 @@ namespace ic
     bool DX12FrameExecutor::submitAndPresent(
         const CompiledGraphPlan& plan,
         const std::vector<ID3D12CommandList*>& commandLists,
-        uint32_t frameSlot)
+        uint32_t frameSlot,
+        const DX12UploadDependency& uploadDependency)
     {
+        std::array<bool, 3> uploadDependencyApplied{};
+        const auto queueIndex = [](QueueType queue)
+        {
+            return static_cast<uint32_t>(queue);
+        };
+        auto waitForUploads =
+            [&](ID3D12CommandQueue* queue, QueueType queueType)
+            {
+                const uint32_t index = queueIndex(queueType);
+                if (!uploadDependency.valid() ||
+                    uploadDependencyApplied[index])
+                {
+                    return;
+                }
+                // Submission order is already sufficient on the upload queue.
+                // All other queues require an explicit GPU-side fence wait.
+                if (queue != uploadDependency.queue)
+                {
+                    throwIfFailed(
+                        queue->Wait(
+                            uploadDependency.fence,
+                            uploadDependency.value),
+                        "Failed to enqueue DX12 upload dependency.");
+                }
+                uploadDependencyApplied[index] = true;
+            };
+
         if (!plan.queueSubmissions.empty())
         {
+            static bool loggedSchedule = false;
+            if (!loggedSchedule)
+            {
+                for (uint32_t i = 0; i < plan.queueSubmissions.size(); ++i)
+                {
+                    const QueueSubmissionBatch& batch = plan.queueSubmissions[i];
+                    spdlog::debug(
+                        "[DX12FrameExecutor] batch={} level={} queue={} nodes={} waits={}",
+                        i, batch.levelIndex, static_cast<uint32_t>(batch.queue),
+                        batch.nodeCount, batch.waitCount);
+                }
+                loggedSchedule = true;
+            }
             std::vector<uint32_t> commandIndexByNode(
                 plan.nodes.size(), UINT32_MAX);
             for (uint32_t i = 0;
@@ -137,10 +194,14 @@ namespace ic
                 commandIndexByNode[plan.executionLevelNodes[i]] = i;
             }
 
-            std::vector<uint64_t> submissionSignals(
-                plan.queueSubmissions.size(), 0);
-            uint64_t lastComputeSignal = 0;
-            uint64_t lastCopySignal = 0;
+            struct SubmissionSignal
+            {
+                QueueType queue = QueueType::Graphics;
+                uint64_t value = 0;
+            };
+            std::vector<SubmissionSignal> submissionSignals(
+                plan.queueSubmissions.size());
+            std::array<uint64_t, 3> lastQueueSignals{};
 
             auto queueFor = [this](QueueType queue)
             {
@@ -160,6 +221,7 @@ namespace ic
                 const QueueSubmissionBatch& submission =
                     plan.queueSubmissions[submissionIndex];
                 ID3D12CommandQueue* queue = queueFor(submission.queue);
+                waitForUploads(queue, submission.queue);
 
                 if (submission.levelIndex == 0 &&
                     m_lastGraphCompletionValue != 0)
@@ -176,12 +238,18 @@ namespace ic
                         plan.queueSubmissionWaits[
                             submission.firstWait + i].submissionIndex;
                     if (dependency < submissionSignals.size() &&
-                        submissionSignals[dependency] != 0)
+                        submissionSignals[dependency].value != 0)
                     {
+                        const SubmissionSignal& source =
+                            submissionSignals[dependency];
+                        if (queueFor(source.queue) == queue)
+                        {
+                            continue;
+                        }
                         throwIfFailed(
                             queue->Wait(
-                                m_fence.Get(),
-                                submissionSignals[dependency]),
+                                m_queueFences[queueIndex(source.queue)].Get(),
+                                source.value),
                             "Failed to enqueue DX12 cross-queue wait.");
                     }
                 }
@@ -206,33 +274,33 @@ namespace ic
                         batchLists.data());
                 }
 
-                const uint64_t signal = m_nextFenceValue++;
+                const uint32_t signalQueue = queueIndex(submission.queue);
+                const uint64_t signal =
+                    m_nextQueueFenceValues[signalQueue]++;
                 throwIfFailed(
-                    queue->Signal(m_fence.Get(), signal),
+                    queue->Signal(m_queueFences[signalQueue].Get(), signal),
                     "Failed to signal DX12 queue submission.");
-                submissionSignals[submissionIndex] = signal;
-                if (submission.queue == QueueType::Compute)
-                {
-                    lastComputeSignal = signal;
-                }
-                else if (submission.queue == QueueType::Transfer)
-                {
-                    lastCopySignal = signal;
-                }
+                submissionSignals[submissionIndex] = {
+                    submission.queue, signal };
+                lastQueueSignals[signalQueue] = signal;
             }
 
-            if (lastComputeSignal != 0)
+            const uint32_t computeIndex = queueIndex(QueueType::Compute);
+            if (lastQueueSignals[computeIndex] != 0)
             {
                 throwIfFailed(
                     m_device->graphicsQueue()->Wait(
-                        m_fence.Get(), lastComputeSignal),
+                        m_queueFences[computeIndex].Get(),
+                        lastQueueSignals[computeIndex]),
                     "Failed to join DX12 compute queue.");
             }
-            if (lastCopySignal != 0)
+            const uint32_t copyIndex = queueIndex(QueueType::Transfer);
+            if (lastQueueSignals[copyIndex] != 0)
             {
                 throwIfFailed(
                     m_device->graphicsQueue()->Wait(
-                        m_fence.Get(), lastCopySignal),
+                        m_queueFences[copyIndex].Get(),
+                        lastQueueSignals[copyIndex]),
                     "Failed to join DX12 copy queue.");
             }
 
@@ -240,6 +308,8 @@ namespace ic
                 plan.executionLevelNodes.size();
             if (commandLists.size() > graphCommandCount)
             {
+                waitForUploads(
+                    m_device->graphicsQueue(), QueueType::Graphics);
                 m_device->graphicsQueue()->ExecuteCommandLists(
                     static_cast<UINT>(
                         commandLists.size() - graphCommandCount),
@@ -248,10 +318,17 @@ namespace ic
         }
         else if (!commandLists.empty())
         {
+            waitForUploads(
+                m_device->graphicsQueue(), QueueType::Graphics);
             m_device->graphicsQueue()->ExecuteCommandLists(
                 static_cast<UINT>(commandLists.size()),
                 commandLists.data());
         }
+
+        // The graphics frame fence owns slot reuse and retirement. Join the
+        // upload fence even when this frame had no graphics batch so its signal
+        // cannot pass pending copy work.
+        waitForUploads(m_device->graphicsQueue(), QueueType::Graphics);
 
         const bool presented = m_swapchain->present();
         signalFrame(frameSlot);

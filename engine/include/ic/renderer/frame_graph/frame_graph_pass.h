@@ -28,6 +28,57 @@ namespace ic
         DontCare
     };
 
+    enum class PassInvalidation : uint32_t
+    {
+        None          = 0,
+        Startup       = 1u << 0,
+        GraphRebuild  = 1u << 1,
+        Resize        = 1u << 2,
+        Resources     = 1u << 3,
+        Configuration = 1u << 4,
+        Scene         = 1u << 5,
+        Environment   = 1u << 6,
+        Manual        = 1u << 7
+    };
+
+    constexpr PassInvalidation operator|(
+        PassInvalidation lhs, PassInvalidation rhs) noexcept
+    {
+        return static_cast<PassInvalidation>(
+            static_cast<uint32_t>(lhs) | static_cast<uint32_t>(rhs));
+    }
+
+    constexpr PassInvalidation& operator|=(
+        PassInvalidation& lhs, PassInvalidation rhs) noexcept
+    {
+        lhs = lhs | rhs;
+        return lhs;
+    }
+
+    constexpr bool any(
+        PassInvalidation value, PassInvalidation mask) noexcept
+    {
+        return (static_cast<uint32_t>(value) &
+                static_cast<uint32_t>(mask)) != 0;
+    }
+
+    // Controls pass-body execution. Barriers and queue ordering remain in the
+    // compiled graph even when a body is skipped, so persistent outputs retain
+    // valid native state without rebuilding the graph.
+    enum class PassCadence : uint8_t
+    {
+        PerFrame = 0,
+        Once,
+        OnInvalidation,
+        OnResize // compatibility shorthand for Resize invalidation
+    };
+
+    struct PassExecutionPolicy
+    {
+        PassCadence cadence = PassCadence::PerFrame;
+        PassInvalidation invalidation = PassInvalidation::None;
+    };
+
     struct GraphicsPassData
     {
         std::string name;
@@ -35,6 +86,7 @@ namespace ic
         DrawListKind drawList = DrawListKind::None;
         AttachmentLoadOp colorLoadOp = AttachmentLoadOp::Clear;
         AttachmentLoadOp depthLoadOp = AttachmentLoadOp::Clear;
+        PassExecutionPolicy execution = {};
     };
 
     struct TransferPassData
@@ -42,6 +94,7 @@ namespace ic
         std::string name;
         GraphResourceId source = InvalidGraphResourceId;
         GraphResourceId destination = InvalidGraphResourceId;
+        PassExecutionPolicy execution = {};
     };
 
     struct ComputePassData
@@ -51,6 +104,7 @@ namespace ic
         uint32_t groupCountX = 1;
         uint32_t groupCountY = 1;
         uint32_t groupCountZ = 1;
+        PassExecutionPolicy execution = {};
     };
 
     struct EnvironmentConvertPassData

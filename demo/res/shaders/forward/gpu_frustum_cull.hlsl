@@ -36,6 +36,16 @@ struct IndexedIndirectArguments
     uint firstInstance;
 };
 
+#if defined(IC_TARGET_DX12)
+struct IndexedIndirectCommand
+{
+    uint4 drawConstants;
+    IndexedIndirectArguments draw;
+};
+#else
+typedef IndexedIndirectArguments IndexedIndirectCommand;
+#endif
+
 #if defined(IC_TARGET_VULKAN)
 [[vk::binding(22, 0)]]
 #endif
@@ -57,11 +67,11 @@ RWStructuredBuffer<uint> gVisibleInstanceCount : register(u24, space0);
 #if defined(IC_TARGET_VULKAN)
 [[vk::binding(26, 0)]]
 #endif
-RWStructuredBuffer<IndexedIndirectArguments> gIndirectArguments : register(u26, space0);
+RWStructuredBuffer<IndexedIndirectCommand> gIndirectArguments : register(u26, space0);
 #if defined(IC_TARGET_VULKAN)
 [[vk::binding(27, 0)]]
-#endif
 RWStructuredBuffer<DrawMetadata> gOutputDrawMetadata : register(u27, space0);
+#endif
 #if defined(IC_TARGET_VULKAN)
 [[vk::binding(28, 0)]]
 #endif
@@ -149,6 +159,19 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     arguments.firstIndex = input.firstIndex;
     arguments.vertexOffset = input.vertexOffset;
     arguments.firstInstance = commandIndex;
+#if defined(IC_TARGET_DX12)
+    IndexedIndirectCommand command;
+    command.drawConstants = uint4(
+        input.metadata.transformIndex,
+        input.metadata.meshIndex,
+        input.metadata.materialIndex,
+        0u);
+    command.draw = arguments;
+    gIndirectArguments[commandIndex] = command;
+#else
     gIndirectArguments[commandIndex] = arguments;
+#endif
+#if defined(IC_TARGET_VULKAN)
     gOutputDrawMetadata[commandIndex] = input.metadata;
+#endif
 }

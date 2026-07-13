@@ -3,6 +3,7 @@
 #include "ic/common/ic_common.h"
 #include "ibl_baker.h"
 #include "renderer_specification.h"
+#include "ic/renderer/frame_graph/frame_graph_pass.h"
 namespace ic
 {
     struct FrameContext;
@@ -47,6 +48,10 @@ namespace ic
         [[nodiscard]] RenderPathType renderPathType() const;
         
         void buildOrRebuildFrameGraph();
+        // Explicitly dirties passes whose execution policy subscribes to one
+        // or more of these API-neutral reasons. Manual is suitable for tools
+        // and one-off editor actions.
+        void invalidatePasses(PassInvalidation reasons);
 
         [[nodiscard]] IBLHandle requestIBLBake(
             const IBLBakeDesc& desc);

@@ -59,8 +59,8 @@ StructuredBuffer<ObjectData> gObjects : register(t0, space0);
 StructuredBuffer<MaterialData> gMaterials : register(t1, space0);
 #if defined(IC_TARGET_VULKAN)
 [[vk::binding(25, 0)]]
-#endif
 StructuredBuffer<DrawMetadata> gDrawMetadata : register(t25, space0);
+#endif
 
 #if defined(IC_TARGET_VULKAN)
 [[vk::push_constant]]
@@ -69,10 +69,14 @@ ConstantBuffer<DrawConstants> gDraw : register(b1, space0);
 
 DrawMetadata resolveDrawMetadata(uint instanceId)
 {
+#if defined(IC_TARGET_VULKAN)
     if (gFrame.cullingConfig.y != 0u)
     {
         return gDrawMetadata[instanceId];
     }
+#else
+    (void)instanceId;
+#endif
     DrawMetadata result = (DrawMetadata)0;
     result.meshIndex = gDraw.meshIndex;
     result.materialIndex = gDraw.materialIndex;

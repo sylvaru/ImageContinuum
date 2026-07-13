@@ -3,6 +3,7 @@
 #include "ic/renderer/vulkan_backend/vulkan_device.h"
 #include "ic/renderer/vulkan_backend/vulkan_swapchain.h"
 #include "ic/renderer/frame_graph/compiled_graph_plan.h"
+#include "ic/renderer/vulkan_backend/vulkan_upload_scheduler.h"
 
 #include <array>
 #include <cstdint>
@@ -80,7 +81,8 @@ namespace ic
         bool submitAndPresent(
             const CompiledGraphPlan& plan,
             std::span<const VkCommandBuffer> commandBuffers,
-            uint32_t frameSlot);
+            uint32_t frameSlot,
+            VulkanUploadDependency uploadDependency = {});
 
     private:
         struct FrameSync

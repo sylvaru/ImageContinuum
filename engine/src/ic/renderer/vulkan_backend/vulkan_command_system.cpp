@@ -60,8 +60,13 @@ namespace ic
                 poolInfo.flags =
                     VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
-                    vkCreateCommandPool(
-                        m_device, &poolInfo, nullptr, &worker.pool);
+                    if (vkCreateCommandPool(
+                            m_device, &poolInfo, nullptr, &worker.pool) !=
+                        VK_SUCCESS)
+                    {
+                        throw std::runtime_error(
+                            "Failed to create Vulkan worker command pool.");
+                    }
                 }
             }
         }
@@ -170,16 +175,22 @@ namespace ic
 
     void VulkanCommandSystem::beginFrame(uint32_t frameIndex)
     {
+        if (frameIndex >= m_frames.size())
+        {
+            throw std::runtime_error("Vulkan frame index out of range.");
+        }
         for (auto& workers : m_frames[frameIndex].queuePools)
         for (std::unique_ptr<WorkerPool>& workerPtr : workers)
         {
             WorkerPool& worker = *workerPtr;
             std::scoped_lock lock(worker.mutex);
             worker.nextCommandBuffer = 0;
-            vkResetCommandPool(
-                m_device,
-                worker.pool,
-                0);
+            if (vkResetCommandPool(
+                    m_device, worker.pool, 0) != VK_SUCCESS)
+            {
+                throw std::runtime_error(
+                    "Failed to reset Vulkan worker command pool.");
+            }
         }
     }
 
@@ -189,11 +200,20 @@ namespace ic
             uint32_t workerIndex,
             QueueType queue)
     {
-        FrameData& frame =
-            m_frames[frameIndex % m_frames.size()];
+        if (frameIndex >= m_frames.size())
+        {
+            throw std::runtime_error("Vulkan frame index out of range.");
+        }
+        FrameData& frame = m_frames[frameIndex];
+
+        auto& workers = frame.queuePools[queueIndex(queue)];
+        if (workerIndex >= workers.size())
+        {
+            throw std::runtime_error("Vulkan worker index out of range.");
+        }
 
         WorkerPool& pool =
-            *frame.queuePools[queueIndex(queue)][workerIndex];
+            *workers[workerIndex];
 
         std::unique_lock lock(pool.mutex);
 
@@ -223,61 +243,6 @@ namespace ic
             pool.commandBuffers[pool.nextCommandBuffer++];
 
         return RecordingLease(commandBuffer, std::move(lock));
-    }
-
-    VkCommandBuffer VulkanCommandSystem::beginFrameCommandBuffer(
-        uint32_t frameIndex,
-        uint32_t workerIndex)
-    {
-        FrameData& frame =
-            m_frames[frameIndex % m_frames.size()];
-
-        WorkerPool& pool =
-            *frame.queuePools[queueIndex(QueueType::Graphics)][workerIndex];
-
-        if (pool.primary == VK_NULL_HANDLE)
-        {
-            VkCommandBufferAllocateInfo allocInfo{};
-            allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            allocInfo.commandPool = pool.pool;
-            allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocInfo.commandBufferCount = 1;
-
-            vkAllocateCommandBuffers(
-                m_device,
-                &allocInfo,
-                &pool.primary);
-        }
-
-        return pool.primary;
-    }
-
-    VkCommandBuffer VulkanCommandSystem::allocateCommandBuffer(
-        uint32_t frameIndex,
-        uint32_t workerIndex)
-    {
-        VkCommandBufferAllocateInfo allocInfo{};
-        allocInfo.sType =
-            VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-
-        allocInfo.commandPool =
-            m_frames[frameIndex]
-            .queuePools[queueIndex(QueueType::Graphics)][workerIndex]
-            ->pool;
-
-        allocInfo.level =
-            VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-
-        allocInfo.commandBufferCount =
-            1;
-
-        VkCommandBuffer cmd;
-        vkAllocateCommandBuffers(
-            m_device,
-            &allocInfo,
-            &cmd);
-
-        return cmd;
     }
 
     void VulkanCommandSystem::immediateSubmit(

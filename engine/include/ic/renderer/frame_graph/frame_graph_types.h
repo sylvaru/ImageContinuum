@@ -64,7 +64,19 @@ namespace ic
     enum class ResourceOwnership : uint8_t
     {
         Transient,
+        Persistent,
         Imported
+    };
+
+    enum class GraphResourceSemantic : uint8_t
+    {
+        Generic = 0,
+        ClusterBounds,
+        ClusterLightGrid,
+        ClusterLightIndices,
+        ClusterLightCounter,
+        VisibleLights,
+        PathTraceTonemap
     };
 
     enum class ImportedResource : uint8_t
@@ -118,6 +130,7 @@ namespace ic
         GraphResourceType type;
         ResourceOwnership ownership;
         ImportedResource imported;
+        GraphResourceSemantic semantic = GraphResourceSemantic::Generic;
         ResourceUsage initialUsage;
         AccessType initialAccess;
         TextureDesc textureDesc;

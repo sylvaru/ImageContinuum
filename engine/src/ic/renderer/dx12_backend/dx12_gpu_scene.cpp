@@ -32,6 +32,7 @@ namespace ic
         m_resourceAllocator = &resourceAllocator;
         m_descriptorSystem = &descriptorSystem;
         m_frames.clear();
+        m_indirectCommandSignatures.clear();
         m_frames.resize(std::max(1u, framesInFlight));
         m_prepared = PreparedGpuScene{};
     }
@@ -52,8 +53,6 @@ namespace ic
             m_descriptorSystem->releaseResourceDescriptors(frame.materialSrv);
         }
         m_frames.clear();
-
-        indexedIndirectCommandSignature.Reset();
 
         m_device = nullptr;
         m_resourceAllocator = nullptr;
@@ -89,16 +88,10 @@ namespace ic
             .debugName = "DX12 GPU cull visible count readback"
         });
         indirectArguments = m_resourceAllocator->createBuffer({
-            .size = maxCullInstances * sizeof(GpuIndexedIndirectArguments),
+            .size = maxCullInstances * sizeof(DX12GpuIndexedIndirectCommand),
             .usage = BufferUsageFlags::Storage | BufferUsageFlags::Indirect,
             .memoryUsage = ResourceMemoryUsage::GpuOnly,
             .debugName = "DX12 GPU-driven indirect arguments"
-        });
-        drawMetadata = m_resourceAllocator->createBuffer({
-            .size = maxCullInstances * sizeof(GpuDrawMetadata),
-            .usage = BufferUsageFlags::Storage,
-            .memoryUsage = ResourceMemoryUsage::GpuOnly,
-            .debugName = "DX12 GPU-driven draw metadata"
         });
         binCounts = m_resourceAllocator->createBuffer({
             .size = maxBins * sizeof(uint32_t),
@@ -110,23 +103,9 @@ namespace ic
         visibleInstancesState = visibleInstances.initialState;
         visibleInstanceCountState = visibleInstanceCount.initialState;
         indirectArgumentsState = indirectArguments.initialState;
-        drawMetadataState = drawMetadata.initialState;
         binCountsState = binCounts.initialState;
 
-        if (!indexedIndirectCommandSignature)
-        {
-            D3D12_INDIRECT_ARGUMENT_DESC argument{};
-            argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
-            D3D12_COMMAND_SIGNATURE_DESC signature{};
-            signature.ByteStride = sizeof(GpuIndexedIndirectArguments);
-            signature.NumArgumentDescs = 1;
-            signature.pArgumentDescs = &argument;
-            throwIfFailed(
-                device->CreateCommandSignature(
-                    &signature, nullptr,
-                    IID_PPV_ARGS(&indexedIndirectCommandSignature)),
-                "Failed to create DX12 indexed indirect command signature.");
-        }
+        (void)device;
     }
 
     void DX12GpuScene::destroyCullBuffers()
@@ -135,13 +114,45 @@ namespace ic
         m_resourceAllocator->destroyBuffer(visibleInstanceCount);
         m_resourceAllocator->destroyBuffer(visibleInstanceCountReadback);
         m_resourceAllocator->destroyBuffer(indirectArguments);
-        m_resourceAllocator->destroyBuffer(drawMetadata);
         m_resourceAllocator->destroyBuffer(binCounts);
         visibleInstancesState = D3D12_RESOURCE_STATE_COMMON;
         visibleInstanceCountState = D3D12_RESOURCE_STATE_COMMON;
         indirectArgumentsState = D3D12_RESOURCE_STATE_COMMON;
-        drawMetadataState = D3D12_RESOURCE_STATE_COMMON;
         binCountsState = D3D12_RESOURCE_STATE_COMMON;
+    }
+
+    ID3D12CommandSignature* DX12GpuScene::indirectCommandSignature(
+        ID3D12RootSignature* rootSignature)
+    {
+        if (!rootSignature || !m_device)
+        {
+            return nullptr;
+        }
+        auto existing = m_indirectCommandSignatures.find(rootSignature);
+        if (existing != m_indirectCommandSignatures.end())
+        {
+            return existing->second.Get();
+        }
+
+        D3D12_INDIRECT_ARGUMENT_DESC arguments[2]{};
+        arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
+        arguments[0].Constant.RootParameterIndex = 3;
+        arguments[0].Constant.Num32BitValuesToSet = 4;
+        arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED;
+
+        D3D12_COMMAND_SIGNATURE_DESC desc{};
+        desc.ByteStride = sizeof(DX12GpuIndexedIndirectCommand);
+        desc.NumArgumentDescs = static_cast<UINT>(std::size(arguments));
+        desc.pArgumentDescs = arguments;
+
+        Microsoft::WRL::ComPtr<ID3D12CommandSignature> signature;
+        throwIfFailed(
+            m_device->CreateCommandSignature(
+                &desc, rootSignature, IID_PPV_ARGS(&signature)),
+            "Failed to create DX12 GPU-driven command signature.");
+        ID3D12CommandSignature* result = signature.Get();
+        m_indirectCommandSignatures.emplace(rootSignature, std::move(signature));
+        return result;
     }
 
     bool DX12GpuScene::prepare(

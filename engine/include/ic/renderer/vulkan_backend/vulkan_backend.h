@@ -12,6 +12,8 @@
 #include "ic/renderer/vulkan_backend/vulkan_resource_allocator.h"
 #include "ic/renderer/vulkan_backend/vulkan_graph_resource_registry.h"
 #include "ic/renderer/vulkan_backend/vulkan_frame_executor.h"
+#include "ic/renderer/vulkan_backend/vulkan_upload_scheduler.h"
+#include "ic/renderer/vulkan_backend/vulkan_retirement_queue.h"
 #include "ic/renderer/vulkan_backend/vulkan_gpu_scene.h"
 #include "ic/renderer/renderer_gpu_assets.h"
 #include "ic/renderer/path_tracing/path_tracer_types.h"
@@ -38,8 +40,9 @@ namespace ic
 
         void shutdown() override;
 
-        void execute(
+        [[nodiscard]] bool execute(
             const CompiledGraphPlan& plan,
+            const GraphExecutionContext& execution,
             const FrameContext& ctx,
             const SceneRenderView& scene) override;
 
@@ -107,6 +110,8 @@ namespace ic
             VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
             std::vector<VkDescriptorSet> pathTraceDescriptorSets;
             std::vector<VkDescriptorSet> tonemapDescriptorSets;
+            std::vector<uint64_t> pathTraceDescriptorVersions;
+            uint64_t pathTraceDescriptorGeneration = 1;
 
             VkImageLayout accumulationLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             VkImageLayout tonemapLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -203,6 +208,7 @@ namespace ic
 
         void executeGraph(
             const CompiledGraphPlan& plan,
+            const GraphExecutionContext& execution,
             const FrameContext& ctx,
             const SceneRenderView& scene,
             VkImage swapchainImage,
@@ -237,7 +243,10 @@ namespace ic
             std::span<const GraphResource> resources,
             VkImage swapchainImage,
             VkImageLayout swapchainInitialLayout,
-            bool crossQueue,
+            QueueType sourceQueue,
+            QueueType destinationQueue,
+            bool crossQueueRelease,
+            bool crossQueueAcquire,
             QueueType commandQueue);
 
         void executeGraphicsNode(
@@ -288,12 +297,13 @@ namespace ic
             const FrameContext& ctx,
             const SceneRenderView& scene);
         void destroyPathTraceResources();
-        void destroyPathTraceSceneResources();
+        void retirePathTraceSceneResources();
         void uploadPathTraceScene(const PathTraceSceneData& sceneData);
         VkImageView createTextureView(const VulkanTexture& texture) const;
         void updatePathTraceDescriptors(
             const VulkanComputePipeline* pathTracePipeline,
-            const VulkanComputePipeline* tonemapPipeline);
+            const VulkanComputePipeline* tonemapPipeline,
+            uint32_t frameSlot);
         bool ensureEnvironmentResources(
             const FrameContext& ctx,
             const SceneRenderView& scene,
@@ -342,7 +352,8 @@ namespace ic
             AssetHandle modelHandle,
             uint32_t imageIndex,
             const ImageAsset& image,
-            TextureTransferFunction transfer);
+            TextureTransferFunction transfer,
+            bool asynchronous = true);
 
         uint32_t requestSampler(const SamplerAsset* sampler);
 
@@ -393,6 +404,8 @@ namespace ic
 
         VulkanGraphResourceRegistry m_graphResourceRegistry;
         VulkanFrameExecutor m_frameExecutor;
+        VulkanUploadScheduler m_uploadScheduler;
+        VulkanRetirementQueue m_retirementQueue;
         std::unordered_map<VkImage, ImageState> m_imageStates;
 
         VulkanInstance m_instance;

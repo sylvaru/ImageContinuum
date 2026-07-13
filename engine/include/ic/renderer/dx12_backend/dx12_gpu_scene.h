@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <span>
+#include <unordered_map>
 #include <vector>
 
 #include <d3d12.h>
@@ -59,9 +60,17 @@ namespace ic
     // upload buffers, and the GPU-driven cull/indirect-argument buffers
     // consumed by the frustum-cull compute pass and (once activated)
     // ExecuteIndirect. The cull/indirect buffers hold native D3D12 formats
-    // (GpuIndexedIndirectArguments); the frustum-cull compute shader writes
-    // them directly, so metadata draw commands never cross into the native
-    // indirect API.
+    // (DX12GpuIndexedIndirectCommand); the frustum-cull compute shader writes
+    // them directly. DX12 prefixes each native draw with root constants so an
+    // ExecuteIndirect command identifies its object/material without relying
+    // on Vulkan's firstInstance/SV_InstanceID semantics.
+    struct DX12GpuIndexedIndirectCommand
+    {
+        DrawConstants drawConstants{};
+        GpuIndexedIndirectArguments draw{};
+    };
+    static_assert(sizeof(DX12GpuIndexedIndirectCommand) == 36);
+
     class DX12GpuScene final
     {
     public:
@@ -139,6 +148,8 @@ namespace ic
             uint32_t maxInstances,
             uint32_t maxBins);
         void destroyCullBuffers();
+        ID3D12CommandSignature* indirectCommandSignature(
+            ID3D12RootSignature* rootSignature);
 
         // Public: consumed directly by the pass recorders and the graphics
         // draw path, mirroring the style of DX12GraphResourceEntry.
@@ -146,21 +157,16 @@ namespace ic
         DX12Buffer visibleInstanceCount;
         DX12Buffer visibleInstanceCountReadback;
         DX12Buffer indirectArguments;
-        DX12Buffer drawMetadata;
         DX12Buffer binCounts;
         D3D12_RESOURCE_STATES visibleInstancesState = D3D12_RESOURCE_STATE_COMMON;
         D3D12_RESOURCE_STATES visibleInstanceCountState =
             D3D12_RESOURCE_STATE_COMMON;
         D3D12_RESOURCE_STATES indirectArgumentsState =
             D3D12_RESOURCE_STATE_COMMON;
-        D3D12_RESOURCE_STATES drawMetadataState = D3D12_RESOURCE_STATE_COMMON;
         D3D12_RESOURCE_STATES binCountsState = D3D12_RESOURCE_STATE_COMMON;
         uint32_t maxInstances = 0;
         uint32_t lastVisibleInstanceCount = 0;
         bool loggedGpuCull = false;
-
-        Microsoft::WRL::ComPtr<ID3D12CommandSignature>
-            indexedIndirectCommandSignature;
 
     private:
         DX12ResourceAllocator* m_resourceAllocator = nullptr;
@@ -169,5 +175,9 @@ namespace ic
 
         std::vector<DX12GpuSceneFrameResources> m_frames;
         PreparedGpuScene m_prepared;
+        std::unordered_map<
+            ID3D12RootSignature*,
+            Microsoft::WRL::ComPtr<ID3D12CommandSignature>>
+            m_indirectCommandSignatures;
     };
 }

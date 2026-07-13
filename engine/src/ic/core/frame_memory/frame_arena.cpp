@@ -1,6 +1,6 @@
 // ic/core/memory/frame_arena.h
 #include "ic/common/ic_pch.h"
-#include "ic/core/memory/frame_arena.h"
+#include "ic/core/frame_memory/frame_arena.h"
 
 namespace ic
 {

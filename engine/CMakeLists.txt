@@ -48,24 +48,28 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/ibl_baker.h"
      
     "include/ic/renderer/vulkan_backend/vulkan_backend.h" 
+    "include/ic/renderer/vulkan_backend/vulkan_upload_scheduler.h"
+    "include/ic/renderer/vulkan_backend/vulkan_retirement_queue.h"
     
     "include/ic/renderer/renderer_backend.h"
     "include/ic/renderer/render_handles.h" 
     "include/ic/renderer/renderer_path/renderer_path.h" 
     "include/ic/renderer/renderer_path/forward.h"
-    "include/ic/core/job_system.h" 
+    "include/ic/core/job_system.h"
+    "include/ic/core/task.h"
+    "include/ic/core/coroutine_frame_pool.h"
     "include/ic/util/util.h"
-    "include/ic/core/memory/frame_arena_region.h"
-    "include/ic/core/memory/frame_memory_types.h"
+    "include/ic/core/frame_memory/frame_arena_region.h"
+    "include/ic/core/frame_memory/frame_memory_types.h"
     
     "include/ic/renderer/frame_graph/frame_graph_types.h" 
     "include/ic/renderer/frame_graph/frame_graph_pass.h"
     "include/ic/core/clock.h" 
     "include/ic/common/ic_fwd.h" 
-    "include/ic/core/memory/frame_arena.h" 
-    "include/ic/core/memory/thread_arena.h" 
-    "include/ic/core/memory/frame_arena_manager.h"
-    "include/ic/core/memory/frame_arena_storage.h"
+    "include/ic/core/frame_memory/frame_arena.h"
+    "include/ic/core/frame_memory/thread_arena.h"
+    "include/ic/core/frame_memory/frame_arena_manager.h"
+    "include/ic/core/frame_memory/frame_arena_storage.h"
     "include/ic/renderer/frame_graph/frame_graph_compiler.h"
     "include/ic/renderer/frame_graph/frame_graph_executor.h"
     "include/ic/scene/scene_types.h"
@@ -90,13 +94,15 @@ target_sources(ImageContinuumEngine PRIVATE
     
     "src/ic/platform/glfw_input.cpp" 
     "src/ic/platform/glfw_window.cpp" 
-    "src/ic/renderer/vulkan_backend/vulkan_backend.cpp" 
+    "src/ic/renderer/vulkan_backend/vulkan_backend.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_upload_scheduler.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_retirement_queue.cpp"
     
     
     
     "src/ic/core/job_system.cpp"
     "src/ic/renderer/frame_graph/frame_graph_compiler.cpp"
-    "src/ic/core/memory/frame_arena.cpp" 
+    "src/ic/core/frame_memory/frame_arena.cpp"
     "src/ic/scene/scene.cpp"
     "src/ic/scene/scene_manager.cpp"
     "src/ic/scene/scene_transform_utils.cpp"
@@ -173,6 +179,8 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/dx12_backend/dx12_device.h" 
     "include/ic/renderer/dx12_backend/dx12_descriptor_system.h" 
     "include/ic/renderer/dx12_backend/dx12_pipeline_manager.h" 
+    "include/ic/renderer/dx12_backend/dx12_retirement_queue.h"
+    "include/ic/renderer/dx12_backend/dx12_upload_scheduler.h"
 
     "src/ic/renderer/dx12_backend/dx12_backend.cpp"
     "src/ic/renderer/dx12_backend/dx12_graph_resource_registry.cpp"
@@ -187,6 +195,8 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/renderer/dx12_backend/dx12_command_system.cpp"
     "src/ic/renderer/dx12_backend/dx12_descriptor_system.cpp"
     "src/ic/renderer/dx12_backend/dx12_pipeline_manager.cpp"
+    "src/ic/renderer/dx12_backend/dx12_retirement_queue.cpp"
+    "src/ic/renderer/dx12_backend/dx12_upload_scheduler.cpp"
     )
     endif()
 

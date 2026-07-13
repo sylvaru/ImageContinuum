@@ -134,6 +134,18 @@ namespace ic
 
             materializeTransient(entry, resource, resolvedTexture);
         }
+
+        for (auto it = m_entries.begin(); it != m_entries.end();)
+        {
+            if (it->second.materializationGeneration == generation)
+            {
+                ++it;
+                continue;
+            }
+
+            retireEntry(std::move(it->second), frameSlot);
+            it = m_entries.erase(it);
+        }
     }
 
     DX12GraphResourceEntry* DX12GraphResourceRegistry::entry(
@@ -181,8 +193,13 @@ namespace ic
     {
         return lhs.width == rhs.width &&
                lhs.height == rhs.height &&
+               lhs.depth == rhs.depth &&
                lhs.mipLevels == rhs.mipLevels &&
-               lhs.arrayLayers == rhs.arrayLayers;
+               lhs.arrayLayers == rhs.arrayLayers &&
+               lhs.cubeCompatible == rhs.cubeCompatible &&
+               lhs.format == rhs.format &&
+               lhs.usage == rhs.usage &&
+               lhs.memoryUsage == rhs.memoryUsage;
     }
 
     bool DX12GraphResourceRegistry::bufferDescMatches(
@@ -350,6 +367,15 @@ namespace ic
         }
 
         assert(frameSlot < m_retiredByFrameSlot.size());
+        if (frameSlot >= m_retiredByFrameSlot.size())
+        {
+            // Out-of-range in a Release build (assert compiled out): destroy
+            // immediately rather than indexing out of bounds. This forgoes
+            // the deferred-free-until-slot-recycled guarantee, but that is
+            // strictly safer than corrupting the heap.
+            destroyEntry(entry);
+            return;
+        }
         m_retiredByFrameSlot[frameSlot].push_back(std::move(entry));
     }
 

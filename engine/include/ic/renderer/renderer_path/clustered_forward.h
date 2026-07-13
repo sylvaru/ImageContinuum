@@ -21,6 +21,7 @@ namespace ic
         GraphResourceId clusterLightIndexBuffer;
         GraphResourceId clusterLightCounterBuffer;
         GraphResourceId visibleLightBuffer;
+        GraphResourceId clusterExecutionToken;
         GpuDrivenGraphResources gpuDriven;
 
         GraphResourceId environmentCubemap;
@@ -93,7 +94,7 @@ namespace ic
                 .debugName = "ClusteredForward.DepthPyramid"
                 });
 
-            clusterBoundsBuffer = builder.createBuffer({
+            clusterBoundsBuffer = builder.createPersistentBuffer({
                 .size = clusterCount * sizeof(GpuClusterBounds),
                 .usage = BufferUsageFlags::Storage,
                 .memoryUsage = ResourceMemoryUsage::GpuOnly,
@@ -132,6 +133,26 @@ namespace ic
                 .mappedAtCreation = false,
                 .debugName = "ClusteredForward.VisibleLights"
                 });
+            builder.setResourceSemantic(
+                clusterBoundsBuffer, GraphResourceSemantic::ClusterBounds);
+            builder.setResourceSemantic(
+                clusterLightGridBuffer, GraphResourceSemantic::ClusterLightGrid);
+            builder.setResourceSemantic(
+                clusterLightIndexBuffer, GraphResourceSemantic::ClusterLightIndices);
+            builder.setResourceSemantic(
+                clusterLightCounterBuffer, GraphResourceSemantic::ClusterLightCounter);
+            builder.setResourceSemantic(
+                visibleLightBuffer, GraphResourceSemantic::VisibleLights);
+
+            // The current native clustered binding packs several logical graph
+            // buffers into one descriptor layout and one backend state bundle.
+            // Declare that shared mutation explicitly so recording and queue
+            // scheduling never treat those state updates as independent.
+            clusterExecutionToken = builder.createBuffer({
+                .size = sizeof(uint32_t),
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::GpuOnly,
+                .debugName = "ClusteredForward.ExecutionToken" });
 
 
             environmentCubemap = builder.createTexture({
@@ -148,22 +169,6 @@ namespace ic
                 .debugName = "Environment.SkyboxCubemap"
                 });
 
-            // Environment conversion
-            // Fine for now, but eventually this should only run when the environment changes
-
-            EnvironmentConvertPassData environmentConvert{};
-            environmentConvert.outputCubemap = environmentCubemap;
-
-            auto environmentNode =
-                builder.addGraphNode(
-                    environmentConvert,
-                    GraphNodeType::Compute,
-                    QueueType::Compute);
-
-            builder.write(
-                environmentNode,
-                environmentCubemap,
-                ResourceUsage::StorageTexture);
 
             gpuDriven = declareGpuDrivenResources(builder);
             addGpuDrivenCullPasses(builder, gpuDriven);
@@ -189,14 +194,21 @@ namespace ic
 
             // Build clusters
             //
-            // This can eventually be cached and rebuilt only when projection,
-            // render extent, tile size, or z slice count changes
+            // Bounds depend on projection as well as render extent. This remains
+            // recurrent until projection changes are exposed as an explicit
+            // renderer rebuild event; treating resize as the only invalidation
+            // would leave stale clusters after an FOV/projection change.
 
             auto clusterBuildNode =
                 builder.addComputePass("BuildClusters")
                 .pipeline("cluster_build")
                 .dispatch(clusterDispatchGroups, 1, 1)
-                .write(clusterBoundsBuffer, ResourceUsage::StorageBuffer);
+                .write(clusterBoundsBuffer, ResourceUsage::StorageBuffer)
+                .write(clusterExecutionToken, ResourceUsage::StorageBuffer)
+                .onInvalidation(
+                    PassInvalidation::GraphRebuild |
+                    PassInvalidation::Resize |
+                    PassInvalidation::Configuration);
 
             // Reset global append counter before light culling.
 
@@ -204,7 +216,8 @@ namespace ic
                 builder.addComputePass("ResetClusterLightCounter")
                 .pipeline("reset_cluster_light_counter")
                 .dispatch(1, 1, 1)
-                .write(clusterLightCounterBuffer, ResourceUsage::StorageBuffer);
+                .write(clusterLightCounterBuffer, ResourceUsage::StorageBuffer)
+                .write(clusterExecutionToken, ResourceUsage::StorageBuffer);
 
             // Cull lights into clusters.
             //
@@ -221,7 +234,8 @@ namespace ic
                 .read(clusterLightCounterBuffer, ResourceUsage::StorageBuffer)
                 .write(clusterLightGridBuffer, ResourceUsage::StorageBuffer)
                 .write(clusterLightIndexBuffer, ResourceUsage::StorageBuffer)
-                .write(clusterLightCounterBuffer, ResourceUsage::StorageBuffer);
+                .write(clusterLightCounterBuffer, ResourceUsage::StorageBuffer)
+                .write(clusterExecutionToken, ResourceUsage::StorageBuffer);
 
 
             // Opaque clustered forward pass

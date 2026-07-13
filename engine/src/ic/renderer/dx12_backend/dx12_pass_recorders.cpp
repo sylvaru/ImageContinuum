@@ -68,10 +68,32 @@ namespace ic
         cmd->SetPipelineState(pipeline.pipelineState.Get());
         cmd->SetComputeRootConstantBufferView(0, inputs.frameConstantsAddr);
 
+        ID3D12Resource* const hiZResource = hiZ->texture.resource.Get();
+        const uint32_t mipCount = hiZ->mipLevels();
+
+        auto transitionMip =
+            [&](uint32_t mip,
+                D3D12_RESOURCE_STATES before,
+                D3D12_RESOURCE_STATES after)
+            {
+                D3D12_RESOURCE_BARRIER barrier{};
+                barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                barrier.Transition.pResource = hiZResource;
+                barrier.Transition.Subresource = mip;
+                barrier.Transition.StateBefore = before;
+                barrier.Transition.StateAfter = after;
+                cmd->ResourceBarrier(1, &barrier);
+            };
+
         uint32_t mipWidth = hiZ->width();
         uint32_t mipHeight = hiZ->height();
-        for (uint32_t mip = 0; mip < hiZ->mipLevels(); ++mip)
+        for (uint32_t mip = 0; mip < mipCount; ++mip)
         {
+            // The downsample reads the previous mip as an SRV. The frame graph
+            // brings the whole resource in as UNORDERED_ACCESS, so before the
+            // dispatch each source mip must be transitioned to a shader-read
+            // state; otherwise the GPU reads a subresource still in UAV state,
+            // which is undefined and hangs the device in Release builds.
             cmd->SetComputeRootDescriptorTable(
                 1,
                 mip == 0
@@ -85,13 +107,32 @@ namespace ic
                 (mipHeight + 7u) / 8u,
                 1);
 
-            D3D12_RESOURCE_BARRIER barrier{};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barrier.UAV.pResource = hiZ->texture.resource.Get();
-            cmd->ResourceBarrier(1, &barrier);
+            // Make this freshly written mip readable as an SRV by the next
+            // iteration. The final mip has no consumer inside this loop, so it
+            // stays in UNORDERED_ACCESS.
+            if (mip + 1u < mipCount)
+            {
+                transitionMip(
+                    mip,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            }
 
             mipWidth = std::max(1u, mipWidth >> 1u);
             mipHeight = std::max(1u, mipHeight >> 1u);
+        }
+
+        // Restore every mip that was flipped to a read state back to
+        // UNORDERED_ACCESS so the whole resource is uniformly in the state the
+        // frame graph tracks it in (StorageTexture / UAV). This keeps the
+        // executor's end-of-life transient transition (all-subresources
+        // UAV -> COMMON) valid.
+        for (uint32_t mip = 0; mip + 1u < mipCount; ++mip)
+        {
+            transitionMip(
+                mip,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         }
 
         return true;
@@ -136,7 +177,7 @@ namespace ic
                     bin.maxDrawCount,
                     indirectStream.indirectArguments,
                     static_cast<UINT64>(bin.commandOffset) *
-                        sizeof(GpuIndexedIndirectArguments),
+                        indirectStream.commandStride,
                     indirectStream.binCounts,
                     static_cast<UINT64>(binIndex) * sizeof(uint32_t));
             }
@@ -230,7 +271,6 @@ namespace ic
         transitionUav(
             buffers.visibleInstanceCount, buffers.visibleInstanceCountState);
         transitionUav(buffers.indirectArguments, buffers.indirectArgumentsState);
-        transitionUav(buffers.drawMetadata, buffers.drawMetadataState);
         transitionUav(buffers.binCounts, buffers.binCountsState);
 
         cmd->SetComputeRootConstantBufferView(0, buffers.frameConstantsAddr);
@@ -241,7 +281,6 @@ namespace ic
         cmd->SetComputeRootShaderResourceView(4, buffers.drawInputsAddr);
         cmd->SetComputeRootUnorderedAccessView(
             5, buffers.indirectArgumentsAddr);
-        cmd->SetComputeRootUnorderedAccessView(6, buffers.drawMetadataAddr);
-        cmd->SetComputeRootUnorderedAccessView(7, buffers.binCountsAddr);
+        cmd->SetComputeRootUnorderedAccessView(6, buffers.binCountsAddr);
     }
 }

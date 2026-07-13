@@ -162,7 +162,61 @@ namespace ic
                     }
                 }
             }
+
+            // A usage change is a state transition even when both accesses
+            // are reads (for example sampled texture -> transfer source).
+            // Keep the two nodes out of the same parallel recording level so
+            // the barrier has a defined execution order and backend state
+            // tracking is never mutated concurrently for that resource.
+            for (size_t i = 1; i < chain.accesses.size(); ++i)
+            {
+                const ResourceAccess& previous = chain.accesses[i - 1];
+                const ResourceAccess& current = chain.accesses[i];
+                if (previous.external || current.external ||
+                    previous.node == current.node ||
+                    previous.usage == current.usage)
+                {
+                    continue;
+                }
+
+                m_dependencies.push_back({ previous.node, current.node });
+            }
+
+            // Exclusive resources require an ordered ownership handoff even
+            // when both accesses are reads. This also orders read-only usage
+            // changes such as sampled -> transfer source.
+            for (size_t i = 1; i < chain.accesses.size(); ++i)
+            {
+                const ResourceAccess& previous = chain.accesses[i - 1];
+                const ResourceAccess& current = chain.accesses[i];
+                if (previous.external || current.external ||
+                    previous.node == current.node ||
+                    m_nodes[previous.node].queue == m_nodes[current.node].queue)
+                {
+                    continue;
+                }
+
+                m_dependencies.push_back({ previous.node, current.node });
+            }
         }
+
+        std::sort(
+            m_dependencies.begin(), m_dependencies.end(),
+            [](const Dependency& lhs, const Dependency& rhs)
+            {
+                return lhs.source < rhs.source ||
+                    (lhs.source == rhs.source &&
+                     lhs.destination < rhs.destination);
+            });
+        m_dependencies.erase(
+            std::unique(
+                m_dependencies.begin(), m_dependencies.end(),
+                [](const Dependency& lhs, const Dependency& rhs)
+                {
+                    return lhs.source == rhs.source &&
+                        lhs.destination == rhs.destination;
+                }),
+            m_dependencies.end());
     }
 
     void FrameGraphCompiler::buildAdjacencyLists()
@@ -398,8 +452,11 @@ namespace ic
             }
         }
 
-        std::vector<std::vector<uint32_t>> waits(
-            m_queueSubmissions.size());
+        // Store (destination, source) pairs in one flat allocation. A vector
+        // per batch plus linear duplicate searches becomes quadratic for
+        // graphs with many cross-queue edges.
+        std::pmr::vector<uint64_t> waitEdges(m_nodes.get_allocator());
+        waitEdges.reserve(m_dependencies.size());
         for (const Dependency& dependency : m_dependencies)
         {
             const uint32_t source = nodeSubmission[dependency.source];
@@ -412,16 +469,16 @@ namespace ic
                 continue;
             }
 
-            auto& destinationWaits = waits[destination];
-            if (std::find(
-                    destinationWaits.begin(),
-                    destinationWaits.end(),
-                    source) == destinationWaits.end())
-            {
-                destinationWaits.push_back(source);
-            }
+            waitEdges.push_back(
+                (static_cast<uint64_t>(destination) << 32u) | source);
         }
 
+        std::sort(waitEdges.begin(), waitEdges.end());
+        waitEdges.erase(
+            std::unique(waitEdges.begin(), waitEdges.end()),
+            waitEdges.end());
+
+        size_t waitEdge = 0;
         for (uint32_t submissionIndex = 0;
              submissionIndex < m_queueSubmissions.size();
              ++submissionIndex)
@@ -430,14 +487,17 @@ namespace ic
                 m_queueSubmissions[submissionIndex];
             batch.firstWait =
                 static_cast<uint32_t>(m_queueSubmissionWaits.size());
-            std::sort(waits[submissionIndex].begin(),
-                      waits[submissionIndex].end());
-            for (uint32_t dependency : waits[submissionIndex])
+            while (waitEdge < waitEdges.size() &&
+                   static_cast<uint32_t>(waitEdges[waitEdge] >> 32u) ==
+                       submissionIndex)
             {
-                m_queueSubmissionWaits.push_back({ dependency });
+                m_queueSubmissionWaits.push_back({
+                    static_cast<uint32_t>(waitEdges[waitEdge]) });
+                ++waitEdge;
             }
             batch.waitCount =
-                static_cast<uint32_t>(waits[submissionIndex].size());
+                static_cast<uint32_t>(m_queueSubmissionWaits.size()) -
+                batch.firstWait;
         }
     }
 

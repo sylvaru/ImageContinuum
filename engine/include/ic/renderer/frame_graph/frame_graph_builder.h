@@ -30,6 +30,9 @@ namespace ic
             GraphicsPassBuilder& depthLoadOp(AttachmentLoadOp op);
             GraphicsPassBuilder& color(GraphResourceId resource);
             GraphicsPassBuilder& depth(GraphResourceId resource);
+            GraphicsPassBuilder& cadence(PassCadence cadence);
+            GraphicsPassBuilder& onInvalidation(PassInvalidation reasons);
+            GraphicsPassBuilder& once();
 
             operator GraphNodeId() const
             {
@@ -62,6 +65,9 @@ namespace ic
             ComputePassBuilder& write(
                 GraphResourceId resource,
                 ResourceUsage usage);
+            ComputePassBuilder& cadence(PassCadence cadence);
+            ComputePassBuilder& onInvalidation(PassInvalidation reasons);
+            ComputePassBuilder& once();
 
             operator GraphNodeId() const
             {
@@ -89,6 +95,13 @@ namespace ic
             TransferPassBuilder& write(
                 GraphResourceId resource,
                 ResourceUsage usage = ResourceUsage::TransferDst);
+            TransferPassBuilder& copy(
+                GraphResourceId source,
+                GraphResourceId destination);
+            TransferPassBuilder& queue(QueueType queue);
+            TransferPassBuilder& cadence(PassCadence cadence);
+            TransferPassBuilder& onInvalidation(PassInvalidation reasons);
+            TransferPassBuilder& once();
 
             operator GraphNodeId() const
             {
@@ -146,6 +159,11 @@ namespace ic
 		// Resource creation
 		GraphResourceId createTexture(const TextureDesc& desc = {});
 		GraphResourceId createBuffer(const BufferDesc& desc = {});
+        GraphResourceId createPersistentTexture(const TextureDesc& desc = {});
+        GraphResourceId createPersistentBuffer(const BufferDesc& desc = {});
+        void setResourceSemantic(
+            GraphResourceId resource,
+            GraphResourceSemantic semantic);
 
 		// Dependency declaration
 		void read(
@@ -187,6 +205,19 @@ namespace ic
             uint32_t groupCountX,
             uint32_t groupCountY,
             uint32_t groupCountZ);
+
+        void setTransferCopy(
+            GraphNodeId node,
+            GraphResourceId source,
+            GraphResourceId destination);
+        void setNodeQueue(GraphNodeId node, QueueType queue);
+
+        void setPassCadence(
+            GraphNodeId node,
+            PassCadence cadence);
+        void setPassInvalidation(
+            GraphNodeId node,
+            PassInvalidation reasons);
 
 	private:
 

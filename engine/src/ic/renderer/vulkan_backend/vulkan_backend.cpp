@@ -106,9 +106,17 @@ namespace ic
             m_device,
             m_resourceAllocator,
             framesInFlight);
+
+        m_retirementQueue.init(
+            m_device.device(), m_resourceAllocator, framesInFlight);
+
+        m_uploadScheduler.init(
+            m_device, framesInFlight);
+
         m_gpuScene.init(m_resourceAllocator, framesInFlight);
 
         m_pipelineManager.init(m_device.device());
+
         m_pipelineLibrary = &pipelineLibrary;
 
         if (spec.useDebugGui)
@@ -129,6 +137,8 @@ namespace ic
         destroyEnvironmentResources();
         destroyClusteredForwardResources();
         destroyPathTraceResources();
+        m_uploadScheduler.shutdown();
+        m_retirementQueue.drain();
         m_graphResourceRegistry.shutdown();
         m_pipelineManager.shutdown();
 
@@ -145,20 +155,15 @@ namespace ic
         spdlog::info("[VulkanBackend] Shutdown");
     }
 
-    void VulkanBackend::execute(
+    bool VulkanBackend::execute(
         const CompiledGraphPlan& plan,
+        const GraphExecutionContext& execution,
         const FrameContext& ctx,
         const SceneRenderView& scene)
     {
-        if (planUsesPathTracing(plan) &&
-            m_device.device() != VK_NULL_HANDLE)
-        {
-            vkDeviceWaitIdle(m_device.device());
-        }
-
         if (!m_frameExecutor.ready())
         {
-            return;
+            return false;
         }
 
         const uint32_t frameSlot =
@@ -166,6 +171,8 @@ namespace ic
                 ctx.frameIndex % m_frameExecutor.framesInFlight());
 
         m_frameExecutor.waitForFrameSlot(frameSlot);
+        m_retirementQueue.beginFrame(frameSlot);
+        m_uploadScheduler.beginFrame(frameSlot);
 
         if (frameSlot < m_gpuScene.frameSlotCount())
         {
@@ -192,7 +199,7 @@ namespace ic
         if (!frame.acquired)
         {
             onSwapchainRecreated();
-            return;
+            return false;
         }
 
         VkImage swapchainImage = frame.swapchainImage;
@@ -217,6 +224,7 @@ namespace ic
         std::vector<VkCommandBuffer> commandBuffers;
         executeGraph(
             plan,
+            execution,
             ctx,
             scene,
             swapchainImage,
@@ -227,18 +235,22 @@ namespace ic
             swapchainImage,
             commandBuffers);
 
-        const bool presented =
-            m_frameExecutor.submitAndPresent(plan, commandBuffers, frameSlot);
+        const VulkanUploadDependency uploadDependency =
+            m_uploadScheduler.flush();
+        const bool presented = m_frameExecutor.submitAndPresent(
+            plan, commandBuffers, frameSlot, uploadDependency);
 
         if (!presented)
         {
             onSwapchainRecreated();
         }
+        return presented;
     }
 
 
     void VulkanBackend::executeGraph(
         const CompiledGraphPlan& plan,
+        const GraphExecutionContext& execution,
         const FrameContext& ctx,
         const SceneRenderView& scene,
         VkImage swapchainImage,
@@ -305,13 +317,38 @@ namespace ic
                     swapchainImage,
                     swapchainInitialLayout);
 
-                dispatchNode(
-                    plan,
-                    node,
-                    ctx,
-                    scene,
-                    cmd,
-                    swapchainImage);
+                if (execution.shouldExecute(node.nodeId))
+                {
+                    dispatchNode(
+                        plan,
+                        node,
+                        ctx,
+                        scene,
+                        cmd,
+                        swapchainImage);
+                }
+
+                if (node.nodeId < plan.nodeSchedules.size())
+                {
+                    const NodeSchedule& schedule = plan.nodeSchedules[node.nodeId];
+                    for (uint32_t i = 0; i < schedule.outgoingBarrierCount; ++i)
+                    {
+                        const ResourceBarrier& barrier =
+                            plan.barriers[plan.outgoingBarrierIndices[
+                                schedule.firstOutgoingBarrier + i]];
+                        if (barrier.fromNode != barrier.toNode &&
+                            plan.nodes[barrier.fromNode].queue !=
+                                plan.nodes[barrier.toNode].queue)
+                        {
+                            recordBarrier(
+                                cmd, barrier, plan.resources, swapchainImage,
+                                swapchainInitialLayout,
+                                plan.nodes[barrier.fromNode].queue,
+                                plan.nodes[barrier.toNode].queue,
+                                true, false, node.queue);
+                        }
+                    }
+                }
 
                 if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
                 {
@@ -352,6 +389,9 @@ namespace ic
                     plan.resources,
                     swapchainImage,
                     swapchainInitialLayout,
+                    plan.nodes[barrier.fromNode].queue,
+                    plan.nodes[barrier.toNode].queue,
+                    false,
                     barrier.fromNode != barrier.toNode &&
                     plan.nodes[barrier.fromNode].queue !=
                         plan.nodes[barrier.toNode].queue,
@@ -381,6 +421,9 @@ namespace ic
                 plan.resources,
                 swapchainImage,
                 swapchainInitialLayout,
+                plan.nodes[barrier.fromNode].queue,
+                plan.nodes[barrier.toNode].queue,
+                false,
                 barrier.fromNode != barrier.toNode &&
                 plan.nodes[barrier.fromNode].queue !=
                     plan.nodes[barrier.toNode].queue,
@@ -394,9 +437,36 @@ namespace ic
         std::span<const GraphResource> resources,
         VkImage swapchainImage,
         VkImageLayout swapchainInitialLayout,
-        bool crossQueue,
+        QueueType sourceQueue,
+        QueueType destinationQueue,
+        bool crossQueueRelease,
+        bool crossQueueAcquire,
         QueueType commandQueue)
     {
+        (void)sourceQueue;
+        (void)destinationQueue;
+        // Graph resources use concurrent sharing across the selected queue
+        // families. The source-side barrier performs any layout transition;
+        // the timeline-semaphore wait supplies the destination visibility.
+        // Recording a second acquire transition would repeat oldLayout ->
+        // newLayout after the release already completed it.
+        if (crossQueueAcquire)
+        {
+            return;
+        }
+
+        const auto nativeQueue = [this](QueueType queue)
+        {
+            switch (queue)
+            {
+            case QueueType::Graphics: return m_device.graphicsQueue();
+            case QueueType::Compute: return m_device.computeQueue();
+            case QueueType::Transfer: return m_device.transferQueue();
+            }
+            return m_device.graphicsQueue();
+        };
+        const bool releaseOnly = crossQueueRelease &&
+            nativeQueue(sourceQueue) != nativeQueue(destinationQueue);
 
         VkImageMemoryBarrier vkBarrier{};
         vkBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -419,9 +489,10 @@ namespace ic
             VkBufferMemoryBarrier bufferBarrier{};
             bufferBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
             bufferBarrier.srcAccessMask =
-                (crossQueue || barrier.firstUse) ? 0 :
+                (crossQueueAcquire || barrier.firstUse) ? 0 :
                 accessMaskFor(barrier.oldUsage, barrier.fromAccess);
             bufferBarrier.dstAccessMask =
+                releaseOnly ? 0 :
                 accessMaskFor(barrier.newUsage, barrier.toAccess);
             bufferBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             bufferBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -429,20 +500,20 @@ namespace ic
             bufferBarrier.offset = 0;
             bufferBarrier.size = entry->buffer.size;
 
-            VkPipelineStageFlags srcStage = (crossQueue || barrier.firstUse)
+            VkPipelineStageFlags srcStage = (crossQueueAcquire || barrier.firstUse)
                 ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
                 : pipelineStageFor(barrier.oldUsage, barrier.fromAccess);
             VkPipelineStageFlags dstStage =
                 pipelineStageFor(barrier.newUsage, barrier.toAccess);
             if (commandQueue == QueueType::Compute)
             {
-                srcStage = crossQueue ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                srcStage = crossQueueAcquire ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
                     : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
                 dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
             }
             else if (commandQueue == QueueType::Transfer)
             {
-                srcStage = crossQueue ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                srcStage = crossQueueAcquire ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
                     : VK_PIPELINE_STAGE_TRANSFER_BIT;
                 dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
             }
@@ -474,7 +545,7 @@ namespace ic
         }
         else
         {
-            const VulkanGraphResourceEntry* entry =
+            VulkanGraphResourceEntry* entry =
                 m_graphResourceRegistry.entry(barrier.resource);
             if (!entry || entry->type != GraphResourceType::Texture ||
                 !entry->texture)
@@ -488,41 +559,41 @@ namespace ic
         }
         vkBarrier.image = image;
 
+        VulkanGraphResourceEntry* trackedEntry =
+            resource.ownership != ResourceOwnership::Imported
+                ? m_graphResourceRegistry.entry(barrier.resource)
+                : nullptr;
         const bool isExternalFirstUse =
-            barrier.firstUse;
+            barrier.firstUse && !trackedEntry;
 
-        vkBarrier.oldLayout = isExternalFirstUse
+        vkBarrier.oldLayout = trackedEntry
+            ? trackedEntry->layout
+            : isExternalFirstUse
             ? (isSwapchainImage
                 ? swapchainInitialLayout
                 : VK_IMAGE_LAYOUT_UNDEFINED)
-            : (!isSwapchainImage &&
-                m_graphResourceRegistry.entry(barrier.resource)
-                ? m_graphResourceRegistry.entry(barrier.resource)->layout
-                : usageToLayout(barrier.oldUsage));
+            : usageToLayout(barrier.oldUsage);
 
         vkBarrier.newLayout = usageToLayout(barrier.newUsage);
 
         vkBarrier.srcAccessMask =
-            crossQueue || barrier.firstUse ||
-                vkBarrier.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED
+            crossQueueAcquire || vkBarrier.oldLayout == VK_IMAGE_LAYOUT_UNDEFINED ||
+                barrier.firstUse && !trackedEntry
                 ? 0
                 : accessMaskFor(
                     barrier.oldUsage,
                     barrier.fromAccess);
 
         vkBarrier.dstAccessMask =
-            accessMaskFor(
+            releaseOnly ? 0 : accessMaskFor(
                 barrier.newUsage,
                 barrier.toAccess);
 
         vkBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         vkBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 
-        vkBarrier.srcQueueFamilyIndex =
-            VK_QUEUE_FAMILY_IGNORED;
-
-        vkBarrier.dstQueueFamilyIndex =
-            VK_QUEUE_FAMILY_IGNORED;
+        // Native graph resources and swapchain images are concurrently shared;
+        // queue-family ownership indices must remain IGNORED.
 
         const bool depthTexture =
             resource.type == GraphResourceType::Texture &&
@@ -535,7 +606,7 @@ namespace ic
 
         vkBarrier.subresourceRange.baseMipLevel = 0;
         vkBarrier.subresourceRange.levelCount =
-            resource.ownership == ResourceOwnership::Transient
+            resource.ownership != ResourceOwnership::Imported
                 ? std::max(1u, resource.textureDesc.mipLevels)
                 : 1u;
         vkBarrier.subresourceRange.baseArrayLayer = 0;
@@ -550,7 +621,7 @@ namespace ic
         {
             srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         }
-        if (crossQueue)
+        if (crossQueueAcquire)
         {
             srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
         }
@@ -566,13 +637,13 @@ namespace ic
         }
         if (commandQueue == QueueType::Compute)
         {
-            srcStage = crossQueue ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            srcStage = crossQueueAcquire ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
                 : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
             dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
         }
         else if (commandQueue == QueueType::Transfer)
         {
-            srcStage = crossQueue ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+            srcStage = crossQueueAcquire ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
                 : VK_PIPELINE_STAGE_TRANSFER_BIT;
             dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         }
@@ -586,14 +657,11 @@ namespace ic
             0, nullptr,
             1, &vkBarrier);
 
-        if (!isSwapchainImage)
+        if (trackedEntry)
         {
-            if (VulkanGraphResourceEntry* entry =
-                    m_graphResourceRegistry.entry(barrier.resource))
-            {
-                entry->layout = vkBarrier.newLayout;
-            }
+            trackedEntry->layout = vkBarrier.newLayout;
         }
+
     }
 
     void VulkanBackend::dispatchNode(
@@ -714,7 +782,7 @@ namespace ic
         colorAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         colorAttachment.imageView =
             useGraphAttachments &&
-                colorEntry && colorEntry->ownership == ResourceOwnership::Transient
+                colorEntry && colorEntry->ownership != ResourceOwnership::Imported
                 ? colorEntry->view
                 : m_swapchain.imageView(m_frameExecutor.currentSwapchainImage());
         colorAttachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -734,7 +802,7 @@ namespace ic
         depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         depthAttachment.imageView =
             useGraphAttachments &&
-                depthEntry && depthEntry->ownership == ResourceOwnership::Transient
+                depthEntry && depthEntry->ownership != ResourceOwnership::Imported
                 ? depthEntry->view
                 : m_depthImageView;
         depthAttachment.imageLayout =
@@ -1405,6 +1473,7 @@ namespace ic
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         m_environmentResources.converted = true;
         m_environmentResources.skyboxDescriptorsDirty = true;
+        ++m_pathTraceResources.pathTraceDescriptorGeneration;
         m_pathTraceResources.pathTraceDescriptorsDirty = true;
         spdlog::info("[Vulkan] Converted HDR environment to cubemap");
         return true;
@@ -1437,12 +1506,6 @@ namespace ic
         if (m_environmentResources.source != scene.environment.equirectTexture ||
             m_environmentResources.cubemapSize != cubemapSize)
         {
-            if (m_device.device() != VK_NULL_HANDLE &&
-                (m_environmentResources.cubemap ||
-                    m_environmentResources.descriptorPool != VK_NULL_HANDLE))
-            {
-                vkDeviceWaitIdle(m_device.device());
-            }
             destroyEnvironmentResources();
             m_environmentResources.source = scene.environment.equirectTexture;
             m_environmentResources.cubemapSize = cubemapSize;
@@ -1814,106 +1877,39 @@ namespace ic
 
     void VulkanBackend::destroyEnvironmentResources()
     {
-        const VkDevice device = m_device.device();
-        if (device != VK_NULL_HANDLE)
+        m_retirementQueue.retireImageView(m_environmentResources.cubemapView);
+        m_retirementQueue.retireImageView(
+            m_environmentResources.cubemapStorageView);
+        m_retirementQueue.retireImageView(
+            m_environmentResources.irradianceView);
+        m_retirementQueue.retireImageView(
+            m_environmentResources.irradianceStorageView);
+        m_retirementQueue.retireImageView(
+            m_environmentResources.prefilteredView);
+        for (VkImageView view : m_environmentResources.prefilteredStorageViews)
         {
-            if (m_environmentResources.cubemapView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_environmentResources.cubemapView,
-                    nullptr);
-            }
-            if (m_environmentResources.cubemapStorageView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_environmentResources.cubemapStorageView,
-                    nullptr);
-            }
-            if (m_environmentResources.irradianceView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_environmentResources.irradianceView,
-                    nullptr);
-            }
-            if (m_environmentResources.irradianceStorageView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_environmentResources.irradianceStorageView,
-                    nullptr);
-            }
-            if (m_environmentResources.prefilteredView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_environmentResources.prefilteredView,
-                    nullptr);
-            }
-            for (VkImageView view :
-                m_environmentResources.prefilteredStorageViews)
-            {
-                if (view != VK_NULL_HANDLE)
-                {
-                    vkDestroyImageView(device, view, nullptr);
-                }
-            }
-            if (m_environmentResources.brdfLutView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_environmentResources.brdfLutView,
-                    nullptr);
-            }
-            if (m_environmentResources.brdfLutStorageView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_environmentResources.brdfLutStorageView,
-                    nullptr);
-            }
-            if (m_environmentResources.equirectView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_environmentResources.equirectView,
-                    nullptr);
-            }
-            if (m_environmentResources.sampler != VK_NULL_HANDLE)
-            {
-                vkDestroySampler(
-                    device,
-                    m_environmentResources.sampler,
-                    nullptr);
-            }
-            if (m_environmentResources.descriptorPool != VK_NULL_HANDLE)
-            {
-                vkDestroyDescriptorPool(
-                    device,
-                    m_environmentResources.descriptorPool,
-                    nullptr);
-            }
-            if (m_environmentResources.bakeDescriptorPool != VK_NULL_HANDLE)
-            {
-                vkDestroyDescriptorPool(
-                    device,
-                    m_environmentResources.bakeDescriptorPool,
-                    nullptr);
-            }
+            m_retirementQueue.retireImageView(view);
         }
+        m_retirementQueue.retireImageView(m_environmentResources.brdfLutView);
+        m_retirementQueue.retireImageView(
+            m_environmentResources.brdfLutStorageView);
+        m_retirementQueue.retireImageView(m_environmentResources.equirectView);
+        m_retirementQueue.retireSampler(m_environmentResources.sampler);
+        m_retirementQueue.retireDescriptorPool(
+            m_environmentResources.descriptorPool);
+        m_retirementQueue.retireDescriptorPool(
+            m_environmentResources.bakeDescriptorPool);
 
         for (VulkanBuffer& buffer :
             m_environmentResources.skyboxConstants)
         {
-            m_resourceAllocator.destroyBuffer(buffer);
+            m_retirementQueue.retire(std::move(buffer));
         }
-        m_resourceAllocator.destroyTexture(m_environmentResources.cubemap);
-        m_resourceAllocator.destroyTexture(m_environmentResources.equirect);
-        m_resourceAllocator.destroyTexture(m_environmentResources.irradiance);
-        m_resourceAllocator.destroyTexture(m_environmentResources.prefiltered);
-        m_resourceAllocator.destroyTexture(m_environmentResources.brdfLut);
+        m_retirementQueue.retire(std::move(m_environmentResources.cubemap));
+        m_retirementQueue.retire(std::move(m_environmentResources.equirect));
+        m_retirementQueue.retire(std::move(m_environmentResources.irradiance));
+        m_retirementQueue.retire(std::move(m_environmentResources.prefiltered));
+        m_retirementQueue.retire(std::move(m_environmentResources.brdfLut));
         m_environmentResources = {};
     }
 
@@ -1955,7 +1951,10 @@ namespace ic
         {
             return;
         }
-        updatePathTraceDescriptors(pipeline, nullptr);
+        updatePathTraceDescriptors(
+            pipeline, nullptr,
+            static_cast<uint32_t>(ctx.frameIndex %
+                m_pathTraceResources.pathTraceDescriptorSets.size()));
 
         if (!m_pathTraceResources.accumulation ||
             m_pathTraceResources.pathTraceDescriptorSets.empty())
@@ -2130,7 +2129,10 @@ namespace ic
         }
 
         ensurePathTraceResources();
-        updatePathTraceDescriptors(nullptr, pipeline);
+        updatePathTraceDescriptors(
+            nullptr, pipeline,
+            static_cast<uint32_t>(ctx.frameIndex %
+                m_pathTraceResources.tonemapDescriptorSets.size()));
 
         if (!m_pathTraceResources.accumulation ||
             !m_pathTraceResources.tonemap ||
@@ -2251,10 +2253,55 @@ namespace ic
             return;
         }
 
-        if (pass->name == "PathTracer.CopyToBackBuffer" &&
-            m_pathTraceResources.tonemap &&
-            swapchainImage != VK_NULL_HANDLE)
+        if (pass->source >= plan.resources.size() ||
+            pass->destination >= plan.resources.size())
         {
+            spdlog::error("Transfer pass '{}' has invalid graph resources", pass->name);
+            return;
+        }
+
+        const GraphResource& sourceDesc = plan.resources[pass->source];
+        const GraphResource& destinationDesc = plan.resources[pass->destination];
+        if (sourceDesc.type != destinationDesc.type)
+        {
+            spdlog::error("Transfer pass '{}' cannot copy between resource types", pass->name);
+            return;
+        }
+
+        const VulkanGraphResourceEntry* sourceEntry =
+            m_graphResourceRegistry.entry(sourceDesc.id);
+        const VulkanGraphResourceEntry* destinationEntry =
+            m_graphResourceRegistry.entry(destinationDesc.id);
+
+        if (sourceDesc.type == GraphResourceType::Buffer)
+        {
+            if (!sourceEntry || !destinationEntry ||
+                !sourceEntry->buffer || !destinationEntry->buffer)
+            {
+                spdlog::error("Transfer pass '{}' could not resolve its buffers", pass->name);
+                return;
+            }
+            VkBufferCopy copy{};
+            copy.size = std::min(sourceEntry->buffer.size, destinationEntry->buffer.size);
+            vkCmdCopyBuffer(
+                cmd,
+                sourceEntry->buffer.buffer,
+                destinationEntry->buffer.buffer,
+                1,
+                &copy);
+            return;
+        }
+
+        VkImage sourceImage = sourceEntry ? sourceEntry->texture.image : VK_NULL_HANDLE;
+        VkImage destinationImage = destinationEntry
+            ? destinationEntry->texture.image : VK_NULL_HANDLE;
+        uint32_t width = sourceEntry ? sourceEntry->width : 0;
+        uint32_t height = sourceEntry ? sourceEntry->height : 0;
+        if (sourceDesc.semantic == GraphResourceSemantic::PathTraceTonemap)
+        {
+            sourceImage = m_pathTraceResources.tonemap.image;
+            width = m_pathTraceResources.width;
+            height = m_pathTraceResources.height;
             if (m_pathTraceResources.tonemapLayout !=
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL)
             {
@@ -2270,27 +2317,42 @@ namespace ic
                 m_pathTraceResources.tonemapLayout =
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
             }
-
-            VkImageCopy copy{};
-            copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copy.srcSubresource.layerCount = 1;
-            copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            copy.dstSubresource.layerCount = 1;
-            copy.extent = {
-                m_pathTraceResources.width,
-                m_pathTraceResources.height,
-                1
-            };
-
-            vkCmdCopyImage(
-                cmd,
-                m_pathTraceResources.tonemap.image,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                swapchainImage,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                1,
-                &copy);
         }
+        if (destinationDesc.imported == ImportedResource::Swapchain)
+        {
+            destinationImage = swapchainImage;
+        }
+        if (sourceImage == VK_NULL_HANDLE || destinationImage == VK_NULL_HANDLE)
+        {
+            spdlog::error("Transfer pass '{}' could not resolve its images", pass->name);
+            return;
+        }
+        if (destinationEntry &&
+            destinationDesc.ownership != ResourceOwnership::Imported)
+        {
+            width = std::min(width, destinationEntry->width);
+            height = std::min(height, destinationEntry->height);
+        }
+        if (width == 0 || height == 0)
+        {
+            spdlog::error("Transfer pass '{}' resolved a zero-sized image copy", pass->name);
+            return;
+        }
+
+        VkImageCopy copy{};
+        copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.srcSubresource.layerCount = 1;
+        copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        copy.dstSubresource.layerCount = 1;
+        copy.extent = { width, height, 1 };
+        vkCmdCopyImage(
+            cmd,
+            sourceImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            destinationImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &copy);
     }
 
     GraphicsPipelineHandle VulkanBackend::pipelineForNode(
@@ -2554,6 +2616,7 @@ namespace ic
                 "Failed to create Vulkan path tracing descriptor pool.");
         }
 
+        ++m_pathTraceResources.pathTraceDescriptorGeneration;
         m_pathTraceResources.pathTraceDescriptorsDirty = true;
         m_pathTraceResources.tonemapDescriptorsDirty = true;
     }
@@ -2660,19 +2723,7 @@ namespace ic
     void VulkanBackend::uploadPathTraceScene(
         const PathTraceSceneData& sceneData)
     {
-        if (m_device.device() != VK_NULL_HANDLE &&
-            (m_pathTraceResources.sceneVertices ||
-                std::ranges::any_of(
-                    m_pathTraceResources.pathTraceDescriptorSets,
-                    [](VkDescriptorSet set)
-                    {
-                        return set != VK_NULL_HANDLE;
-                    })))
-        {
-            vkDeviceWaitIdle(m_device.device());
-        }
-
-        destroyPathTraceSceneResources();
+        retirePathTraceSceneResources();
 
         m_pathTraceResources.sceneVertexCount =
             static_cast<uint32_t>(sceneData.vertices.size());
@@ -2805,8 +2856,7 @@ namespace ic
 
         if (!pendingUploads.empty())
         {
-            m_commandSystem.immediateSubmit(
-                m_device.graphicsQueue(),
+            m_uploadScheduler.record(
                 [&](VkCommandBuffer cmd)
                 {
                     for (const PendingSceneUpload& upload : pendingUploads)
@@ -2826,8 +2876,7 @@ namespace ic
                             VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
                         barrier.srcAccessMask =
                             VK_ACCESS_TRANSFER_WRITE_BIT;
-                        barrier.dstAccessMask =
-                            VK_ACCESS_SHADER_READ_BIT;
+                        barrier.dstAccessMask = 0;
                         barrier.srcQueueFamilyIndex =
                             VK_QUEUE_FAMILY_IGNORED;
                         barrier.dstQueueFamilyIndex =
@@ -2839,7 +2888,7 @@ namespace ic
                         vkCmdPipelineBarrier(
                             cmd,
                             VK_PIPELINE_STAGE_TRANSFER_BIT,
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                             0,
                             0,
                             nullptr,
@@ -2852,75 +2901,44 @@ namespace ic
 
             for (PendingSceneUpload& upload : pendingUploads)
             {
-                m_resourceAllocator.destroyBuffer(upload.staging);
+                m_retirementQueue.retire(std::move(upload.staging));
             }
         }
 
+        ++m_pathTraceResources.pathTraceDescriptorGeneration;
         m_pathTraceResources.pathTraceDescriptorsDirty = true;
     }
 
-    void VulkanBackend::destroyPathTraceSceneResources()
+    void VulkanBackend::retirePathTraceSceneResources()
     {
-        m_resourceAllocator.destroyBuffer(
-            m_pathTraceResources.sceneVertices);
-        m_resourceAllocator.destroyBuffer(
-            m_pathTraceResources.sceneMaterials);
-        m_resourceAllocator.destroyBuffer(
-            m_pathTraceResources.sceneTriangles);
-        m_resourceAllocator.destroyBuffer(
-            m_pathTraceResources.sceneBvhNodes);
-
-        m_pathTraceResources.sceneVertexCount = 0;
-        m_pathTraceResources.sceneMaterialCount = 0;
-        m_pathTraceResources.sceneTriangleCount = 0;
-        m_pathTraceResources.sceneBvhNodeCount = 0;
-        m_pathTraceResources.firstEmissiveTriangleIndex = UINT32_MAX;
+        m_retirementQueue.retire(
+            std::move(m_pathTraceResources.sceneVertices));
+        m_retirementQueue.retire(
+            std::move(m_pathTraceResources.sceneMaterials));
+        m_retirementQueue.retire(
+            std::move(m_pathTraceResources.sceneTriangles));
+        m_retirementQueue.retire(
+            std::move(m_pathTraceResources.sceneBvhNodes));
     }
 
     void VulkanBackend::destroyPathTraceResources()
     {
-        VkDevice device = m_device.device();
-
-        if (device != VK_NULL_HANDLE)
-        {
-            if (m_pathTraceResources.accumulationView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_pathTraceResources.accumulationView,
-                    nullptr);
-            }
-
-            if (m_pathTraceResources.tonemapView != VK_NULL_HANDLE)
-            {
-                vkDestroyImageView(
-                    device,
-                    m_pathTraceResources.tonemapView,
-                    nullptr);
-            }
-
-            if (m_pathTraceResources.descriptorPool != VK_NULL_HANDLE)
-            {
-                vkDestroyDescriptorPool(
-                    device,
-                    m_pathTraceResources.descriptorPool,
-                    nullptr);
-            }
-        }
-
-        destroyPathTraceSceneResources();
-
-        m_resourceAllocator.destroyTexture(
-            m_pathTraceResources.accumulation);
-        m_resourceAllocator.destroyTexture(
-            m_pathTraceResources.tonemap);
+        m_retirementQueue.retireImageView(
+            m_pathTraceResources.accumulationView);
+        m_retirementQueue.retireImageView(m_pathTraceResources.tonemapView);
+        m_retirementQueue.retireDescriptorPool(
+            m_pathTraceResources.descriptorPool);
+        retirePathTraceSceneResources();
+        m_retirementQueue.retire(
+            std::move(m_pathTraceResources.accumulation));
+        m_retirementQueue.retire(std::move(m_pathTraceResources.tonemap));
         for (VulkanBuffer& buffer : m_pathTraceResources.pathTraceConstants)
         {
-            m_resourceAllocator.destroyBuffer(buffer);
+            m_retirementQueue.retire(std::move(buffer));
         }
         for (VulkanBuffer& buffer : m_pathTraceResources.tonemapConstants)
         {
-            m_resourceAllocator.destroyBuffer(buffer);
+            m_retirementQueue.retire(std::move(buffer));
         }
 
         m_pathTraceResources = {};
@@ -2956,7 +2974,8 @@ namespace ic
 
     void VulkanBackend::updatePathTraceDescriptors(
         const VulkanComputePipeline* pathTracePipeline,
-        const VulkanComputePipeline* tonemapPipeline)
+        const VulkanComputePipeline* tonemapPipeline,
+        uint32_t frameSlot)
     {
         if (m_pathTraceResources.descriptorPool == VK_NULL_HANDLE)
         {
@@ -2973,7 +2992,10 @@ namespace ic
         if (pathTracePipeline)
         {
             bool updateDescriptors =
-                m_pathTraceResources.pathTraceDescriptorsDirty;
+                m_pathTraceResources.pathTraceDescriptorsDirty ||
+                frameSlot >= m_pathTraceResources.pathTraceDescriptorVersions.size() ||
+                m_pathTraceResources.pathTraceDescriptorVersions[frameSlot] !=
+                    m_pathTraceResources.pathTraceDescriptorGeneration;
 
             const bool needAllocate =
                 m_pathTraceResources.pathTraceDescriptorSets.empty() ||
@@ -2998,6 +3020,7 @@ namespace ic
                     std::ranges::fill(
                         m_pathTraceResources.tonemapDescriptorSets,
                         VK_NULL_HANDLE);
+                    ++m_pathTraceResources.pathTraceDescriptorGeneration;
                     m_pathTraceResources.pathTraceDescriptorsDirty = true;
                     m_pathTraceResources.tonemapDescriptorsDirty = true;
                     updateDescriptors = true;
@@ -3038,6 +3061,8 @@ namespace ic
                 }
 
                 updateDescriptors = true;
+                m_pathTraceResources.pathTraceDescriptorVersions.assign(
+                    setCount, 0);
             }
 
             if (!updateDescriptors)
@@ -3114,12 +3139,10 @@ namespace ic
             std::vector<VkDescriptorBufferInfo> constantsInfos(
                 m_pathTraceResources.pathTraceConstants.size());
             std::vector<VkWriteDescriptorSet> writes;
-            writes.reserve(
-                m_pathTraceResources.pathTraceDescriptorSets.size() * 10u);
+            writes.reserve(10u);
 
-            for (size_t setIndex = 0;
-                 setIndex < m_pathTraceResources.pathTraceDescriptorSets.size();
-                 ++setIndex)
+            const size_t setIndex = frameSlot;
+            if (setIndex < m_pathTraceResources.pathTraceDescriptorSets.size())
             {
                 constantsInfos[setIndex].buffer =
                     m_pathTraceResources.pathTraceConstants[setIndex].buffer;
@@ -3231,7 +3254,16 @@ namespace ic
                 0,
                 nullptr);
 
-            m_pathTraceResources.pathTraceDescriptorsDirty = false;
+            m_pathTraceResources.pathTraceDescriptorVersions[frameSlot] =
+                m_pathTraceResources.pathTraceDescriptorGeneration;
+            m_pathTraceResources.pathTraceDescriptorsDirty =
+                std::ranges::any_of(
+                    m_pathTraceResources.pathTraceDescriptorVersions,
+                    [this](uint64_t version)
+                    {
+                        return version != m_pathTraceResources
+                            .pathTraceDescriptorGeneration;
+                    });
         }
 
         if (tonemapPipeline)
@@ -3836,7 +3868,8 @@ namespace ic
                     request.desc.sourceEnvironment,
                     0,
                     *image,
-                    TextureTransferFunction::Linear);
+                    TextureTransferFunction::Linear,
+                    false);
 
                 SceneRenderView bakeScene{};
                 bakeScene.environment.equirectTexture =
@@ -4357,7 +4390,8 @@ namespace ic
         AssetHandle modelHandle,
         uint32_t imageIndex,
         const ImageAsset& image,
-        TextureTransferFunction transfer)
+        TextureTransferFunction transfer,
+        bool asynchronous)
     {
         const uint64_t key = uploadedTextureKey(modelHandle, imageIndex, transfer);
         if (auto it = m_uploadedTextures.find(key);
@@ -4402,9 +4436,7 @@ namespace ic
                 TextureUsageFlags::Sampled | TextureUsageFlags::TransferDst,
                 "Vulkan bindless model texture");
 
-        m_commandSystem.immediateSubmit(
-            m_device.graphicsQueue(),
-            [&](VkCommandBuffer cmd)
+        auto recordUpload = [&](VkCommandBuffer cmd)
             {
                 transitionImage(
                     cmd,
@@ -4437,11 +4469,22 @@ namespace ic
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     VK_ACCESS_TRANSFER_WRITE_BIT,
-                    VK_ACCESS_SHADER_READ_BIT,
+                    asynchronous ? 0 : VK_ACCESS_SHADER_READ_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-            });
+                    asynchronous
+                        ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
+                        : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            };
+        if (asynchronous)
+        {
+            m_uploadScheduler.record(recordUpload);
+        }
+        else
+        {
+            m_commandSystem.immediateSubmit(
+                m_device.graphicsQueue(), std::move(recordUpload));
+        }
 
         uploaded.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
@@ -4462,7 +4505,14 @@ namespace ic
                 &uploaded.view),
             "Failed to create Vulkan bindless texture view.");
 
-        m_resourceAllocator.destroyBuffer(staging);
+        if (asynchronous)
+        {
+            m_retirementQueue.retire(std::move(staging));
+        }
+        else
+        {
+            m_resourceAllocator.destroyBuffer(staging);
+        }
 
         m_uploadedTextures.emplace(key, std::move(uploaded));
         return static_cast<uint32_t>(m_uploadedTextures.size() - 1u);
@@ -4620,8 +4670,7 @@ namespace ic
                 .debugName = "Vulkan model index buffer"
             });
 
-        m_commandSystem.immediateSubmit(
-            m_device.graphicsQueue(),
+        m_uploadScheduler.record(
             [&](VkCommandBuffer cmd)
             {
                 VkBufferCopy vertexCopy{};
@@ -4647,8 +4696,7 @@ namespace ic
                     VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
                 barriers[0].srcAccessMask =
                     VK_ACCESS_TRANSFER_WRITE_BIT;
-                barriers[0].dstAccessMask =
-                    VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
+                barriers[0].dstAccessMask = 0;
                 barriers[0].srcQueueFamilyIndex =
                     VK_QUEUE_FAMILY_IGNORED;
                 barriers[0].dstQueueFamilyIndex =
@@ -4661,8 +4709,7 @@ namespace ic
                     VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
                 barriers[1].srcAccessMask =
                     VK_ACCESS_TRANSFER_WRITE_BIT;
-                barriers[1].dstAccessMask =
-                    VK_ACCESS_INDEX_READ_BIT;
+                barriers[1].dstAccessMask = 0;
                 barriers[1].srcQueueFamilyIndex =
                     VK_QUEUE_FAMILY_IGNORED;
                 barriers[1].dstQueueFamilyIndex =
@@ -4674,7 +4721,7 @@ namespace ic
                 vkCmdPipelineBarrier(
                     cmd,
                     VK_PIPELINE_STAGE_TRANSFER_BIT,
-                    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                     0,
                     0,
                     nullptr,
@@ -4684,8 +4731,8 @@ namespace ic
                     nullptr);
             });
 
-        m_resourceAllocator.destroyBuffer(vertexStaging);
-        m_resourceAllocator.destroyBuffer(indexStaging);
+        m_retirementQueue.retire(std::move(vertexStaging));
+        m_retirementQueue.retire(std::move(indexStaging));
 
         uploaded.samplerDescriptorIndices.assign(
             model->samplers.size(),
@@ -5925,12 +5972,13 @@ namespace ic
 
     void VulkanBackend::onSwapchainRecreated()
     {
-        vkDeviceWaitIdle(m_device.device());
+        // VulkanSwapchain::recreate performs the single teardown idle wait.
+        // Recreate first so all queues are drained before immediate destruction
+        // of swapchain-dependent scene and pipeline objects.
+        m_swapchain.recreate();
         destroySceneResources();
         m_graphResourceRegistry.reset();
         m_pipelineManager.shutdown();
-
-        m_swapchain.recreate();
 
         if (!m_swapchain.validForRendering())
             return;
@@ -5959,4 +6007,3 @@ namespace ic
     }
 
 }
-

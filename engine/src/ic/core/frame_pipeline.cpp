@@ -4,7 +4,7 @@
 #include "ic/core/app_base.h"
 #include "ic/util/profiler.h"
 #include "ic/core/event_frame_buffer.h"
-#include "ic/core/memory/frame_arena.h"
+#include "ic/core/frame_memory/frame_arena.h"
 #include "ic/core/frame_context.h"
 
 

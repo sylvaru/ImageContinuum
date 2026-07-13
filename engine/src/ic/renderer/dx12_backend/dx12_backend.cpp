@@ -100,6 +100,10 @@ namespace ic
             m_resourceAllocator,
             m_descriptorSystem,
             framesInFlight);
+        m_uploadScheduler.init(
+            m_device, m_resourceAllocator, framesInFlight);
+        m_retirementQueue.init(
+            m_resourceAllocator, m_descriptorSystem, framesInFlight);
         m_pipelineManager.init(m_device);
         m_pipelineLibrary = &pipelineLibrary;
 
@@ -114,6 +118,8 @@ namespace ic
     void DX12Backend::shutdown()
     {
         m_frameExecutor.waitForGpu();
+        m_uploadScheduler.shutdown();
+        m_retirementQueue.drain();
 
         shutdownImGui();
         destroySceneResources();
@@ -135,19 +141,15 @@ namespace ic
         spdlog::info("[DX12Backend] Shutdown");
     }
 
-    void DX12Backend::execute(
+    bool DX12Backend::execute(
         const CompiledGraphPlan& plan,
+        const GraphExecutionContext& execution,
         const FrameContext& ctx,
         const SceneRenderView& scene)
     {
         if (!m_frameExecutor.ready())
         {
-            return;
-        }
-
-        if (planUsesPathTracing(plan))
-        {
-            m_frameExecutor.waitForGpu();
+            return false;
         }
 
         const uint32_t frameSlot =
@@ -155,6 +157,7 @@ namespace ic
                 ctx.frameIndex % m_frameExecutor.framesInFlight());
 
         m_frameExecutor.waitForFrame(frameSlot);
+        m_retirementQueue.beginFrame(frameSlot);
 
         if (!m_swapchain.updateSizeFromWindow())
         {
@@ -162,10 +165,11 @@ namespace ic
 
             if (!m_swapchain.validForRendering())
             {
-                return;
+                return false;
             }
         }
 
+        m_uploadScheduler.beginFrame(frameSlot);
         m_commandSystem.beginFrame(frameSlot);
 
         ID3D12Resource* swapchainImage =
@@ -189,6 +193,7 @@ namespace ic
         std::vector<ID3D12CommandList*> commandLists;
         executeGraph(
             plan,
+            execution,
             ctx,
             scene,
             swapchainImage,
@@ -199,18 +204,22 @@ namespace ic
             commandLists);
         m_device.logValidationMessages();
 
-        const bool presented =
-            m_frameExecutor.submitAndPresent(plan, commandLists, frameSlot);
+        const DX12UploadDependency uploadDependency =
+            m_uploadScheduler.flush();
+        const bool presented = m_frameExecutor.submitAndPresent(
+            plan, commandLists, frameSlot, uploadDependency);
 
         if (!presented)
         {
             recreateSwapchain();
         }
+        return presented;
     }
 
 
     void DX12Backend::executeGraph(
         const CompiledGraphPlan& plan,
+        const GraphExecutionContext& execution,
         const FrameContext& ctx,
         const SceneRenderView& scene,
         ID3D12Resource* swapchainImage,
@@ -261,13 +270,16 @@ namespace ic
                     node,
                     swapchainImage);
 
-                dispatchNode(
-                    plan,
-                    node,
-                    ctx,
-                    scene,
-                    cmd,
-                    swapchainImage);
+                if (execution.shouldExecute(node.nodeId))
+                {
+                    dispatchNode(
+                        plan,
+                        node,
+                        ctx,
+                        scene,
+                        cmd,
+                        swapchainImage);
+                }
 
                 if (node.nodeId < plan.nodeSchedules.size())
                 {
@@ -290,32 +302,6 @@ namespace ic
                                 true, false, node.queue);
                         }
                     }
-                }
-
-                for (const ResourceLifetime& lifetime :
-                     plan.resourceLifetimes)
-                {
-                    if (lifetime.lastUse != node.nodeId ||
-                        lifetime.resource >= plan.resources.size() ||
-                        plan.resources[lifetime.resource].ownership !=
-                            ResourceOwnership::Transient)
-                    {
-                        continue;
-                    }
-                    DX12GraphResourceEntry* entry =
-                        m_graphResourceRegistry.entry(lifetime.resource);
-                    if (!entry || entry->state == D3D12_RESOURCE_STATE_COMMON)
-                    {
-                        continue;
-                    }
-                    ID3D12Resource* resource =
-                        entry->type == GraphResourceType::Texture
-                            ? entry->texture.resource.Get()
-                            : entry->buffer.resource.Get();
-                    transitionResource(
-                        cmd, resource, entry->state,
-                        D3D12_RESOURCE_STATE_COMMON);
-                    entry->state = D3D12_RESOURCE_STATE_COMMON;
                 }
 
                 throwIfFailed(
@@ -411,12 +397,16 @@ namespace ic
                 break;
             }
         }
-        else if (DX12GraphResourceEntry* entry =
-                     m_graphResourceRegistry.entry(barrier.resource))
+        DX12GraphResourceEntry* graphEntry = nullptr;
+        if (resource.ownership != ResourceOwnership::Imported)
         {
-            dxResource = entry->type == GraphResourceType::Texture
-                ? entry->texture.resource.Get()
-                : entry->buffer.resource.Get();
+            graphEntry = m_graphResourceRegistry.entry(barrier.resource);
+            if (graphEntry)
+            {
+                dxResource = graphEntry->type == GraphResourceType::Texture
+                    ? graphEntry->texture.resource.Get()
+                    : graphEntry->buffer.resource.Get();
+            }
         }
 
         if (!dxResource)
@@ -427,22 +417,37 @@ namespace ic
             return;
         }
 
-        const D3D12_RESOURCE_STATES before =
-            (crossQueueAcquire || barrier.firstUse)
-            ? D3D12_RESOURCE_STATE_COMMON
-            : (resource.ownership == ResourceOwnership::Transient &&
-                m_graphResourceRegistry.entry(barrier.resource)
-                ? m_graphResourceRegistry.entry(barrier.resource)->state
-                : usageToState(barrier.oldUsage));
+        // Resolve the resource state for a usage on the queue this barrier is
+        // being recorded on. The compute queue cannot use the graphics-only
+        // PIXEL_SHADER_RESOURCE bit, so a sampled read there resolves to the
+        // non-pixel state only.
+        //
+        // Graph allocations persist across frames, so the compiled first-use
+        // state is only correct immediately after materialization. Carry the
+        // native state in the registry thereafter. Resource-conflicting nodes
+        // and read-only usage changes have compiler dependencies, so updates
+        // for one resource occur in sequential recording levels.
+        auto stateForUsage =
+            [&](ResourceUsage usage) -> D3D12_RESOURCE_STATES
+            {
+                if (commandQueue == QueueType::Compute &&
+                    usage == ResourceUsage::SampledTexture)
+                {
+                    return D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                }
+                return usageToState(usage);
+            };
 
-        D3D12_RESOURCE_STATES after = crossQueueRelease
+        const bool tracked = graphEntry != nullptr;
+        const D3D12_RESOURCE_STATES before = tracked
+            ? graphEntry->state
+            : (crossQueueAcquire || barrier.firstUse)
             ? D3D12_RESOURCE_STATE_COMMON
-            : usageToState(barrier.newUsage);
-        if (!crossQueueRelease && commandQueue == QueueType::Compute &&
-            barrier.newUsage == ResourceUsage::SampledTexture)
-        {
-            after = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        }
+            : stateForUsage(barrier.oldUsage);
+
+        const D3D12_RESOURCE_STATES after = crossQueueRelease
+            ? D3D12_RESOURCE_STATE_COMMON
+            : stateForUsage(barrier.newUsage);
 
         if (before == after)
         {
@@ -455,6 +460,7 @@ namespace ic
                 uav.UAV.pResource = dxResource;
                 cmd->ResourceBarrier(1, &uav);
             }
+            if (tracked) graphEntry->state = after;
             return;
         }
 
@@ -463,15 +469,7 @@ namespace ic
             dxResource,
             before,
             after);
-
-        if (resource.ownership == ResourceOwnership::Transient)
-        {
-            if (DX12GraphResourceEntry* entry =
-                    m_graphResourceRegistry.entry(barrier.resource))
-            {
-                entry->state = after;
-            }
-        }
+        if (tracked) graphEntry->state = after;
 
     }
 
@@ -523,6 +521,15 @@ namespace ic
                 ? std::get_if<GraphicsPassData>(
                     &plan.payloads[node.payloadIndex])
                 : nullptr;
+        const bool usesClusterData =
+            nodeUsesResourceSemantic(
+                plan, node, GraphResourceSemantic::ClusterBounds) ||
+            nodeUsesResourceSemantic(
+                plan, node, GraphResourceSemantic::ClusterLightGrid) ||
+            nodeUsesResourceSemantic(
+                plan, node, GraphResourceSemantic::ClusterLightIndices) ||
+            nodeUsesResourceSemantic(
+                plan, node, GraphResourceSemantic::ClusterLightCounter);
 
         const bool hasColorTarget =
             pipeline->desc.colorAttachmentCount > 0;
@@ -542,7 +549,7 @@ namespace ic
 
         const D3D12_CPU_DESCRIPTOR_HANDLE rtv =
             useGraphAttachments &&
-                colorEntry && colorEntry->ownership == ResourceOwnership::Transient &&
+                colorEntry && colorEntry->ownership != ResourceOwnership::Imported &&
                 colorEntry->rtv.valid()
                 ? colorEntry->rtv.cpuStart
                 : m_swapchain.currentRtv();
@@ -580,7 +587,7 @@ namespace ic
 
         const D3D12_CPU_DESCRIPTOR_HANDLE dsv =
             useGraphAttachments &&
-                depthEntry && depthEntry->ownership == ResourceOwnership::Transient &&
+                depthEntry && depthEntry->ownership != ResourceOwnership::Imported &&
                 depthEntry->dsv.valid()
                 ? depthEntry->dsv.cpuStart
                 : m_depthDsv.cpuStart;
@@ -659,7 +666,8 @@ namespace ic
         cmd->SetGraphicsRootSignature(pipeline->rootSignature.Get());
         cmd->SetPipelineState(pipeline->pipelineState.Get());
         if (pipeline->desc.bindingLayout ==
-            PipelineBindingLayoutKind::ClusteredForward)
+                PipelineBindingLayoutKind::ClusteredForward &&
+            usesClusterData)
         {
             bindClusteredForwardGraphics(*pipeline, ctx, cmd);
         }
@@ -695,9 +703,6 @@ namespace ic
                     9,
                     m_environmentResources.sampler.gpuStart);
             }
-            cmd->SetGraphicsRootShaderResourceView(
-                10,
-                m_gpuScene.drawMetadata.gpuAddress);
         }
         cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
@@ -708,13 +713,10 @@ namespace ic
             &unusedFallbackConstants,
             0);
 
-        // DX12 command consumption remains behind this guard while the
-        // command-signature/root-constant contract is validated on all
-        // supported drivers. Culling and command generation stay active.
-        constexpr bool enableDx12IndirectConsumption = false;
+        ID3D12CommandSignature* indirectSignature =
+            m_gpuScene.indirectCommandSignature(pipeline->rootSignature.Get());
         const bool useGpuDriven =
-            enableDx12IndirectConsumption &&
-            m_gpuScene.indexedIndirectCommandSignature &&
+            indirectSignature &&
             m_gpuScene.indirectArguments &&
             m_gpuScene.binCounts &&
             !m_gpuScene.geometryBins().empty();
@@ -740,24 +742,14 @@ namespace ic
                 m_gpuScene.binCountsState =
                     D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
             }
-            if (m_gpuScene.drawMetadataState !=
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
-            {
-                transitionResource(cmd,
-                    m_gpuScene.drawMetadata.resource.Get(),
-                    m_gpuScene.drawMetadataState,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                m_gpuScene.drawMetadataState =
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-            }
         }
 
         DX12IndirectDrawStream indirectStream{};
-        indirectStream.commandSignature =
-            m_gpuScene.indexedIndirectCommandSignature.Get();
+        indirectStream.commandSignature = indirectSignature;
         indirectStream.indirectArguments =
             m_gpuScene.indirectArguments.resource.Get();
         indirectStream.binCounts = m_gpuScene.binCounts.resource.Get();
+        indirectStream.commandStride = sizeof(DX12GpuIndexedIndirectCommand);
 
         // Shared by the depth prepass and the forward pass: both pipelines
         // route scene geometry through this same recorder (see
@@ -773,6 +765,52 @@ namespace ic
                 auto it = m_uploadedModels.find(handle);
                 return it != m_uploadedModels.end() ? &it->second : nullptr;
             });
+
+        // Backend-owned GPU-scene buffers are represented by graph dependency
+        // tokens, but are not allocated by the graph registry. Return every
+        // resource that crosses to the compute queue to COMMON on the queue
+        // that last used it; the graph fence wait then makes the handoff legal.
+        if (useGpuDriven)
+        {
+            if (m_gpuScene.indirectArgumentsState != D3D12_RESOURCE_STATE_COMMON)
+            {
+                transitionResource(
+                    cmd, m_gpuScene.indirectArguments.resource.Get(),
+                    m_gpuScene.indirectArgumentsState,
+                    D3D12_RESOURCE_STATE_COMMON);
+                m_gpuScene.indirectArgumentsState = D3D12_RESOURCE_STATE_COMMON;
+            }
+            if (m_gpuScene.binCountsState != D3D12_RESOURCE_STATE_COMMON)
+            {
+                transitionResource(
+                    cmd, m_gpuScene.binCounts.resource.Get(),
+                    m_gpuScene.binCountsState, D3D12_RESOURCE_STATE_COMMON);
+                m_gpuScene.binCountsState = D3D12_RESOURCE_STATE_COMMON;
+            }
+        }
+
+        if (pipeline->desc.bindingLayout ==
+                PipelineBindingLayoutKind::ClusteredForward &&
+            usesClusterData)
+        {
+            ID3D12Resource* resources[] = {
+                m_clusteredForwardResources.clusterBounds.resource.Get(),
+                m_clusteredForwardResources.clusterLightGrid.resource.Get(),
+                m_clusteredForwardResources.clusterLightIndices.resource.Get(),
+                m_clusteredForwardResources.clusterLightCounter.resource.Get() };
+            D3D12_RESOURCE_STATES* states[] = {
+                &m_clusteredForwardResources.boundsState,
+                &m_clusteredForwardResources.gridState,
+                &m_clusteredForwardResources.indicesState,
+                &m_clusteredForwardResources.counterState };
+            for (uint32_t i = 0; i < std::size(resources); ++i)
+            {
+                transitionResource(
+                    cmd, resources[i], *states[i],
+                    D3D12_RESOURCE_STATE_COMMON);
+                *states[i] = D3D12_RESOURCE_STATE_COMMON;
+            }
+        }
     }
 
     void DX12Backend::executeComputeNode(
@@ -910,9 +948,6 @@ namespace ic
             cull.indirectArguments = g.indirectArguments.resource.Get();
             cull.indirectArgumentsState = &g.indirectArgumentsState;
             cull.indirectArgumentsAddr = g.indirectArguments.gpuAddress;
-            cull.drawMetadata = g.drawMetadata.resource.Get();
-            cull.drawMetadataState = &g.drawMetadataState;
-            cull.drawMetadataAddr = g.drawMetadata.gpuAddress;
             cull.binCounts = g.binCounts.resource.Get();
             cull.binCountsState = &g.binCountsState;
             cull.binCountsAddr = g.binCounts.gpuAddress;
@@ -970,27 +1005,32 @@ namespace ic
         else if (pipeline->desc.bindingLayout ==
             PipelineBindingLayoutKind::ClusteredForward)
         {
-            D3D12_RESOURCE_BARRIER barriers[4]{};
-            ID3D12Resource* resources[] =
-            {
+            ID3D12Resource* resources[] = {
                 m_clusteredForwardResources.clusterBounds.resource.Get(),
                 m_clusteredForwardResources.clusterLightGrid.resource.Get(),
                 m_clusteredForwardResources.clusterLightIndices.resource.Get(),
-                m_clusteredForwardResources.clusterLightCounter.resource.Get()
-            };
-            for (uint32_t i = 0; i < static_cast<uint32_t>(std::size(barriers)); ++i)
+                m_clusteredForwardResources.clusterLightCounter.resource.Get() };
+            D3D12_RESOURCE_STATES* states[] = {
+                &m_clusteredForwardResources.boundsState,
+                &m_clusteredForwardResources.gridState,
+                &m_clusteredForwardResources.indicesState,
+                &m_clusteredForwardResources.counterState };
+            for (uint32_t i = 0; i < std::size(resources); ++i)
             {
-                barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                barriers[i].UAV.pResource = resources[i];
+                D3D12_RESOURCE_BARRIER uav{};
+                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uav.UAV.pResource = resources[i];
+                cmd->ResourceBarrier(1, &uav);
+                transitionResource(
+                    cmd, resources[i], *states[i],
+                    D3D12_RESOURCE_STATE_COMMON);
+                *states[i] = D3D12_RESOURCE_STATE_COMMON;
             }
-            cmd->ResourceBarrier(
-                static_cast<UINT>(std::size(barriers)),
-                barriers);
         }
         else if (pipeline->desc.bindingLayout ==
             PipelineBindingLayoutKind::GpuFrustumCull)
         {
-            D3D12_RESOURCE_BARRIER barriers[5]{};
+            D3D12_RESOURCE_BARRIER barriers[4]{};
             barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
             barriers[0].UAV.pResource =
                 m_gpuScene.visibleInstances.resource.Get();
@@ -1002,11 +1042,25 @@ namespace ic
                 m_gpuScene.indirectArguments.resource.Get();
             barriers[3].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
             barriers[3].UAV.pResource =
-                m_gpuScene.drawMetadata.resource.Get();
-            barriers[4].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barriers[4].UAV.pResource =
                 m_gpuScene.binCounts.resource.Get();
-            cmd->ResourceBarrier(5, barriers);
+            cmd->ResourceBarrier(4, barriers);
+            ID3D12Resource* resources[] = {
+                m_gpuScene.visibleInstances.resource.Get(),
+                m_gpuScene.visibleInstanceCount.resource.Get(),
+                m_gpuScene.indirectArguments.resource.Get(),
+                m_gpuScene.binCounts.resource.Get() };
+            D3D12_RESOURCE_STATES* states[] = {
+                &m_gpuScene.visibleInstancesState,
+                &m_gpuScene.visibleInstanceCountState,
+                &m_gpuScene.indirectArgumentsState,
+                &m_gpuScene.binCountsState };
+            for (uint32_t i = 0; i < std::size(resources); ++i)
+            {
+                transitionResource(
+                    cmd, resources[i], *states[i],
+                    D3D12_RESOURCE_STATE_COMMON);
+                *states[i] = D3D12_RESOURCE_STATE_COMMON;
+            }
             readbackVisibleInstanceCount(ctx, cmd);
         }
     }
@@ -1483,9 +1537,43 @@ namespace ic
             return;
         }
 
-        if (pass->name == "PathTracer.CopyToBackBuffer" &&
-            m_pathTraceResources.tonemap &&
-            swapchainImage)
+        if (pass->source >= plan.resources.size() ||
+            pass->destination >= plan.resources.size())
+        {
+            spdlog::error("Transfer pass '{}' has invalid graph resources", pass->name);
+            return;
+        }
+
+        const GraphResource& sourceDesc = plan.resources[pass->source];
+        const GraphResource& destinationDesc = plan.resources[pass->destination];
+        auto resolve = [&](const GraphResource& resource) -> ID3D12Resource*
+        {
+            if (resource.imported == ImportedResource::Swapchain)
+            {
+                return swapchainImage;
+            }
+            if (resource.semantic == GraphResourceSemantic::PathTraceTonemap)
+            {
+                return m_pathTraceResources.tonemap
+                    ? m_pathTraceResources.tonemap.resource.Get() : nullptr;
+            }
+            return m_graphResourceRegistry.nativeResource(resource.id);
+        };
+
+        ID3D12Resource* source = resolve(sourceDesc);
+        ID3D12Resource* destination = resolve(destinationDesc);
+        if (!source || !destination)
+        {
+            spdlog::error("Transfer pass '{}' could not resolve its resources", pass->name);
+            return;
+        }
+        if (sourceDesc.type != destinationDesc.type)
+        {
+            spdlog::error("Transfer pass '{}' cannot copy between resource types", pass->name);
+            return;
+        }
+
+        if (sourceDesc.semantic == GraphResourceSemantic::PathTraceTonemap)
         {
             if (m_pathTraceResources.tonemapState !=
                 D3D12_RESOURCE_STATE_COPY_SOURCE)
@@ -1499,10 +1587,35 @@ namespace ic
                     D3D12_RESOURCE_STATE_COPY_SOURCE;
             }
 
-            cmd->CopyResource(
-                swapchainImage,
-                m_pathTraceResources.tonemap.resource.Get());
         }
+
+        const D3D12_RESOURCE_DESC sourceNativeDesc = source->GetDesc();
+        const D3D12_RESOURCE_DESC destinationNativeDesc = destination->GetDesc();
+        if (sourceDesc.type == GraphResourceType::Buffer)
+        {
+            cmd->CopyBufferRegion(
+                destination,
+                0,
+                source,
+                0,
+                std::min(sourceNativeDesc.Width, destinationNativeDesc.Width));
+            return;
+        }
+
+        if (sourceNativeDesc.Dimension != destinationNativeDesc.Dimension ||
+            sourceNativeDesc.Width != destinationNativeDesc.Width ||
+            sourceNativeDesc.Height != destinationNativeDesc.Height ||
+            sourceNativeDesc.DepthOrArraySize != destinationNativeDesc.DepthOrArraySize ||
+            sourceNativeDesc.MipLevels != destinationNativeDesc.MipLevels ||
+            sourceNativeDesc.Format != destinationNativeDesc.Format ||
+            sourceNativeDesc.SampleDesc.Count != destinationNativeDesc.SampleDesc.Count)
+        {
+            spdlog::error(
+                "Transfer pass '{}' requires matching texture descriptions",
+                pass->name);
+            return;
+        }
+        cmd->CopyResource(destination, source);
     }
 
     GraphicsPipelineHandle DX12Backend::pipelineForNode(
@@ -1805,15 +1918,7 @@ namespace ic
     void DX12Backend::uploadPathTraceScene(
         const PathTraceSceneData& sceneData)
     {
-        if (m_pathTraceResources.sceneVertices ||
-            m_pathTraceResources.sceneMaterials ||
-            m_pathTraceResources.sceneTriangles ||
-            m_pathTraceResources.sceneBvhNodes)
-        {
-            m_frameExecutor.waitForGpu();
-        }
-
-        destroyPathTraceSceneResources();
+        retirePathTraceSceneResources();
 
         m_pathTraceResources.sceneVertexCount =
             static_cast<uint32_t>(sceneData.vertices.size());
@@ -1940,61 +2045,36 @@ namespace ic
 
         if (!pendingUploads.empty())
         {
-            Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
-            throwIfFailed(
-                m_device.device()->CreateCommandAllocator(
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    IID_PPV_ARGS(&allocator)),
-                "Failed to create DX12 path trace upload allocator.");
-
-            Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd;
-            throwIfFailed(
-                m_device.device()->CreateCommandList(
-                    0,
-                    D3D12_COMMAND_LIST_TYPE_DIRECT,
-                    allocator.Get(),
-                    nullptr,
-                    IID_PPV_ARGS(&cmd)),
-                "Failed to create DX12 path trace upload command list.");
-
-            for (PendingSceneUpload& upload : pendingUploads)
-            {
-                transitionResource(
-                    cmd.Get(),
-                    upload.destination->resource.Get(),
-                    D3D12_RESOURCE_STATE_COMMON,
-                    D3D12_RESOURCE_STATE_COPY_DEST);
-
-                cmd->CopyBufferRegion(
-                    upload.destination->resource.Get(),
-                    0,
-                    upload.staging.resource.Get(),
-                    0,
-                    upload.byteSize);
-
-                transitionResource(
-                    cmd.Get(),
-                    upload.destination->resource.Get(),
-                    D3D12_RESOURCE_STATE_COPY_DEST,
-                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-            }
-
-            throwIfFailed(
-                cmd->Close(),
-                "Failed to close DX12 path trace upload command list.");
-
-            ID3D12CommandList* lists[] = { cmd.Get() };
-            m_device.graphicsQueue()->ExecuteCommandLists(1, lists);
-            m_frameExecutor.waitForGpu();
+            m_uploadScheduler.record(
+                [&](ID3D12GraphicsCommandList4* cmd)
+                {
+                    for (const PendingSceneUpload& upload : pendingUploads)
+                    {
+                        transitionResource(
+                            cmd,
+                            upload.destination->resource.Get(),
+                            D3D12_RESOURCE_STATE_COMMON,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+                        cmd->CopyBufferRegion(
+                            upload.destination->resource.Get(),
+                            0,
+                            upload.staging.resource.Get(),
+                            0,
+                            upload.byteSize);
+                        transitionResource(
+                            cmd,
+                            upload.destination->resource.Get(),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    }
+                });
 
             for (PendingSceneUpload& upload : pendingUploads)
             {
-                m_resourceAllocator.destroyBuffer(upload.staging);
+                m_uploadScheduler.retire(std::move(upload.staging));
             }
         }
 
-        m_descriptorSystem.releaseResourceDescriptors(
-            m_pathTraceResources.sceneSrvs);
         m_pathTraceResources.sceneSrvs =
             m_descriptorSystem.allocateResourceDescriptors(5);
 
@@ -2066,6 +2146,20 @@ namespace ic
         m_pathTraceResources.sceneTriangleCount = 0;
         m_pathTraceResources.sceneBvhNodeCount = 0;
         m_pathTraceResources.firstEmissiveTriangleIndex = UINT32_MAX;
+    }
+
+    void DX12Backend::retirePathTraceSceneResources()
+    {
+        m_retirementQueue.retire(
+            std::move(m_pathTraceResources.sceneVertices));
+        m_retirementQueue.retire(
+            std::move(m_pathTraceResources.sceneMaterials));
+        m_retirementQueue.retire(
+            std::move(m_pathTraceResources.sceneTriangles));
+        m_retirementQueue.retire(
+            std::move(m_pathTraceResources.sceneBvhNodes));
+        m_retirementQueue.retire(m_pathTraceResources.sceneSrvs);
+        m_pathTraceResources.sceneSrvs = {};
     }
 
     void DX12Backend::destroyPathTraceResources()
@@ -2171,6 +2265,12 @@ namespace ic
 
     void DX12Backend::ensureClusteredForwardResources()
     {
+        // Recording jobs for other nodes (e.g. GpuFrustumCull) may call this
+        // redundantly from worker threads while a resize is in flight on the
+        // main thread; the check-then-destroy-then-recreate sequence below is
+        // not atomic on its own, so serialize the whole thing.
+        std::lock_guard<std::mutex> lock(m_clusteredForwardResourcesMutex);
+
         const uint32_t width = std::max(1u, m_swapchain.width());
         const uint32_t height = std::max(1u, m_swapchain.height());
         const uint32_t clusterCountX =
@@ -2321,31 +2421,23 @@ namespace ic
         DX12GpuSceneFrameResources& frameResources =
             m_gpuScene.frameResources(frameSlot);
 
-        auto transitionClusterBuffer =
-            [&](DX12Buffer& buffer, D3D12_RESOURCE_STATES& state)
-            {
-                if (state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-                {
-                    transitionResource(
-                        cmd,
-                        buffer.resource.Get(),
-                        state,
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                    state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                }
-            };
-        transitionClusterBuffer(
-            m_clusteredForwardResources.clusterBounds,
-            m_clusteredForwardResources.boundsState);
-        transitionClusterBuffer(
-            m_clusteredForwardResources.clusterLightGrid,
-            m_clusteredForwardResources.gridState);
-        transitionClusterBuffer(
-            m_clusteredForwardResources.clusterLightIndices,
-            m_clusteredForwardResources.indicesState);
-        transitionClusterBuffer(
-            m_clusteredForwardResources.clusterLightCounter,
-            m_clusteredForwardResources.counterState);
+        ID3D12Resource* clusterResources[] = {
+            m_clusteredForwardResources.clusterBounds.resource.Get(),
+            m_clusteredForwardResources.clusterLightGrid.resource.Get(),
+            m_clusteredForwardResources.clusterLightIndices.resource.Get(),
+            m_clusteredForwardResources.clusterLightCounter.resource.Get() };
+        D3D12_RESOURCE_STATES* clusterStates[] = {
+            &m_clusteredForwardResources.boundsState,
+            &m_clusteredForwardResources.gridState,
+            &m_clusteredForwardResources.indicesState,
+            &m_clusteredForwardResources.counterState };
+        for (uint32_t i = 0; i < std::size(clusterResources); ++i)
+        {
+            transitionResource(
+                cmd, clusterResources[i], *clusterStates[i],
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            *clusterStates[i] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
 
         ID3D12DescriptorHeap* heaps[] =
         {
@@ -2387,6 +2479,25 @@ namespace ic
         const FrameContext& ctx,
         ID3D12GraphicsCommandList4* cmd)
     {
+        ID3D12Resource* clusterResources[] = {
+            m_clusteredForwardResources.clusterBounds.resource.Get(),
+            m_clusteredForwardResources.clusterLightGrid.resource.Get(),
+            m_clusteredForwardResources.clusterLightIndices.resource.Get() };
+        D3D12_RESOURCE_STATES* clusterStates[] = {
+            &m_clusteredForwardResources.boundsState,
+            &m_clusteredForwardResources.gridState,
+            &m_clusteredForwardResources.indicesState };
+        constexpr D3D12_RESOURCE_STATES shaderReadState =
+            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        for (uint32_t i = 0; i < std::size(clusterResources); ++i)
+        {
+            transitionResource(
+                cmd, clusterResources[i], *clusterStates[i],
+                shaderReadState);
+            *clusterStates[i] = shaderReadState;
+        }
+
         const uint32_t frameSlot =
             static_cast<uint32_t>(ctx.frameIndex % m_gpuScene.frameSlotCount());
         DX12GpuSceneFrameResources& frameResources =
@@ -2421,21 +2532,9 @@ namespace ic
                 9,
                 m_environmentResources.sampler.gpuStart);
         }
-        cmd->SetGraphicsRootUnorderedAccessView(
-            10,
-            m_clusteredForwardResources.clusterBounds.gpuAddress);
-        cmd->SetGraphicsRootUnorderedAccessView(
-            11,
-            m_clusteredForwardResources.clusterLightGrid.gpuAddress);
-        cmd->SetGraphicsRootUnorderedAccessView(
-            12,
-            m_clusteredForwardResources.clusterLightIndices.gpuAddress);
         cmd->SetGraphicsRootShaderResourceView(
             13,
             frameResources.visibleLights.gpuAddress);
-        cmd->SetGraphicsRootUnorderedAccessView(
-            14,
-            m_clusteredForwardResources.clusterLightCounter.gpuAddress);
         cmd->SetGraphicsRootShaderResourceView(
             15,
             m_clusteredForwardResources.clusterBounds.gpuAddress);
@@ -2445,9 +2544,6 @@ namespace ic
         cmd->SetGraphicsRootShaderResourceView(
             17,
             m_clusteredForwardResources.clusterLightIndices.gpuAddress);
-        cmd->SetGraphicsRootShaderResourceView(
-            18,
-            m_gpuScene.drawMetadata.gpuAddress);
     }
 
     void DX12Backend::destroyClusteredForwardResources()
@@ -2851,12 +2947,6 @@ namespace ic
 
             try
             {
-                (void)requestTexture(
-                    request.desc.sourceEnvironment,
-                    0,
-                    *image,
-                    TextureTransferFunction::Linear);
-
                 SceneRenderView bakeScene{};
                 bakeScene.environment.equirectTexture =
                     request.desc.sourceEnvironment;
@@ -2891,6 +2981,16 @@ namespace ic
                         nullptr,
                         IID_PPV_ARGS(&cmd)),
                     "Failed to create DX12 IBL bake command list.");
+
+                // IBL baking is a synchronous result-producing API. Record its
+                // source upload into the same direct list so the conversion
+                // dispatch is ordered without a separate queue submit or wait.
+                (void)requestTexture(
+                    request.desc.sourceEnvironment,
+                    0,
+                    *image,
+                    TextureTransferFunction::Linear,
+                    cmd.Get());
 
                 (void)ensureEnvironmentResources(
                     ctx,
@@ -3206,6 +3306,9 @@ namespace ic
             }
             catch (const std::exception& e)
             {
+                // IBL requests execute outside the normal frame validation
+                // drain, so surface any API diagnostics at the failure site.
+                m_device.logValidationMessages();
                 result.success = false;
                 result.error = e.what();
             }
@@ -3220,7 +3323,8 @@ namespace ic
         AssetHandle modelHandle,
         uint32_t imageIndex,
         const ImageAsset& image,
-        TextureTransferFunction transfer)
+        TextureTransferFunction transfer,
+        ID3D12GraphicsCommandList4* immediateCommandList)
     {
         const uint64_t key = uploadedTextureKey(modelHandle, imageIndex, transfer);
         if (auto it = m_uploadedTextures.find(key);
@@ -3284,59 +3388,59 @@ namespace ic
                 static_cast<size_t>(tightRowBytes));
         }
 
-        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
-        throwIfFailed(
-            m_device.device()->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                IID_PPV_ARGS(&allocator)),
-            "Failed to create DX12 texture upload allocator.");
+        auto recordUpload =
+            [&](ID3D12GraphicsCommandList4* cmd, bool forCopyQueue)
+            {
+                if (!forCopyQueue)
+                {
+                    transitionResource(
+                        cmd,
+                        uploaded.texture.resource.Get(),
+                        uploaded.texture.initialState,
+                        D3D12_RESOURCE_STATE_COPY_DEST);
+                }
 
-        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd;
-        throwIfFailed(
-            m_device.device()->CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                allocator.Get(),
-                nullptr,
-                IID_PPV_ARGS(&cmd)),
-            "Failed to create DX12 texture upload command list.");
+                D3D12_TEXTURE_COPY_LOCATION dstLocation{};
+                dstLocation.pResource = uploaded.texture.resource.Get();
+                dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 
-        transitionResource(
-            cmd.Get(),
-            uploaded.texture.resource.Get(),
-            uploaded.texture.initialState,
-            D3D12_RESOURCE_STATE_COPY_DEST);
+                D3D12_TEXTURE_COPY_LOCATION srcLocation{};
+                srcLocation.pResource = staging.resource.Get();
+                srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                srcLocation.PlacedFootprint = footprint;
 
-        D3D12_TEXTURE_COPY_LOCATION dstLocation{};
-        dstLocation.pResource = uploaded.texture.resource.Get();
-        dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-
-        D3D12_TEXTURE_COPY_LOCATION srcLocation{};
-        srcLocation.pResource = staging.resource.Get();
-        srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        srcLocation.PlacedFootprint = footprint;
-
-        cmd->CopyTextureRegion(&dstLocation, 0, 0, 0, &srcLocation, nullptr);
-
-        transitionResource(
-            cmd.Get(),
-            uploaded.texture.resource.Get(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        uploaded.state =
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-
-        throwIfFailed(
-            cmd->Close(),
-            "Failed to close DX12 texture upload command list.");
-
-        ID3D12CommandList* lists[] = { cmd.Get() };
-        m_device.graphicsQueue()->ExecuteCommandLists(1, lists);
-        m_frameExecutor.waitForGpu();
-
-        m_resourceAllocator.destroyBuffer(staging);
+                cmd->CopyTextureRegion(
+                    &dstLocation, 0, 0, 0, &srcLocation, nullptr);
+                if (!forCopyQueue)
+                {
+                    transitionResource(
+                        cmd,
+                        uploaded.texture.resource.Get(),
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                }
+            };
+        if (immediateCommandList)
+        {
+            recordUpload(immediateCommandList, false);
+            uploaded.state =
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            m_retirementQueue.retire(std::move(staging));
+        }
+        else
+        {
+            m_uploadScheduler.record(
+                [&](ID3D12GraphicsCommandList4* cmd)
+                {
+                    recordUpload(cmd, false);
+                });
+            uploaded.state =
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            m_uploadScheduler.retire(std::move(staging));
+        }
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
         srv.Shader4ComponentMapping =
@@ -3496,68 +3600,44 @@ namespace ic
                 .debugName = "DX12 model index buffer"
             });
 
-        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
-        throwIfFailed(
-            m_device.device()->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                IID_PPV_ARGS(&allocator)),
-            "Failed to create DX12 model upload allocator.");
-
-        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList4> cmd;
-        throwIfFailed(
-            m_device.device()->CreateCommandList(
-                0,
-                D3D12_COMMAND_LIST_TYPE_DIRECT,
-                allocator.Get(),
-                nullptr,
-                IID_PPV_ARGS(&cmd)),
-            "Failed to create DX12 model upload command list.");
-
-        transitionResource(
-            cmd.Get(),
-            uploaded.vertexBuffer.resource.Get(),
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_COPY_DEST);
-        transitionResource(
-            cmd.Get(),
-            uploaded.indexBuffer.resource.Get(),
-            D3D12_RESOURCE_STATE_COMMON,
-            D3D12_RESOURCE_STATE_COPY_DEST);
-
-        cmd->CopyBufferRegion(
-            uploaded.vertexBuffer.resource.Get(),
-            0,
-            vertexStaging.resource.Get(),
-            0,
-            vertexBytes);
-        cmd->CopyBufferRegion(
-            uploaded.indexBuffer.resource.Get(),
-            0,
-            indexStaging.resource.Get(),
-            0,
-            indexBytes);
-
-        transitionResource(
-            cmd.Get(),
-            uploaded.vertexBuffer.resource.Get(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
-        transitionResource(
-            cmd.Get(),
-            uploaded.indexBuffer.resource.Get(),
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            D3D12_RESOURCE_STATE_INDEX_BUFFER);
-
-        throwIfFailed(
-            cmd->Close(),
-            "Failed to close DX12 model upload command list.");
-
-        ID3D12CommandList* lists[] = { cmd.Get() };
-        m_device.graphicsQueue()->ExecuteCommandLists(1, lists);
-        m_frameExecutor.waitForGpu();
-
-        m_resourceAllocator.destroyBuffer(vertexStaging);
-        m_resourceAllocator.destroyBuffer(indexStaging);
+        m_uploadScheduler.record(
+            [&](ID3D12GraphicsCommandList4* cmd)
+            {
+                transitionResource(
+                    cmd,
+                    uploaded.vertexBuffer.resource.Get(),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+                transitionResource(
+                    cmd,
+                    uploaded.indexBuffer.resource.Get(),
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
+                cmd->CopyBufferRegion(
+                    uploaded.vertexBuffer.resource.Get(),
+                    0,
+                    vertexStaging.resource.Get(),
+                    0,
+                    vertexBytes);
+                cmd->CopyBufferRegion(
+                    uploaded.indexBuffer.resource.Get(),
+                    0,
+                    indexStaging.resource.Get(),
+                    0,
+                    indexBytes);
+                transitionResource(
+                    cmd,
+                    uploaded.vertexBuffer.resource.Get(),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+                transitionResource(
+                    cmd,
+                    uploaded.indexBuffer.resource.Get(),
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    D3D12_RESOURCE_STATE_INDEX_BUFFER);
+            });
+        m_uploadScheduler.retire(std::move(vertexStaging));
+        m_uploadScheduler.retire(std::move(indexStaging));
 
         uploaded.samplerDescriptorIndices.assign(
             model->samplers.size(),
@@ -3793,9 +3873,8 @@ namespace ic
                 frameData.cullingConfig = glm::uvec4(
                     std::min<uint32_t>(
                         instanceBoundsCount, ClusteredForwardMaxGpuCullInstances),
-                    // DX12 currently consumes direct draws while ExecuteIndirect
-                    // is guarded. Keep graphics shaders on their root-constant
-                    // path.
+                    // DX12 commands deliver draw identity through root
+                    // constants; Vulkan uses firstInstance + metadata.
                     0u,
                     geometryBinCount,
                     0u);

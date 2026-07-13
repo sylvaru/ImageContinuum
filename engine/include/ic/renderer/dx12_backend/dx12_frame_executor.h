@@ -2,9 +2,11 @@
 
 #include "ic/renderer/dx12_backend/dx12_device.h"
 #include "ic/renderer/dx12_backend/dx12_swapchain.h"
+#include "ic/renderer/dx12_backend/dx12_upload_scheduler.h"
 #include "ic/renderer/frame_graph/compiled_graph_plan.h"
 
 #include <cstdint>
+#include <array>
 #include <vector>
 
 #include <d3d12.h>
@@ -58,7 +60,8 @@ namespace ic
         bool submitAndPresent(
             const CompiledGraphPlan& plan,
             const std::vector<ID3D12CommandList*>& commandLists,
-            uint32_t frameSlot);
+            uint32_t frameSlot,
+            const DX12UploadDependency& uploadDependency = {});
 
     private:
         struct FrameSync
@@ -69,8 +72,10 @@ namespace ic
         const DX12Device* m_device = nullptr;
         DX12Swapchain* m_swapchain = nullptr;
         Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
+        std::array<Microsoft::WRL::ComPtr<ID3D12Fence>, 3> m_queueFences;
         HANDLE m_fenceEvent = nullptr;
         uint64_t m_nextFenceValue = 1;
+        std::array<uint64_t, 3> m_nextQueueFenceValues{ 1, 1, 1 };
         uint64_t m_lastGraphCompletionValue = 0;
         std::vector<FrameSync> m_frameSync;
     };

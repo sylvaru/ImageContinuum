@@ -13,11 +13,14 @@
 #include "ic/renderer/dx12_backend/dx12_graph_resource_registry.h"
 #include "ic/renderer/dx12_backend/dx12_frame_executor.h"
 #include "ic/renderer/dx12_backend/dx12_gpu_scene.h"
+#include "ic/renderer/dx12_backend/dx12_retirement_queue.h"
+#include "ic/renderer/dx12_backend/dx12_upload_scheduler.h"
 #include "ic/renderer/renderer_gpu_assets.h"
 #include "ic/renderer/path_tracing/path_tracer_types.h"
 
 #include <d3d12.h>
 #include <glm/glm.hpp>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -38,8 +41,9 @@ namespace ic
 
         void shutdown() override;
 
-        void execute(
+        [[nodiscard]] bool execute(
             const CompiledGraphPlan& plan,
+            const GraphExecutionContext& execution,
             const FrameContext& ctx,
             const SceneRenderView& scene) override;
 
@@ -184,6 +188,7 @@ namespace ic
 
         void executeGraph(
             const CompiledGraphPlan& plan,
+            const GraphExecutionContext& execution,
             const FrameContext& ctx,
             const SceneRenderView& scene,
             ID3D12Resource* swapchainImage,
@@ -268,6 +273,7 @@ namespace ic
             const SceneRenderView& scene);
         void destroyPathTraceResources();
         void destroyPathTraceSceneResources();
+        void retirePathTraceSceneResources();
         void uploadPathTraceScene(const PathTraceSceneData& sceneData);
         void updatePathTraceDescriptors();
         bool ensureEnvironmentResources(
@@ -313,7 +319,8 @@ namespace ic
             AssetHandle modelHandle,
             uint32_t imageIndex,
             const ImageAsset& image,
-            TextureTransferFunction transfer);
+            TextureTransferFunction transfer,
+            ID3D12GraphicsCommandList4* immediateCommandList = nullptr);
 
         uint32_t requestSampler(const SamplerAsset* sampler);
 
@@ -360,6 +367,7 @@ namespace ic
         D3D12_RESOURCE_STATES m_computeTestBufferState =
             D3D12_RESOURCE_STATE_COMMON;
         ClusteredForwardResources m_clusteredForwardResources;
+        std::mutex m_clusteredForwardResourcesMutex;
         PathTraceResources m_pathTraceResources;
         EnvironmentResources m_environmentResources;
 
@@ -371,6 +379,8 @@ namespace ic
         std::unordered_map<uint64_t, UploadedSampler> m_uploadedSamplers;
         DX12GraphResourceRegistry m_graphResourceRegistry;
         DX12GpuScene m_gpuScene;
+        DX12UploadScheduler m_uploadScheduler;
+        DX12RetirementQueue m_retirementQueue;
 
         DX12FrameExecutor m_frameExecutor;
         uint32_t m_workerSlots = 1;

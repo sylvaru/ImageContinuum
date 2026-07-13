@@ -1,6 +1,8 @@
 
 add_executable(ImageContinuumTests
     "src/main.cpp"
+    "src/job_system_stress_tests.cpp"
+    "include/job_system_stress_tests.h"
 )
 
 # Set C++ standard to C++20 required

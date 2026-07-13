@@ -205,6 +205,7 @@ namespace ic
                 input.metadata.geometryBinIndex = currentBinIndex;
                 input.indexCount = mesh.indexCount;
                 input.firstIndex = mesh.firstIndex;
+                // Model index buffers are uploaded with model-global indices.
                 input.vertexOffset = 0;
                 input.commandBinOffset = bin.commandOffset;
                 m_drawInputs.push_back(input);

@@ -38,6 +38,17 @@ namespace ic
                    lhs.brdfLutSize == rhs.brdfLutSize &&
                    lhs.format == rhs.format;
         }
+
+        PassExecutionPolicy executionPolicy(const PassPayload& payload)
+        {
+            if (const auto* pass = std::get_if<GraphicsPassData>(&payload))
+                return pass->execution;
+            if (const auto* pass = std::get_if<ComputePassData>(&payload))
+                return pass->execution;
+            if (const auto* pass = std::get_if<TransferPassData>(&payload))
+                return pass->execution;
+            return {};
+        }
     }
 
     struct Renderer::Runtime
@@ -60,7 +71,19 @@ namespace ic
 
         RenderExtent renderExtent{};
         bool graphDirty = true;
+        FrameGraphBuildReason rebuildReason =
+            FrameGraphBuildReason::Startup;
         RenderPathType pathType = RenderPathType::Forward;
+        PassInvalidation pendingInvalidation =
+            PassInvalidation::Startup | PassInvalidation::GraphRebuild;
+        std::vector<uint8_t> nodeExecuted;
+        std::vector<uint8_t> executeNodes;
+        uint64_t lastSceneVersion = UINT64_MAX;
+        uint64_t lastEnvironmentVersion = UINT64_MAX;
+        float lastNearPlane = 0.0f;
+        float lastFarPlane = 0.0f;
+        float lastVerticalFov = 0.0f;
+        float lastAspectRatio = 0.0f;
 
         Runtime(
             Scope<RendererBackend> b,
@@ -123,6 +146,18 @@ namespace ic
     {
         auto& runtime = *m_runtime;
 
+        const RenderExtent frameExtent{
+            std::max(1u, frame.windowWidth),
+            std::max(1u, frame.windowHeight) };
+        if (frameExtent.width != runtime.renderExtent.width ||
+            frameExtent.height != runtime.renderExtent.height)
+        {
+            runtime.renderExtent = frameExtent;
+            runtime.graphDirty = true;
+            runtime.rebuildReason = FrameGraphBuildReason::Resize;
+            runtime.pendingInvalidation |= PassInvalidation::Resize;
+        }
+
         if (runtime.graphDirty)
         {
             buildOrRebuildFrameGraph();
@@ -130,6 +165,28 @@ namespace ic
 
         syncSceneEnvironmentIBL(frame, scene);
         processPendingRendererJobs(frame);
+
+        if (runtime.lastSceneVersion != scene.sceneVersion)
+        {
+            runtime.lastSceneVersion = scene.sceneVersion;
+            runtime.pendingInvalidation |= PassInvalidation::Scene;
+        }
+        if (runtime.lastEnvironmentVersion != scene.environment.version)
+        {
+            runtime.lastEnvironmentVersion = scene.environment.version;
+            runtime.pendingInvalidation |= PassInvalidation::Environment;
+        }
+        if (runtime.lastNearPlane != scene.camera.nearPlane ||
+            runtime.lastFarPlane != scene.camera.farPlane ||
+            runtime.lastVerticalFov != scene.camera.verticalFovRadians ||
+            runtime.lastAspectRatio != scene.camera.aspectRatio)
+        {
+            runtime.lastNearPlane = scene.camera.nearPlane;
+            runtime.lastFarPlane = scene.camera.farPlane;
+            runtime.lastVerticalFov = scene.camera.verticalFovRadians;
+            runtime.lastAspectRatio = scene.camera.aspectRatio;
+            runtime.pendingInvalidation |= PassInvalidation::Configuration;
+        }
 
         if (scene.camera.valid == 0u)
         {
@@ -148,10 +205,71 @@ namespace ic
             }
         }
 
-        runtime.backend->execute(
-            runtime.compiledGraphPlan,
+        const CompiledGraphPlan& plan = runtime.compiledGraphPlan;
+        runtime.executeNodes.assign(plan.nodes.size(), uint8_t{1});
+        for (const ExecutionNode& node : plan.nodes)
+        {
+            PassExecutionPolicy policy{};
+            if (node.payloadIndex < plan.payloads.size())
+            {
+                policy = executionPolicy(plan.payloads[node.payloadIndex]);
+            }
+
+            bool execute = true;
+            if (policy.cadence == PassCadence::Once)
+            {
+                execute = node.nodeId >= runtime.nodeExecuted.size() ||
+                    runtime.nodeExecuted[node.nodeId] == 0;
+            }
+            else if (policy.cadence == PassCadence::OnResize)
+            {
+                execute = node.nodeId >= runtime.nodeExecuted.size() ||
+                    runtime.nodeExecuted[node.nodeId] == 0 ||
+                    any(runtime.pendingInvalidation, PassInvalidation::Resize);
+            }
+            else if (policy.cadence == PassCadence::OnInvalidation)
+            {
+                execute = node.nodeId >= runtime.nodeExecuted.size() ||
+                    runtime.nodeExecuted[node.nodeId] == 0 ||
+                    any(runtime.pendingInvalidation, policy.invalidation);
+            }
+
+            // A skipped producer needs storage that survives the frame. Writes
+            // to transient or imported resources are therefore always active.
+            if (!execute)
+            {
+                const auto accesses = plan.resourceAccesses.subspan(
+                    node.firstResourceAccess, node.resourceAccessCount);
+                for (const ResourceAccess& access : accesses)
+                {
+                    if (access.access != AccessType::Read &&
+                        access.resource < plan.resources.size() &&
+                        plan.resources[access.resource].ownership !=
+                            ResourceOwnership::Persistent)
+                    {
+                        execute = true;
+                        break;
+                    }
+                }
+            }
+            runtime.executeNodes[node.nodeId] = execute ? 1u : 0u;
+        }
+
+        const GraphExecutionContext execution{ runtime.executeNodes };
+        const bool completed = runtime.backend->execute(
+            plan,
+            execution,
             frame,
             scene);
+
+        if (completed)
+        {
+            for (GraphNodeId node = 0; node < runtime.executeNodes.size(); ++node)
+            {
+                if (runtime.executeNodes[node]) runtime.nodeExecuted[node] = 1;
+            }
+            runtime.pendingInvalidation = PassInvalidation::None;
+        }
     }
 
     void Renderer::shutdown()
@@ -170,12 +288,26 @@ namespace ic
 
         RendererPathContext rctx;
         rctx.renderExtent = m_runtime->renderExtent;
+        rctx.rebuildReason = rt.rebuildReason;
 
         rt.path->buildFrameGraph(rctx, rt.builder);
 
         rt.compiledGraphPlan = rt.compiler.compile(rt.builder);
 
+        rt.nodeExecuted.assign(rt.compiledGraphPlan.nodes.size(), uint8_t{0});
+        rt.executeNodes.assign(rt.compiledGraphPlan.nodes.size(), uint8_t{1});
+        rt.pendingInvalidation |= PassInvalidation::GraphRebuild;
+
         rt.graphDirty = false;
+        rt.rebuildReason = FrameGraphBuildReason::Explicit;
+    }
+
+    void Renderer::invalidatePasses(PassInvalidation reasons)
+    {
+        if (m_runtime)
+        {
+            m_runtime->pendingInvalidation |= reasons;
+        }
     }
 
     Scope<RendererBackend> 
@@ -292,12 +424,33 @@ namespace ic
             return "Unnamed";
         };
 
-        if (ImGui::BeginTable("GraphQueueSchedule", 7,
+        // Author-declared execution cadence (see PassCadence). Only Graphics,
+        // Compute and Transfer passes carry it; anything else is treated as
+        // per-frame.
+        auto passCadence = [&plan](GraphNodeId node) -> PassCadence
+        {
+            if (node >= plan.nodes.size()) return PassCadence::PerFrame;
+            const ExecutionNode& execution = plan.nodes[node];
+            if (execution.payloadIndex >= plan.payloads.size())
+                return PassCadence::PerFrame;
+            const PassPayload& payload = plan.payloads[execution.payloadIndex];
+            if (const auto* pass = std::get_if<GraphicsPassData>(&payload))
+                return pass->execution.cadence;
+            if (const auto* pass = std::get_if<ComputePassData>(&payload))
+                return pass->execution.cadence;
+            if (const auto* pass = std::get_if<TransferPassData>(&payload))
+                return pass->execution.cadence;
+            return PassCadence::PerFrame;
+        };
+
+        if (ImGui::BeginTable("GraphQueueSchedule", 9,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
         {
             ImGui::TableSetupColumn("Level");
             ImGui::TableSetupColumn("Queue");
             ImGui::TableSetupColumn("Pass");
+            ImGui::TableSetupColumn("Cadence");
+            ImGui::TableSetupColumn("Run");
             ImGui::TableSetupColumn("Waits");
             ImGui::TableSetupColumn("CPU Parallel");
             ImGui::TableSetupColumn("GPU Async");
@@ -328,7 +481,70 @@ namespace ic
                     ImGui::TableNextColumn();
                     ImGui::TextUnformatted(passName(node));
                     ImGui::TableNextColumn();
-                    ImGui::Text("%u", batch.waitCount);
+                    switch (passCadence(node))
+                    {
+                    case PassCadence::Once:
+                        ImGui::TextColored(
+                            ImVec4(0.55f, 0.75f, 1.0f, 1.0f), "Once");
+                        break;
+                    case PassCadence::OnResize:
+                        ImGui::TextColored(
+                            ImVec4(1.0f, 0.8f, 0.35f, 1.0f), "On Resize");
+                        break;
+                    case PassCadence::OnInvalidation:
+                        ImGui::TextColored(
+                            ImVec4(1.0f, 0.8f, 0.35f, 1.0f), "Invalidated");
+                        break;
+                    case PassCadence::PerFrame:
+                    default:
+                        ImGui::TextDisabled("Per-Frame");
+                        break;
+                    }
+                    ImGui::TableNextColumn();
+                    const bool scheduled =
+                        node < m_runtime->executeNodes.size() &&
+                        m_runtime->executeNodes[node] != 0;
+                    ImGui::TextUnformatted(scheduled ? "Execute" : "Barrier only");
+                    ImGui::TableNextColumn();
+                    if (batch.waitCount == 0)
+                    {
+                        ImGui::TextDisabled("-");
+                    }
+                    else
+                    {
+                        std::string waits;
+                        for (uint32_t wait = 0; wait < batch.waitCount; ++wait)
+                        {
+                            const uint32_t sourceIndex =
+                                plan.queueSubmissionWaits[
+                                    batch.firstWait + wait].submissionIndex;
+                            if (sourceIndex >= plan.queueSubmissions.size()) continue;
+                            if (!waits.empty()) waits += "; ";
+                            const QueueSubmissionBatch& source =
+                                plan.queueSubmissions[sourceIndex];
+                            waits += queueName(source.queue);
+                            waits += ": ";
+                            if (source.nodeCount == 0)
+                            {
+                                waits += "submission ";
+                                waits += std::to_string(sourceIndex);
+                            }
+                            else
+                            {
+                                const GraphNodeId sourceNode =
+                                    plan.queueSubmissionNodes[source.firstNode];
+                                waits += passName(sourceNode);
+                                if (source.nodeCount > 1)
+                                {
+                                    waits += " +";
+                                    waits += std::to_string(source.nodeCount - 1);
+                                    waits += " pass";
+                                    if (source.nodeCount > 2) waits += "es";
+                                }
+                            }
+                        }
+                        ImGui::TextUnformatted(waits.c_str());
+                    }
                     ImGui::TableNextColumn();
                     ImGui::TextUnformatted(cpuParallel ? "Yes" : "No");
                     ImGui::TableNextColumn();

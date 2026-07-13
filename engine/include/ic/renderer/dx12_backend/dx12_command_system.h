@@ -61,10 +61,6 @@ namespace ic
             uint32_t workerIndex,
             QueueType queue = QueueType::Graphics);
 
-        ID3D12GraphicsCommandList4* beginFrameCommandList(
-            uint32_t frameIndex,
-            uint32_t workerIndex);
-
     private:
         struct CommandSlot
         {

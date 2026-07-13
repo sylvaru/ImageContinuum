@@ -1,0 +1,32 @@
+[app]
+name = "ImageContinuum Demo DX12 Path Traced"
+
+[window]
+width = 1280
+height = 720
+mode = "windowed"
+
+[paths]
+asset_root = "demo/res"
+model_root = "demo/res/models"
+
+[renderer]
+backend = "DX12"
+path = "PathTraced"
+validation = true
+debug_gui = true
+vsync = true
+target_fps = 500.0
+frames_in_flight = 2
+pipeline_library = "demo/res/pipelines/path_tracing.toml"
+
+[renderer.environment]
+enabled = true
+intensity = 1.0
+skybox_exposure = 0.9
+path_trace_exposure = 0.25
+tonemap_exposure = 1.0
+cubemap_size = 512
+
+[scene]
+file = "demo/res/scene_files/cornell_scene.toml"

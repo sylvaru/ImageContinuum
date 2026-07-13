@@ -90,14 +90,6 @@ namespace ic
             uint32_t workerIndex,
             QueueType queue = QueueType::Graphics);
 
-        VkCommandBuffer beginFrameCommandBuffer(
-            uint32_t frameIndex,
-            uint32_t workerIndex);
-
-        VkCommandBuffer allocateCommandBuffer(
-            uint32_t frameIndex,
-            uint32_t workerIndex);
-
         // Immediate submission (upload / init / staging)
         void immediateSubmit(
             VkQueue queue,
@@ -108,7 +100,6 @@ namespace ic
         struct WorkerPool
         {
             VkCommandPool pool = VK_NULL_HANDLE;
-            VkCommandBuffer primary = VK_NULL_HANDLE;
             std::vector<VkCommandBuffer> commandBuffers;
             uint32_t nextCommandBuffer = 0;
             std::mutex mutex;
