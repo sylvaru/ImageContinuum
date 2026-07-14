@@ -30,8 +30,8 @@ namespace ic
             , m_barriers(memory)
             , m_resourceLifetimes(memory)
             , m_dependencies(memory)
+            , m_executionOrder(memory)
             , m_resourceChains(memory)
-            , m_chainMap(memory)
             , m_adjacencyOffsets(memory)
             , m_adjacencyCounts(memory)
             , m_adjacencyEdges(memory)
@@ -74,7 +74,6 @@ namespace ic
         std::pmr::vector<ResourceLifetime> m_resourceLifetimes;
         std::pmr::vector<Dependency> m_dependencies;
         std::pmr::vector<GraphNodeId> m_executionOrder;
-        std::pmr::unordered_map<GraphResourceId, ResourceChain> m_chainMap;
         std::pmr::vector<ResourceChain> m_resourceChains;
         std::pmr::vector<uint32_t> m_adjacencyOffsets;
         std::pmr::vector<uint32_t> m_adjacencyCounts;

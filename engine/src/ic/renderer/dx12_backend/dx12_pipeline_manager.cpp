@@ -9,6 +9,7 @@
 #include "ic/core/asset_manager.h"
 #include "ic/util/util.h"
 #include "ic/renderer/renderer_common/renderer_util.h"
+#include "ic/renderer/pipeline_library.h"
 
 namespace
 {
@@ -37,6 +38,8 @@ namespace ic
     {
         m_graphicsPipelines.clear();
         m_computePipelines.clear();
+        m_graphicsById.clear();
+        m_computeById.clear();
         m_device = nullptr;
     }
 
@@ -79,6 +82,33 @@ namespace ic
         m_computePipelines.push_back(
             createComputePipeline(handle, desc));
 
+        return handle;
+    }
+
+    GraphicsPipelineHandle DX12PipelineManager::resolveGraphicsPipeline(
+        const PipelineLibrary& library,
+        PipelineId id,
+        TextureFormat swapchainFormat)
+    {
+        if (!id) return {};
+        if (const auto it = m_graphicsById.find(id); it != m_graphicsById.end())
+            return it->second;
+        const GraphicsPipelineHandle handle = requestGraphicsPipeline(
+            library.resolveGraphics(id, RendererBackendType::DX12, swapchainFormat));
+        m_graphicsById.emplace(id, handle);
+        return handle;
+    }
+
+    ComputePipelineHandle DX12PipelineManager::resolveComputePipeline(
+        const PipelineLibrary& library,
+        PipelineId id)
+    {
+        if (!id) return {};
+        if (const auto it = m_computeById.find(id); it != m_computeById.end())
+            return it->second;
+        const ComputePipelineHandle handle = requestComputePipeline(
+            library.resolveCompute(id, RendererBackendType::DX12));
+        m_computeById.emplace(id, handle);
         return handle;
     }
 

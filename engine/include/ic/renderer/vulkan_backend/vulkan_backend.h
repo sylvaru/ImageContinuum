@@ -73,12 +73,6 @@ namespace ic
             return m_resourceAllocator;
         }
 
-        struct ImageState
-        {
-            VkImageLayout layout;
-            AccessType access;
-        };
-
         struct UploadedTexture
         {
             VulkanTexture texture;
@@ -388,25 +382,10 @@ namespace ic
             ResourceUsage usage,
             AccessType access) const;
 
-        VkImageLayout getOrInitImageLayout(VkImage image);
-
-        void transitionImage(
-            VkCommandBuffer cmd,
-            VkImage image,
-            VkImageLayout oldLayout,
-            VkImageLayout newLayout,
-            VkAccessFlags srcAccess,
-            VkAccessFlags dstAccess,
-            VkPipelineStageFlags srcStage,
-            VkPipelineStageFlags dstStage,
-            uint32_t baseMipLevel = 0,
-            uint32_t levelCount = 1);
-
         VulkanGraphResourceRegistry m_graphResourceRegistry;
         VulkanFrameExecutor m_frameExecutor;
         VulkanUploadScheduler m_uploadScheduler;
         VulkanRetirementQueue m_retirementQueue;
-        std::unordered_map<VkImage, ImageState> m_imageStates;
 
         VulkanInstance m_instance;
         VulkanPlatform m_platform;
@@ -431,8 +410,6 @@ namespace ic
         EnvironmentResources m_environmentResources;
 
         const PipelineLibrary* m_pipelineLibrary = nullptr;
-        std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash> m_pipelineHandles;
-        std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash> m_computePipelineHandles;
         std::unordered_map<AssetHandle, VulkanUploadedModel, AssetHandleHash> m_uploadedModels;
         std::unordered_map<uint64_t, UploadedTexture> m_uploadedTextures;
         std::unordered_map<uint64_t, UploadedSampler> m_uploadedSamplers;

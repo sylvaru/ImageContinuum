@@ -3,8 +3,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <new>
-#include <vector>
 
 namespace ic
 {
@@ -22,10 +22,8 @@ namespace ic
 
         Design:
         - Thread-local: each worker gets its own pool, so allocate/deallocate are
-          lock-free and cache-friendly. A frame is nearly always freed on the
-          same thread it was born on for lazily-started tasks; when it isn't, we
-          simply fall back to freeing through the owning thread's global operator
-          (see below), so cross-thread frees are correct, just not pooled.
+          lock-free and cache-friendly. A cross-thread free is cached by the
+          freeing thread; blocks have no pool ownership, so migration is safe.
         - Size-classed: sizes are rounded up to kGranularity and bucketed. Blocks
           carry a small header recording their rounded size class so deallocate
           can return them to the right bucket without the caller passing a size.
@@ -33,8 +31,8 @@ namespace ic
           global allocator so idle pools don't pin unbounded memory.
 
         This is deliberately modest — correctness first, with the fast path being
-        a single vector pop/push. promise_type opts in via operator new/delete
-        (see task.h).
+        a single intrusive-list pop/push and no metadata allocation. promise_type
+        opts in via operator new/delete (see task.h).
 
     */
     class CoroutineFramePool
@@ -42,6 +40,12 @@ namespace ic
     public:
         static void* allocate(std::size_t size)
         {
+            if (size > std::numeric_limits<std::size_t>::max() -
+                           kHeaderSize - (kGranularity - 1))
+            {
+                throw std::bad_alloc{};
+            }
+
             // Reserve room for the header and round up to a size class.
             const std::size_t total     = size + kHeaderSize;
             const std::size_t rounded   = roundUp(total);
@@ -51,11 +55,12 @@ namespace ic
 
             if (bucketIdx < kBucketCount)
             {
-                std::vector<void*>& freeList = pool.buckets[bucketIdx];
-                if (!freeList.empty())
+                Header*& freeList = pool.buckets[bucketIdx];
+                if (freeList)
                 {
-                    void* block = freeList.back();
-                    freeList.pop_back();
+                    Header* block = freeList;
+                    freeList = block->next;
+                    --pool.counts[bucketIdx];
                     return userPtr(block, rounded);
                 }
             }
@@ -71,19 +76,19 @@ namespace ic
 
             Header*           header  = headerFor(userPointer);
             const std::size_t rounded = header->roundedSize;
-            void*             block   = header;
-
             const std::size_t bucketIdx = bucketIndex(rounded);
 
             Pool& pool = tls();
             if (bucketIdx < kBucketCount &&
-                pool.buckets[bucketIdx].size() < kMaxCachedPerBucket)
+                pool.counts[bucketIdx] < kMaxCachedPerBucket)
             {
-                pool.buckets[bucketIdx].push_back(block);
+                header->next = pool.buckets[bucketIdx];
+                pool.buckets[bucketIdx] = header;
+                ++pool.counts[bucketIdx];
                 return;
             }
 
-            ::operator delete(block);
+            ::operator delete(header);
         }
 
     private:
@@ -97,21 +102,27 @@ namespace ic
         struct Header
         {
             std::size_t roundedSize;
+            Header* next;
         };
+
+        static_assert(sizeof(Header) <= kHeaderSize);
 
         struct Pool
         {
-            std::vector<void*> buckets[kBucketCount];
+            Header* buckets[kBucketCount] {};
+            uint16_t counts[kBucketCount] {};
 
             ~Pool()
             {
                 // Return every cached block to the global allocator on thread
                 // exit so the pool never leaks.
-                for (auto& bucket : buckets)
+                for (Header* bucket : buckets)
                 {
-                    for (void* block : bucket)
+                    while (bucket)
                     {
-                        ::operator delete(block);
+                        Header* next = bucket->next;
+                        ::operator delete(bucket);
+                        bucket = next;
                     }
                 }
             }
@@ -130,7 +141,7 @@ namespace ic
 
         static std::size_t bucketIndex(std::size_t rounded) noexcept
         {
-            return rounded / kGranularity;
+            return rounded / kGranularity - 1;
         }
 
         // Lay out the block as [Header | user bytes]. The header records the
@@ -141,6 +152,7 @@ namespace ic
         {
             auto* header        = static_cast<Header*>(block);
             header->roundedSize = rounded;
+            header->next        = nullptr;
             return static_cast<void*>(static_cast<std::uint8_t*>(block) + kHeaderSize);
         }
 

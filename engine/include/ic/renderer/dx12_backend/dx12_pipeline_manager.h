@@ -2,6 +2,8 @@
 
 #include <cstddef>
 #include <vector>
+#include <deque>
+#include <unordered_map>
 
 #include <d3d12.h>
 #include <wrl/client.h>
@@ -11,6 +13,7 @@
 
 namespace ic
 {
+    class PipelineLibrary;
     struct DX12GraphicsPipeline
     {
         GraphicsPipelineHandle handle = {};
@@ -49,6 +52,13 @@ namespace ic
             const GraphicsPipelineDesc& desc);
         ComputePipelineHandle requestComputePipeline(
             const ComputePipelineDesc& desc);
+        GraphicsPipelineHandle resolveGraphicsPipeline(
+            const PipelineLibrary& library,
+            PipelineId id,
+            TextureFormat swapchainFormat);
+        ComputePipelineHandle resolveComputePipeline(
+            const PipelineLibrary& library,
+            PipelineId id);
 
         DX12GraphicsPipeline* graphicsPipeline(GraphicsPipelineHandle handle);
         const DX12GraphicsPipeline* graphicsPipeline(GraphicsPipelineHandle handle) const;
@@ -78,7 +88,13 @@ namespace ic
         DXGI_FORMAT toDxgiFormat(TextureFormat format) const;
 
         ID3D12Device5* m_device = nullptr;
-        std::vector<DX12GraphicsPipeline> m_graphicsPipelines;
-        std::vector<DX12ComputePipeline> m_computePipelines;
+        // Pipeline pointers are handed to pass recording code. deque keeps
+        // element addresses stable as lazily resolved pipelines are appended.
+        std::deque<DX12GraphicsPipeline> m_graphicsPipelines;
+        std::deque<DX12ComputePipeline> m_computePipelines;
+        std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash>
+            m_graphicsById;
+        std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash>
+            m_computeById;
     };
 }

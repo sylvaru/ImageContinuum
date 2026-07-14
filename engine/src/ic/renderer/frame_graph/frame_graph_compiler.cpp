@@ -24,7 +24,6 @@ namespace ic
         m_queueSubmissions.clear();
         m_queueSubmissionNodes.clear();
         m_queueSubmissionWaits.clear();
-        m_chainMap.clear();
         m_resourceChains.clear();
         m_nodeSchedules.clear();
         m_adjacencyOffsets.clear();
@@ -33,9 +32,23 @@ namespace ic
         m_incomingBarrierIndices.clear();
         m_outgoingBarrierIndices.clear();
   
-        auto nodes = builder.nodes();
+        const auto nodes = builder.nodes();
+        const auto accesses = builder.accesses();
 
-        // Build node list
+        // Backends walk accesses as a contiguous range per node. Count and
+        // scatter in two linear passes instead of rescanning every access for
+        // every node as the graph grows.
+        std::pmr::vector<uint32_t> accessCounts(
+            nodes.size(), 0, m_nodes.get_allocator());
+        for (const ResourceAccess& access : accesses)
+        {
+            assert(access.node < nodes.size());
+            ++accessCounts[access.node];
+        }
+
+        m_nodes.reserve(nodes.size());
+        m_resourceAccesses.resize(accesses.size());
+        uint32_t firstAccess = 0;
         for (const auto& node : nodes)
         {
             ExecutionNode compiledNode{};
@@ -45,20 +58,22 @@ namespace ic
             compiledNode.type = node.graphNode.type;
             compiledNode.payloadIndex = node.graphNode.payloadIndex;
 
-            compiledNode.firstResourceAccess =
-                static_cast<uint32_t>(m_resourceAccesses.size());
-            for (const ResourceAccess& access : builder.accesses())
-            {
-                if (access.node == compiledNode.nodeId)
-                {
-                    m_resourceAccesses.push_back(access);
-                }
-            }
-            compiledNode.resourceAccessCount =
-                static_cast<uint32_t>(m_resourceAccesses.size()) -
-                compiledNode.firstResourceAccess;
+            compiledNode.firstResourceAccess = firstAccess;
+            compiledNode.resourceAccessCount = accessCounts[compiledNode.nodeId];
+            firstAccess += compiledNode.resourceAccessCount;
 
             m_nodes.push_back(compiledNode);
+        }
+
+        std::pmr::vector<uint32_t> accessCursors(
+            nodes.size(), 0, m_nodes.get_allocator());
+        for (const ExecutionNode& node : m_nodes)
+        {
+            accessCursors[node.nodeId] = node.firstResourceAccess;
+        }
+        for (const ResourceAccess& access : accesses)
+        {
+            m_resourceAccesses[accessCursors[access.node]++] = access;
         }
 
         buildResourceAccessChains(builder);
@@ -547,47 +562,49 @@ namespace ic
         const FrameGraphBuilder& builder)
     {
         m_resourceChains.clear();
-        m_chainMap.clear();
 
-        for (const ResourceAccess& access : builder.accesses())
+        const auto resources = builder.resources();
+        const auto accesses = builder.accesses();
+
+        // GraphResourceId is a dense builder-owned index, so direct indexing
+        // avoids hash computation, per-entry allocations, and a second
+        // unordered-map-to-vector flattening pass.
+        std::pmr::vector<uint32_t> accessCounts(
+            resources.size(), 0, m_nodes.get_allocator());
+        for (const ResourceAccess& access : accesses)
         {
-            auto& chain =
-                m_chainMap.try_emplace(
-                    access.resource,
-                    access.resource,
-                    builder.get_allocator()
-                ).first->second;
-
-            chain.accesses.push_back(access);
+            assert(access.resource < resources.size());
+            ++accessCounts[access.resource];
         }
 
-        m_resourceChains.clear();
-        m_resourceChains.reserve(m_chainMap.size());
-
-        for (auto& [id, chain] : m_chainMap)
+        m_resourceChains.reserve(resources.size());
+        for (GraphResourceId resource = 0;
+             resource < resources.size();
+             ++resource)
         {
-            m_resourceChains.push_back(std::move(chain));
+            m_resourceChains.emplace_back(resource, builder.get_allocator());
+            m_resourceChains.back().accesses.reserve(
+                static_cast<size_t>(accessCounts[resource]) + 1u);
         }
 
-        auto resources = builder.resources();
-
-        for (auto& chain : m_resourceChains)
+        for (const ResourceAccess& access : accesses)
         {
-            const auto& resource = resources[chain.resource];
-
+            ResourceChain& chain = m_resourceChains[access.resource];
             if (chain.accesses.empty())
-                continue;
-
-            ResourceAccess initial{};
-            initial.node = chain.accesses.front().node;
-            initial.resource = chain.resource;
-            initial.access = resource.ownership == ResourceOwnership::Imported
-                ? resource.initialAccess : AccessType::Read;
-            initial.usage = resource.ownership == ResourceOwnership::Imported
-                ? resource.initialUsage : chain.accesses.front().usage;
-            initial.external = true;
-            initial.firstUse = true;
-            chain.accesses.insert(chain.accesses.begin(), initial);
+            {
+                const GraphResource& resource = resources[access.resource];
+                chain.accesses.push_back({
+                    .node = access.node,
+                    .resource = access.resource,
+                    .access = resource.ownership == ResourceOwnership::Imported
+                        ? resource.initialAccess : AccessType::Read,
+                    .usage = resource.ownership == ResourceOwnership::Imported
+                        ? resource.initialUsage : access.usage,
+                    .external = true,
+                    .firstUse = true
+                });
+            }
+            chain.accesses.push_back(access);
         }
     }
 

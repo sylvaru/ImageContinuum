@@ -47,6 +47,36 @@ namespace ic
             }
             return levels;
         }
+
+        void transitionImage(
+            VkCommandBuffer cmd,
+            VkImage image,
+            VkImageLayout oldLayout,
+            VkImageLayout newLayout,
+            VkAccessFlags srcAccess,
+            VkAccessFlags dstAccess,
+            VkPipelineStageFlags srcStage,
+            VkPipelineStageFlags dstStage,
+            uint32_t baseMipLevel = 0,
+            uint32_t levelCount = 1)
+        {
+            VkImageMemoryBarrier barrier{
+                VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+            barrier.oldLayout = oldLayout;
+            barrier.newLayout = newLayout;
+            barrier.srcAccessMask = srcAccess;
+            barrier.dstAccessMask = dstAccess;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = image;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = baseMipLevel;
+            barrier.subresourceRange.levelCount = levelCount;
+            barrier.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(
+                cmd, srcStage, dstStage, 0,
+                0, nullptr, 0, nullptr, 1, &barrier);
+        }
     }
 
 	void VulkanBackend::init(
@@ -995,23 +1025,12 @@ namespace ic
             // per-frame scene resources present (matches the original guard).
             const PipelineId graphicsPipelineId =
                 makePipelineId("forward_bindless");
-            GraphicsPipelineHandle graphicsHandle{};
-            if (auto it = m_pipelineHandles.find(graphicsPipelineId);
-                it != m_pipelineHandles.end())
-            {
-                graphicsHandle = it->second;
-            }
-            else if (m_pipelineLibrary)
-            {
-                GraphicsPipelineDesc desc =
-                    m_pipelineLibrary->resolveGraphics(
-                        graphicsPipelineId,
-                        RendererBackendType::Vulkan,
-                        swapchainTextureFormat());
-                graphicsHandle =
-                    m_pipelineManager.requestGraphicsPipeline(desc);
-                m_pipelineHandles.emplace(graphicsPipelineId, graphicsHandle);
-            }
+            const GraphicsPipelineHandle graphicsHandle = m_pipelineLibrary
+                ? m_pipelineManager.resolveGraphicsPipeline(
+                    *m_pipelineLibrary,
+                    graphicsPipelineId,
+                    swapchainTextureFormat())
+                : GraphicsPipelineHandle{};
             if (!graphicsHandle || m_gpuScene.frameSlotCount() == 0)
             {
                 return;
@@ -1269,22 +1288,9 @@ namespace ic
         }
 
         const PipelineId pipelineId = makePipelineId("equirect_to_cubemap");
-        auto it = m_computePipelineHandles.find(pipelineId);
-        ComputePipelineHandle handle{};
-        if (it != m_computePipelineHandles.end())
-        {
-            handle = it->second;
-        }
-        else
-        {
-            ComputePipelineDesc desc =
-                m_pipelineLibrary->resolveCompute(
-                    pipelineId,
-                    RendererBackendType::Vulkan);
-            handle = m_pipelineManager.requestComputePipeline(desc);
-            m_computePipelineHandles.emplace(pipelineId, handle);
-        }
-
+        const ComputePipelineHandle handle =
+            m_pipelineManager.resolveComputePipeline(
+                *m_pipelineLibrary, pipelineId);
         return m_pipelineManager.computePipeline(handle);
     }
 
@@ -2372,22 +2378,8 @@ namespace ic
             return {};
         }
 
-        auto it = m_pipelineHandles.find(pass->pipeline);
-        if (it != m_pipelineHandles.end())
-        {
-            return it->second;
-        }
-
-        GraphicsPipelineDesc desc =
-            m_pipelineLibrary->resolveGraphics(
-                pass->pipeline,
-                RendererBackendType::Vulkan,
-                swapchainTextureFormat());
-
-        GraphicsPipelineHandle handle =
-            m_pipelineManager.requestGraphicsPipeline(desc);
-        m_pipelineHandles.emplace(pass->pipeline, handle);
-        return handle;
+        return m_pipelineManager.resolveGraphicsPipeline(
+            *m_pipelineLibrary, pass->pipeline, swapchainTextureFormat());
     }
 
     ComputePipelineHandle VulkanBackend::computePipelineForNode(
@@ -2423,21 +2415,8 @@ namespace ic
             return {};
         }
 
-        auto it = m_computePipelineHandles.find(pipelineId);
-        if (it != m_computePipelineHandles.end())
-        {
-            return it->second;
-        }
-
-        ComputePipelineDesc desc =
-            m_pipelineLibrary->resolveCompute(
-                pipelineId,
-                RendererBackendType::Vulkan);
-
-        ComputePipelineHandle handle =
-            m_pipelineManager.requestComputePipeline(desc);
-        m_computePipelineHandles.emplace(pipelineId, handle);
-        return handle;
+        return m_pipelineManager.resolveComputePipeline(
+            *m_pipelineLibrary, pipelineId);
     }
 
     void VulkanBackend::destroySceneResources()
@@ -2493,8 +2472,6 @@ namespace ic
 
         m_gpuScene.shutdown(m_device.device());
 
-        m_pipelineHandles.clear();
-        m_computePipelineHandles.clear();
     }
 
     void VulkanBackend::ensurePathTraceResources()
@@ -3611,22 +3588,12 @@ namespace ic
     {
         const PipelineId graphicsPipelineId =
             makePipelineId("clustered_forward_opaque");
-        GraphicsPipelineHandle graphicsHandle{};
-        if (auto it = m_pipelineHandles.find(graphicsPipelineId);
-            it != m_pipelineHandles.end())
-        {
-            graphicsHandle = it->second;
-        }
-        else if (m_pipelineLibrary)
-        {
-            GraphicsPipelineDesc desc =
-                m_pipelineLibrary->resolveGraphics(
-                    graphicsPipelineId,
-                    RendererBackendType::Vulkan,
-                    swapchainTextureFormat());
-            graphicsHandle = m_pipelineManager.requestGraphicsPipeline(desc);
-            m_pipelineHandles.emplace(graphicsPipelineId, graphicsHandle);
-        }
+        const GraphicsPipelineHandle graphicsHandle = m_pipelineLibrary
+            ? m_pipelineManager.resolveGraphicsPipeline(
+                *m_pipelineLibrary,
+                graphicsPipelineId,
+                swapchainTextureFormat())
+            : GraphicsPipelineHandle{};
 
         if (!graphicsHandle ||
             !prepareSceneResources(ctx, scene, graphicsHandle))
@@ -3808,21 +3775,9 @@ namespace ic
             auto computePipeline = [&](const char* name) -> VulkanComputePipeline*
                 {
                     const PipelineId pipelineId = makePipelineId(name);
-                    auto it = m_computePipelineHandles.find(pipelineId);
-                    ComputePipelineHandle handle{};
-                    if (it != m_computePipelineHandles.end())
-                    {
-                        handle = it->second;
-                    }
-                    else
-                    {
-                        ComputePipelineDesc desc =
-                            m_pipelineLibrary->resolveCompute(
-                                pipelineId,
-                                RendererBackendType::Vulkan);
-                        handle = m_pipelineManager.requestComputePipeline(desc);
-                        m_computePipelineHandles.emplace(pipelineId, handle);
-                    }
+                    const ComputePipelineHandle handle =
+                        m_pipelineManager.resolveComputePipeline(
+                            *m_pipelineLibrary, pipelineId);
                     return m_pipelineManager.computePipeline(handle);
                 };
 
@@ -3834,23 +3789,6 @@ namespace ic
                 computePipeline("ibl_prefilter");
             VulkanComputePipeline* brdfPipeline =
                 computePipeline("ibl_brdf_lut");
-
-            convertPipeline =
-                m_pipelineManager.computePipeline(
-                    m_computePipelineHandles.at(
-                        makePipelineId("equirect_to_cubemap")));
-            irradiancePipeline =
-                m_pipelineManager.computePipeline(
-                    m_computePipelineHandles.at(
-                        makePipelineId("ibl_irradiance")));
-            prefilterPipeline =
-                m_pipelineManager.computePipeline(
-                    m_computePipelineHandles.at(
-                        makePipelineId("ibl_prefilter")));
-            brdfPipeline =
-                m_pipelineManager.computePipeline(
-                    m_computePipelineHandles.at(
-                        makePipelineId("ibl_brdf_lut")));
 
             if (!convertPipeline ||
                 !irradiancePipeline ||
@@ -5910,66 +5848,6 @@ namespace ic
         }
     }
 
-    VkImageLayout VulkanBackend::getOrInitImageLayout(VkImage image)
-    {
-        auto it = m_imageStates.find(image);
-        if (it != m_imageStates.end())
-            return it->second.layout;
-
-        m_imageStates[image] = {
-            .layout = VK_IMAGE_LAYOUT_UNDEFINED,
-            .access = AccessType::Read
-        };
-
-        return VK_IMAGE_LAYOUT_UNDEFINED;
-    }
-
-    void VulkanBackend::transitionImage(
-        VkCommandBuffer cmd,
-        VkImage image,
-        VkImageLayout oldLayout,
-        VkImageLayout newLayout,
-        VkAccessFlags srcAccess,
-        VkAccessFlags dstAccess,
-        VkPipelineStageFlags srcStage,
-        VkPipelineStageFlags dstStage,
-        uint32_t baseMipLevel,
-        uint32_t levelCount)
-    {
-        VkImageMemoryBarrier barrier{};
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-
-        barrier.oldLayout = oldLayout;
-        barrier.newLayout = newLayout;
-
-        barrier.srcAccessMask = srcAccess;
-        barrier.dstAccessMask = dstAccess;
-
-        barrier.image = image;
-
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.baseMipLevel = baseMipLevel;
-        barrier.subresourceRange.levelCount = levelCount;
-        barrier.subresourceRange.layerCount = 1;
-
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-
-        vkCmdPipelineBarrier(
-            cmd,
-            srcStage,
-            dstStage,
-            0,
-            0, nullptr,
-            0, nullptr,
-            1, &barrier);
-
-        m_imageStates[image].layout = newLayout;
-        m_imageStates[image].access = (dstAccess != 0)
-            ? AccessType::Write
-            : AccessType::Read;
-    }
-
     void VulkanBackend::onSwapchainRecreated()
     {
         // VulkanSwapchain::recreate performs the single teardown idle wait.
@@ -5986,7 +5864,6 @@ namespace ic
         m_frameExecutor.initSwapchainSync();
         m_pipelineManager.init(m_device.device());
         m_gpuScene.init(m_resourceAllocator, m_frameExecutor.framesInFlight());
-        m_imageStates.clear();
     }
 
     TextureFormat VulkanBackend::swapchainTextureFormat() const

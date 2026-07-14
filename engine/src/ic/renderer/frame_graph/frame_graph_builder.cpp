@@ -187,7 +187,7 @@ namespace ic
     }
 
     FrameGraphBuilder::ComputePassBuilder
-        FrameGraphBuilder::addComputePass(std::string_view name)
+        FrameGraphBuilder::addComputePass(std::string_view name, QueueType queue)
     {
         ComputePassData data{};
         data.name = name;
@@ -196,7 +196,7 @@ namespace ic
             addGraphNode(
                 data,
                 GraphNodeType::Compute,
-                QueueType::Compute);
+                queue);
 
         return ComputePassBuilder(*this, node);
     }

@@ -153,7 +153,31 @@ namespace ic
 		}
 
         GraphicsPassBuilder addGraphicsPass(std::string_view name);
-        ComputePassBuilder addComputePass(std::string_view name);
+
+        // A compute pass defaults to the graphics queue.
+        //
+        // Every compute pass the renderer currently records (GPU cull, Hi-Z
+        // build, cluster build, light culling) is a link in a serial chain that
+        // both consumes and feeds graphics work in the same frame
+        // (depth -> Hi-Z -> cull -> cluster -> opaque shading), so an async
+        // compute queue has nothing to overlap and buys no parallelism.
+        //
+        // It would also be unsafe as written: several of these passes touch
+        // backend-managed resources (scene depth, the cluster/light buffers)
+        // that live outside the frame graph's barrier tracking, and D3D12
+        // requires any resource handed between the graphics and compute queues
+        // to pass through the COMMON state at the boundary. That cross-queue
+        // COMMON handoff is not implemented for those non-graph resources, and
+        // omitting it is what triggers DXGI_ERROR_ACCESS_DENIED device removal.
+        //
+        // Passing QueueType::Compute explicitly opts a pass into the async queue
+        // and is only correct once a workload has independent work to overlap
+        // AND the cross-queue COMMON handoff above is implemented for every
+        // resource it shares with another queue.
+        ComputePassBuilder addComputePass(
+            std::string_view name,
+            QueueType queue = QueueType::Graphics);
+
         TransferPassBuilder addTransferPass(std::string_view name);
 
 		// Resource creation

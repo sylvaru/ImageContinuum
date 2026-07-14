@@ -73,12 +73,6 @@ namespace ic
         }
 
     private:
-        struct ResourceState
-        {
-            D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
-            AccessType access = AccessType::Read;
-        };
-
         struct UploadedTexture
         {
             DX12Texture texture;
@@ -336,14 +330,7 @@ namespace ic
             const CompiledGraphPlan& plan,
             const ExecutionNode& node);
 
-        void transitionResource(
-            ID3D12GraphicsCommandList4* cmd,
-            ID3D12Resource* resource,
-            D3D12_RESOURCE_STATES before,
-            D3D12_RESOURCE_STATES after);
-
         D3D12_RESOURCE_STATES usageToState(ResourceUsage usage) const;
-        D3D12_RESOURCE_STATES getOrInitResourceState(ID3D12Resource* resource);
 
         void recreateSwapchain();
         TextureFormat swapchainTextureFormat() const;
@@ -372,8 +359,6 @@ namespace ic
         EnvironmentResources m_environmentResources;
 
         const PipelineLibrary* m_pipelineLibrary = nullptr;
-        std::unordered_map<PipelineId, GraphicsPipelineHandle, PipelineIdHash> m_pipelineHandles;
-        std::unordered_map<PipelineId, ComputePipelineHandle, PipelineIdHash> m_computePipelineHandles;
         std::unordered_map<AssetHandle, DX12UploadedModel, AssetHandleHash> m_uploadedModels;
         std::unordered_map<uint64_t, UploadedTexture> m_uploadedTextures;
         std::unordered_map<uint64_t, UploadedSampler> m_uploadedSamplers;
@@ -384,7 +369,6 @@ namespace ic
 
         DX12FrameExecutor m_frameExecutor;
         uint32_t m_workerSlots = 1;
-        std::unordered_map<ID3D12Resource*, ResourceState> m_resourceStates;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;
         bool m_clusteredForwardHeatmapEnabled = false;

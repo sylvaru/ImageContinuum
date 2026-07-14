@@ -6,6 +6,7 @@
 #include "ic/core/asset_manager.h"
 #include "ic/renderer/renderer_gpu_assets.h"
 #include "ic/renderer/renderer_common/renderer_util.h"
+#include "ic/renderer/pipeline_library.h"
 #include "ic/util/util.h"
 namespace
 {
@@ -77,6 +78,8 @@ namespace ic
 
         m_graphicsPipelines.clear();
         m_computePipelines.clear();
+        m_graphicsById.clear();
+        m_computeById.clear();
         m_device = VK_NULL_HANDLE;
     }
 
@@ -119,6 +122,34 @@ namespace ic
         m_computePipelines.push_back(
             createComputePipeline(handle, desc));
 
+        return handle;
+    }
+
+    GraphicsPipelineHandle VulkanPipelineManager::resolveGraphicsPipeline(
+        const PipelineLibrary& library,
+        PipelineId id,
+        TextureFormat swapchainFormat)
+    {
+        if (!id) return {};
+        if (const auto it = m_graphicsById.find(id); it != m_graphicsById.end())
+            return it->second;
+        const GraphicsPipelineHandle handle = requestGraphicsPipeline(
+            library.resolveGraphics(
+                id, RendererBackendType::Vulkan, swapchainFormat));
+        m_graphicsById.emplace(id, handle);
+        return handle;
+    }
+
+    ComputePipelineHandle VulkanPipelineManager::resolveComputePipeline(
+        const PipelineLibrary& library,
+        PipelineId id)
+    {
+        if (!id) return {};
+        if (const auto it = m_computeById.find(id); it != m_computeById.end())
+            return it->second;
+        const ComputePipelineHandle handle = requestComputePipeline(
+            library.resolveCompute(id, RendererBackendType::Vulkan));
+        m_computeById.emplace(id, handle);
         return handle;
     }
 

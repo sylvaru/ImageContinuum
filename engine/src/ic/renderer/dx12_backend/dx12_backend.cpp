@@ -51,6 +51,23 @@ namespace ic
             }
             return levels;
         }
+
+        void transitionResource(
+            ID3D12GraphicsCommandList4* cmd,
+            ID3D12Resource* resource,
+            D3D12_RESOURCE_STATES before,
+            D3D12_RESOURCE_STATES after)
+        {
+            if (!resource || before == after) return;
+            D3D12_RESOURCE_BARRIER barrier{};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = resource;
+            barrier.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = before;
+            barrier.Transition.StateAfter = after;
+            cmd->ResourceBarrier(1, &barrier);
+        }
     }
 
 
@@ -136,7 +153,6 @@ namespace ic
         m_device.shutdown();
         m_adapter.shutdown();
         m_factory.shutdown();
-        m_resourceStates.clear();
 
         spdlog::info("[DX12Backend] Shutdown");
     }
@@ -1097,22 +1113,9 @@ namespace ic
         }
 
         const PipelineId pipelineId = makePipelineId("equirect_to_cubemap");
-        auto it = m_computePipelineHandles.find(pipelineId);
-        ComputePipelineHandle handle{};
-        if (it != m_computePipelineHandles.end())
-        {
-            handle = it->second;
-        }
-        else
-        {
-            ComputePipelineDesc desc =
-                m_pipelineLibrary->resolveCompute(
-                    pipelineId,
-                    RendererBackendType::DX12);
-            handle = m_pipelineManager.requestComputePipeline(desc);
-            m_computePipelineHandles.emplace(pipelineId, handle);
-        }
-
+        const ComputePipelineHandle handle =
+            m_pipelineManager.resolveComputePipeline(
+                *m_pipelineLibrary, pipelineId);
         return m_pipelineManager.computePipeline(handle);
     }
 
@@ -1635,22 +1638,8 @@ namespace ic
             return {};
         }
 
-        auto it = m_pipelineHandles.find(pass->pipeline);
-        if (it != m_pipelineHandles.end())
-        {
-            return it->second;
-        }
-
-        GraphicsPipelineDesc desc =
-            m_pipelineLibrary->resolveGraphics(
-                pass->pipeline,
-                RendererBackendType::DX12,
-                swapchainTextureFormat());
-
-        GraphicsPipelineHandle handle =
-            m_pipelineManager.requestGraphicsPipeline(desc);
-        m_pipelineHandles.emplace(pass->pipeline, handle);
-        return handle;
+        return m_pipelineManager.resolveGraphicsPipeline(
+            *m_pipelineLibrary, pass->pipeline, swapchainTextureFormat());
     }
 
     ComputePipelineHandle DX12Backend::computePipelineForNode(
@@ -1686,21 +1675,8 @@ namespace ic
             return {};
         }
 
-        auto it = m_computePipelineHandles.find(pipelineId);
-        if (it != m_computePipelineHandles.end())
-        {
-            return it->second;
-        }
-
-        ComputePipelineDesc desc =
-            m_pipelineLibrary->resolveCompute(
-                pipelineId,
-                RendererBackendType::DX12);
-
-        ComputePipelineHandle handle =
-            m_pipelineManager.requestComputePipeline(desc);
-        m_computePipelineHandles.emplace(pipelineId, handle);
-        return handle;
+        return m_pipelineManager.resolveComputePipeline(
+            *m_pipelineLibrary, pipelineId);
     }
 
     void DX12Backend::destroySceneResources()
@@ -1733,8 +1709,6 @@ namespace ic
 
         m_gpuScene.shutdown();
 
-        m_pipelineHandles.clear();
-        m_computePipelineHandles.clear();
     }
 
     void DX12Backend::ensurePathTraceResources()
@@ -2891,21 +2865,9 @@ namespace ic
             auto computePipeline = [&](const char* name) -> DX12ComputePipeline*
                 {
                     const PipelineId pipelineId = makePipelineId(name);
-                    auto it = m_computePipelineHandles.find(pipelineId);
-                    ComputePipelineHandle handle{};
-                    if (it != m_computePipelineHandles.end())
-                    {
-                        handle = it->second;
-                    }
-                    else
-                    {
-                        ComputePipelineDesc desc =
-                            m_pipelineLibrary->resolveCompute(
-                                pipelineId,
-                                RendererBackendType::DX12);
-                        handle = m_pipelineManager.requestComputePipeline(desc);
-                        m_computePipelineHandles.emplace(pipelineId, handle);
-                    }
+                    const ComputePipelineHandle handle =
+                        m_pipelineManager.resolveComputePipeline(
+                            *m_pipelineLibrary, pipelineId);
                     return m_pipelineManager.computePipeline(handle);
                 };
 
@@ -2917,23 +2879,6 @@ namespace ic
                 computePipeline("ibl_prefilter");
             DX12ComputePipeline* brdfPipeline =
                 computePipeline("ibl_brdf_lut");
-
-            convertPipeline =
-                m_pipelineManager.computePipeline(
-                    m_computePipelineHandles.at(
-                        makePipelineId("equirect_to_cubemap")));
-            irradiancePipeline =
-                m_pipelineManager.computePipeline(
-                    m_computePipelineHandles.at(
-                        makePipelineId("ibl_irradiance")));
-            prefilterPipeline =
-                m_pipelineManager.computePipeline(
-                    m_computePipelineHandles.at(
-                        makePipelineId("ibl_prefilter")));
-            brdfPipeline =
-                m_pipelineManager.computePipeline(
-                    m_computePipelineHandles.at(
-                        makePipelineId("ibl_brdf_lut")));
 
             if (!convertPipeline ||
                 !irradiancePipeline ||
@@ -3884,30 +3829,6 @@ namespace ic
             });
     }
 
-    void DX12Backend::transitionResource(
-        ID3D12GraphicsCommandList4* cmd,
-        ID3D12Resource* resource,
-        D3D12_RESOURCE_STATES before,
-        D3D12_RESOURCE_STATES after)
-    {
-        if (!resource || before == after)
-        {
-            return;
-        }
-
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-        barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-        barrier.Transition.pResource = resource;
-        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-        barrier.Transition.StateBefore = before;
-        barrier.Transition.StateAfter = after;
-
-        cmd->ResourceBarrier(1, &barrier);
-    }
-
-
-
     void DX12Backend::initImGui(Window& window)
     {
         if (m_imguiEnabled)
@@ -4213,23 +4134,6 @@ namespace ic
         return D3D12_RESOURCE_STATE_COMMON;
     }
 
-    D3D12_RESOURCE_STATES DX12Backend::getOrInitResourceState(
-        ID3D12Resource* resource)
-    {
-        auto it = m_resourceStates.find(resource);
-        if (it != m_resourceStates.end())
-        {
-            return it->second.state;
-        }
-
-        m_resourceStates[resource] = {
-            .state = D3D12_RESOURCE_STATE_PRESENT,
-            .access = AccessType::Read
-        };
-
-        return D3D12_RESOURCE_STATE_PRESENT;
-    }
-
     void DX12Backend::recreateSwapchain()
     {
         m_frameExecutor.waitForGpu();
@@ -4237,11 +4141,8 @@ namespace ic
         m_graphResourceRegistry.reset();
         destroyPathTraceResources();
         m_pipelineManager.shutdown();
-        m_pipelineHandles.clear();
-        m_computePipelineHandles.clear();
         m_swapchain.resize();
         m_pipelineManager.init(m_device);
-        m_resourceStates.clear();
     }
 
     TextureFormat DX12Backend::swapchainTextureFormat() const

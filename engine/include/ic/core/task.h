@@ -19,6 +19,7 @@
 #include <thread>
 #include <variant>
 #include <concepts>
+#include <stdexcept>
 
 namespace ic
 {
@@ -27,12 +28,12 @@ namespace ic
 
     /*
 
-        Task<T> — a C++20 coroutine type layered on top of the existing
-        JobSystem (moodycamel::ConcurrentQueue + counting_semaphore workers).
+        Task<T> — a C++20 coroutine type integrated with the hybrid
+        local-deque/work-stealing JobSystem.
 
-        Coroutines are strictly ADDITIVE: JobTask / kickTasks / waitForCounter
-        are untouched. A coroutine resume is simply a JobTask whose body calls
-        handle.resume(), so the existing worker loop runs it verbatim.
+        A coroutine resume is a direct JobTask payload. Worker-originated child
+        tasks and continuations stay local when capacity allows; external starts
+        and overflow use the shared injection queue.
 
         Three properties the design guarantees, and *why*:
 
@@ -47,10 +48,9 @@ namespace ic
            await_suspend RETURN the child's coroutine_handle (symmetric
            transfer). The compiler tail-resumes the child instead of nesting a
            resume() call, so a chain A -> B -> C -> ... does not grow the stack.
-           On completion, the child's final_suspend hands its parent back to the
-           job queue (scheduleResume) and returns noop_coroutine(): the worker
-           unwinds to its loop (again, no growth) and the parent is resumed by
-           whichever worker dequeues it.
+           On completion, final_suspend symmetrically transfers to the parent.
+           This keeps the chain stack-flat and prevents a second worker from
+           destroying the child before its resume() call has returned.
 
         3. No use-after-free on cross-thread resume.
            A completed child SUSPENDS at final_suspend (it does not self-destroy),
@@ -78,13 +78,10 @@ namespace ic
 
         // Awaiter returned from every task promise's final_suspend().
         //
-        // Resumes the continuation by SCHEDULING it back onto the job system
-        // (requirement: "schedules continuations back onto the job system rather
-        // than blocking a worker"), returning noop_coroutine() so the finishing
-        // worker unwinds to its loop without stack growth. If no system is set
-        // (a task driven purely by inline symmetric transfer, e.g. under
-        // sync_wait with no pool), it falls back to symmetric transferring into
-        // the continuation directly.
+        // Completes with symmetric transfer to the awaiting coroutine. This is
+        // both stack-safe and lifetime-safe: queueing the continuation from
+        // final_suspend would allow another worker to destroy this frame before
+        // the current resume() call returns.
         struct FinalAwaiter
         {
             bool await_ready() const noexcept { return false; }
@@ -104,16 +101,6 @@ namespace ic
                     return std::noop_coroutine();
                 }
 
-                if (JobSystem* system = promise.system())
-                {
-                    // Cross-thread-safe hand-off: publish the continuation to the
-                    // queue and let a worker pick it up. We must not touch this
-                    // frame afterward — treat it as owned by the resuming worker.
-                    system->scheduleResume(continuation);
-                    return std::noop_coroutine();
-                }
-
-                // No job system in play: resume inline via symmetric transfer.
                 return continuation;
             }
 
@@ -142,6 +129,29 @@ namespace ic
             static void operator delete(void* ptr) noexcept
             {
                 CoroutineFramePool::deallocate(ptr);
+            }
+
+            // Over-aligned promise state (for example Task<alignas(64) T>)
+            // bypasses the 16-byte size-class pool and uses the matching
+            // alignment-aware global allocation functions.
+            static void* operator new(
+                std::size_t size,
+                std::align_val_t alignment)
+            {
+                return ::operator new(size, alignment);
+            }
+            static void operator delete(
+                void* ptr,
+                std::align_val_t alignment) noexcept
+            {
+                ::operator delete(ptr, alignment);
+            }
+            static void operator delete(
+                void* ptr,
+                std::size_t,
+                std::align_val_t alignment) noexcept
+            {
+                ::operator delete(ptr, alignment);
             }
 
         protected:
@@ -261,6 +271,10 @@ namespace ic
 
             T await_resume()
             {
+                if (!child)
+                {
+                    throw std::logic_error("cannot await an empty Task");
+                }
                 return child.promise().result();
             }
         };
@@ -375,11 +389,18 @@ namespace ic
 
             m_node.handle = caller;
             m_node.next   = nullptr;
+            JobSystem* system = m_node.system;
+            system->retainSuspended();
 
             // Returns false if the counter already closed (resume inline, node
             // not published — safe to keep using the awaiter). Returns true if
             // published — after which we must not touch anything in this frame.
-            return m_counter->pushWaiter(&m_node);
+            if (!m_counter->pushWaiter(&m_node))
+            {
+                system->releaseSuspended();
+                return false;
+            }
+            return true;
         }
 
         void await_resume() const noexcept {}
@@ -443,6 +464,7 @@ namespace ic
                         // publish. Nothing below may touch the frame.
                         SyncWaitState* waitState = self.promise().state;
                         waitState->done.store(true, std::memory_order_release);
+                        waitState->done.notify_all();
                     }
                     void await_resume() const noexcept {}
                 };
@@ -487,18 +509,28 @@ namespace ic
         {
             runner.handle.promise().state = &state;
             runner.handle.promise().setSystem(&system); // nested awaits fork onto pool
-            runner.handle.resume();                      // begin on the calling thread
+            // Enter through the scheduler even at the blocking boundary. This
+            // makes the runner an outstanding internal unit before it can fork
+            // or suspend, closing the race where shutdown begins while an
+            // externally-started coroutine is between two immediately-ready
+            // awaits. In zero-worker mode the loop below drains this job.
+            system.scheduleResume(runner.handle);
 
             while (!state.done.load(std::memory_order_acquire))
             {
-                const uint64_t epoch = system.workEpoch();
                 if (!system.tryRunOne() &&
                     !state.done.load(std::memory_order_acquire))
                 {
-                    // Rechecking after sampling the epoch closes the enqueue
-                    // race. The atomic wait sleeps until work (normally the
-                    // continuation resume) is published.
-                    system.waitForWork(epoch);
+                    if (system.workerCount() != 0)
+                    {
+                        state.done.wait(false, std::memory_order_acquire);
+                    }
+                    else
+                    {
+                        // With no workers this caller is the executor; keep
+                        // polling so later externally queued work can run.
+                        std::this_thread::yield();
+                    }
                 }
             }
         }
@@ -554,34 +586,27 @@ namespace ic
 
             // Called by the group coroutine when it suspends. Returns true if it
             // should stay suspended (children still outstanding).
-            bool tryAwait(std::coroutine_handle<> continuation, JobSystem* system) noexcept
+            bool tryAwait(std::coroutine_handle<> continuation) noexcept
             {
                 m_continuation = continuation;
-                m_system       = system;
                 return m_count.fetch_sub(1, std::memory_order_acq_rel) > 1;
             }
 
-            // Called by each child on completion; the last one reschedules the
-            // group continuation onto the job queue.
-            void notify() noexcept
+            // Called by each child on completion. The last child symmetrically
+            // transfers into the group, keeping destruction ordered after the
+            // completing child's resume/final-suspend protocol.
+            std::coroutine_handle<> notify() noexcept
             {
                 if (m_count.fetch_sub(1, std::memory_order_acq_rel) == 1)
                 {
-                    if (m_system)
-                    {
-                        m_system->scheduleResume(m_continuation);
-                    }
-                    else if (m_continuation)
-                    {
-                        m_continuation.resume();
-                    }
+                    return m_continuation;
                 }
+                return std::noop_coroutine();
             }
 
         private:
             std::atomic<std::size_t> m_count;
             std::coroutine_handle<>  m_continuation {};
-            JobSystem*               m_system { nullptr };
         };
 
         // Wrapper coroutine: runs one child task, stores its result, then
@@ -596,12 +621,12 @@ namespace ic
             struct FinalNotify
             {
                 bool await_ready() const noexcept { return false; }
-                void await_suspend(handle_type h) const noexcept
+                std::coroutine_handle<> await_suspend(handle_type h) const noexcept
                 {
                     // Notify after the result is stored (return_value already
                     // ran). The wrapper parks here so its stored result stays
                     // alive for the group to read.
-                    h.promise().m_counter->notify();
+                    return h.promise().m_counter->notify();
                 }
                 void await_resume() const noexcept {}
             };
@@ -679,9 +704,9 @@ namespace ic
             struct FinalNotify
             {
                 bool await_ready() const noexcept { return false; }
-                void await_suspend(handle_type h) const noexcept
+                std::coroutine_handle<> await_suspend(handle_type h) const noexcept
                 {
-                    h.promise().m_counter->notify();
+                    return h.promise().m_counter->notify();
                 }
                 void await_resume() const noexcept {}
             };
@@ -750,7 +775,7 @@ namespace ic
             template<typename Promise>
             bool await_suspend(std::coroutine_handle<Promise> group) noexcept
             {
-                return counter.tryAwait(group, group.promise().system());
+                return counter.tryAwait(group);
             }
 
             void await_resume() const noexcept {}
