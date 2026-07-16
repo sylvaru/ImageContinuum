@@ -28,9 +28,42 @@ namespace ic
     {
         m_device = device.device();
         m_resourceAllocator = &resourceAllocator;
+        m_framesInFlight = std::max(1u, framesInFlight);
+        m_frameCounter = 0;
         m_retiredByFrameSlot.clear();
-        m_retiredByFrameSlot.resize(std::max(1u, framesInFlight));
+        m_retiredByFrameSlot.resize(m_framesInFlight);
         m_contentGeneration = 0;
+    }
+
+    uint32_t VulkanGraphResourceRegistry::instanceCountFor(
+        ResourceMultiplicity multiplicity) const noexcept
+    {
+        return multiplicity == ResourceMultiplicity::Single
+            ? 1u
+            : m_framesInFlight;
+    }
+
+    uint32_t VulkanGraphResourceRegistry::currentInstanceIndex(
+        const VulkanGraphResourceInstances& instances) const noexcept
+    {
+        const uint32_t count = static_cast<uint32_t>(instances.slots.size());
+        // Per-frame-slot resources index by the executor's frame slot so they
+        // align with every other frame-slot-indexed backend structure (command
+        // buffers, cached descriptor sets, retirement buckets). Only history
+        // resources index by the monotonic submitted-frame counter. That is
+        // what makes their "previous" skip-safe.
+        if (instances.multiplicity == ResourceMultiplicity::History)
+        {
+            return currentFrameInstanceIndex(m_frameCounter, count);
+        }
+        return currentFrameInstanceIndex(m_frameSlot, count);
+    }
+
+    uint32_t VulkanGraphResourceRegistry::previousInstanceIndex(
+        const VulkanGraphResourceInstances& instances) const noexcept
+    {
+        return previousFrameInstanceIndex(
+            m_frameCounter, static_cast<uint32_t>(instances.slots.size()));
     }
 
     void VulkanGraphResourceRegistry::shutdown()
@@ -43,9 +76,12 @@ namespace ic
 
     void VulkanGraphResourceRegistry::reset() noexcept
     {
-        for (auto& [id, entry] : m_entries)
+        for (auto& [id, instances] : m_entries)
         {
-            destroyEntry(entry);
+            for (VulkanGraphResourceEntry& entry : instances.slots)
+            {
+                destroyEntry(entry);
+            }
         }
         m_entries.clear();
 
@@ -84,15 +120,43 @@ namespace ic
         const VulkanGraphResourceImports& imports)
     {
         assert(frameSlot < m_retiredByFrameSlot.size());
+        // Executor frame slot (drives per-frame-slot instance selection).
+        m_frameSlot = frameSlot;
+        // Monotonic submitted-frame count (drives history current/previous
+        // selection), advanced once per recorded frame regardless of skips.
+        ++m_frameCounter;
 
         for (const GraphResource& resource : plan.resources)
         {
-            VulkanGraphResourceEntry& entry = m_entries[resource.id];
+            VulkanGraphResourceInstances& instances = m_entries[resource.id];
+            instances.multiplicity = resource.multiplicity;
 
             uint32_t resolvedWidth = resource.textureDesc.width;
             uint32_t resolvedHeight = resource.textureDesc.height;
             if (resolvedWidth == 0) resolvedWidth = defaultWidth;
             if (resolvedHeight == 0) resolvedHeight = defaultHeight;
+
+            // Size the instance ring for this resource's multiplicity. Extra
+            // slots (from a shrinking ring) are retired into the current frame
+            // slot so they are freed only after this slot's GPU work completes.
+            const uint32_t desiredCount =
+                resource.ownership == ResourceOwnership::Imported
+                    ? 1u
+                    : instanceCountFor(resource.multiplicity);
+            while (instances.slots.size() > desiredCount)
+            {
+                retireEntry(std::move(instances.slots.back()), frameSlot);
+                instances.slots.pop_back();
+            }
+            if (instances.slots.size() < desiredCount)
+            {
+                instances.slots.resize(desiredCount);
+            }
+
+            // Only the current frame slot's instance is (re)materialized here;
+            // the other slots are materialized when their own frame comes round.
+            const uint32_t index = currentInstanceIndex(instances);
+            VulkanGraphResourceEntry& entry = instances.slots[index];
 
             if (resource.ownership == ResourceOwnership::Imported)
             {
@@ -147,7 +211,10 @@ namespace ic
                 continue;
             }
 
-            retireEntry(std::move(it->second), frameSlot);
+            for (VulkanGraphResourceEntry& entry : it->second.slots)
+            {
+                retireEntry(std::move(entry), frameSlot);
+            }
             it = m_entries.erase(it);
         }
     }
@@ -156,14 +223,44 @@ namespace ic
         GraphResourceId id) noexcept
     {
         auto it = m_entries.find(id);
-        return it != m_entries.end() ? &it->second : nullptr;
+        if (it == m_entries.end() || it->second.slots.empty())
+        {
+            return nullptr;
+        }
+        return &it->second.slots[currentInstanceIndex(it->second)];
     }
 
     const VulkanGraphResourceEntry* VulkanGraphResourceRegistry::entry(
         GraphResourceId id) const noexcept
     {
         auto it = m_entries.find(id);
-        return it != m_entries.end() ? &it->second : nullptr;
+        if (it == m_entries.end() || it->second.slots.empty())
+        {
+            return nullptr;
+        }
+        return &it->second.slots[currentInstanceIndex(it->second)];
+    }
+
+    VulkanGraphResourceEntry* VulkanGraphResourceRegistry::previousEntry(
+        GraphResourceId id) noexcept
+    {
+        auto it = m_entries.find(id);
+        if (it == m_entries.end() || it->second.slots.empty())
+        {
+            return nullptr;
+        }
+        return &it->second.slots[previousInstanceIndex(it->second)];
+    }
+
+    const VulkanGraphResourceEntry* VulkanGraphResourceRegistry::previousEntry(
+        GraphResourceId id) const noexcept
+    {
+        auto it = m_entries.find(id);
+        if (it == m_entries.end() || it->second.slots.empty())
+        {
+            return nullptr;
+        }
+        return &it->second.slots[previousInstanceIndex(it->second)];
     }
 
     bool VulkanGraphResourceRegistry::entryMatches(
@@ -186,11 +283,26 @@ namespace ic
                    entry.textureDesc.memoryUsage == resource.textureDesc.memoryUsage;
         }
 
+        const BufferDesc desc = resolvedBufferDesc(resource);
         return static_cast<bool>(entry.buffer) &&
-               entry.bufferDesc.size == resource.bufferDesc.size &&
-               entry.bufferDesc.usage == resource.bufferDesc.usage &&
-               entry.bufferDesc.memoryUsage == resource.bufferDesc.memoryUsage &&
-               entry.bufferDesc.mappedAtCreation == resource.bufferDesc.mappedAtCreation;
+               entry.bufferDesc.size == desc.size &&
+               entry.bufferDesc.usage == desc.usage &&
+               entry.bufferDesc.memoryUsage == desc.memoryUsage &&
+               entry.bufferDesc.mappedAtCreation == desc.mappedAtCreation;
+    }
+
+    BufferDesc VulkanGraphResourceRegistry::resolvedBufferDesc(
+        const GraphResource& resource) const noexcept
+    {
+        BufferDesc desc = resource.bufferDesc;
+        if (resource.semantic ==
+                GraphResourceSemantic::GpuDrivenIndirectArguments &&
+            desc.elementCount > 0 && m_indirectCommandStride > 0)
+        {
+            desc.size = static_cast<uint64_t>(desc.elementCount) *
+                m_indirectCommandStride;
+        }
+        return desc;
     }
 
     void VulkanGraphResourceRegistry::materializeTexture(
@@ -248,8 +360,9 @@ namespace ic
         VulkanGraphResourceEntry& entry,
         const GraphResource& resource)
     {
-        entry.bufferDesc = resource.bufferDesc;
-        entry.buffer = m_resourceAllocator->createBuffer(resource.bufferDesc);
+        const BufferDesc bufferDesc = resolvedBufferDesc(resource);
+        entry.bufferDesc = bufferDesc;
+        entry.buffer = m_resourceAllocator->createBuffer(bufferDesc);
         entry.generation = nextGeneration();
     }
 

@@ -169,6 +169,14 @@ namespace ic
         BufferUsageFlags usage = BufferUsageFlags::None;
         ResourceMemoryUsage memoryUsage = ResourceMemoryUsage::GpuOnly;
         bool mappedAtCreation = false;
+        // Element count for buffers whose per-element byte stride is defined by
+        // the backend rather than by an API-neutral struct (currently only the
+        // GPU-driven indirect-command buffer: DX12 packs root constants into a
+        // 36-byte command, Vulkan uses a 20-byte VkDrawIndexedIndirectCommand).
+        // When non-zero and the resource carries a native-stride semantic, the
+        // backend registry sizes the buffer as elementCount * nativeStride and
+        // ignores `size`. Zero means `size` is authoritative.
+        uint32_t elementCount = 0;
         const char* debugName = nullptr;
     };
 

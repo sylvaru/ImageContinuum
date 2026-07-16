@@ -5,25 +5,79 @@
 #include "ic/renderer/vulkan_backend/vulkan_pipeline_manager.h"
 #include "ic/renderer/frame_graph/compiled_graph_plan.h"
 
+#include <cstdint>
 #include <functional>
 #include <span>
 #include <vulkan/vulkan.h>
 
 namespace ic
 {
+    struct FrameContext;
+    struct SceneRenderView;
+    class VulkanResourceAllocator;
+    class VulkanPipelineManager;
+    class VulkanGpuScene;
+
     // Lightweight, API-specific pass context handed to the Vulkan pass
-    // recorders. Carries the native command buffer, executing node, graph
-    // resource registry and device. It does NOT own the swapchain, frame
-    // lifecycle or queue submission; the backend performs resource
-    // "ensure"/prepare before invoking a recorder. Passed by const&.
+    // recorders. Carries the native command buffer, executing node/plan,
+    // per-frame + scene views, and narrow references to the SHARED subsystems a
+    // recorder reads to resolve graph resources, upload constants, and bind
+    // pipelines. It does NOT own the swapchain lifecycle, queue submission, or
+    // any backend-private per-technique resource struct (those the backend
+    // resolves into a pass-specific *Inputs struct, performing ensure/prepare and
+    // state-tracked transitions itself). Passed by const&.
     struct VulkanPassContext
     {
         VkCommandBuffer cmd = VK_NULL_HANDLE;
         const CompiledGraphPlan* plan = nullptr;
         const ExecutionNode* node = nullptr;
+        const FrameContext* frame = nullptr;
+        const SceneRenderView* scene = nullptr;
         VulkanGraphResourceRegistry* resources = nullptr;
         VkDevice device = VK_NULL_HANDLE;
+        VulkanResourceAllocator* allocator = nullptr;
+        VulkanPipelineManager* pipelines = nullptr;
+        VulkanGpuScene* gpuScene = nullptr;
+        VkExtent2D surfaceExtent = {};
     };
+
+    // Native, already-resolved source/destination for a transfer-copy pass. The
+    // backend resolves both (imported swapchain, backend-private path-trace
+    // targets) and applies any state-tracked transition first; the recorder owns
+    // the copy command.
+    struct VulkanTransferCopy
+    {
+        bool isBuffer = false;
+        VkBuffer sourceBuffer = VK_NULL_HANDLE;
+        VkBuffer destinationBuffer = VK_NULL_HANDLE;
+        VkDeviceSize bufferSize = 0;
+        VkImage sourceImage = VK_NULL_HANDLE;
+        VkImage destinationImage = VK_NULL_HANDLE;
+        uint32_t width = 0;
+        uint32_t height = 0;
+    };
+
+    void recordTransferCopy(
+        VkCommandBuffer cmd,
+        const VulkanTransferCopy& copy);
+
+    // Diagnostic storage-buffer compute pass. The backend has bound the pipeline
+    // and ensured the resources + descriptor set; the recorder binds the set,
+    // dispatches, and issues the trailing buffer barrier.
+    struct VulkanComputeStorageBufferTest
+    {
+        VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+        VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceSize bufferSize = 0;
+        uint32_t groupCountX = 1;
+        uint32_t groupCountY = 1;
+        uint32_t groupCountZ = 1;
+    };
+
+    void recordComputeStorageBufferTest(
+        const VulkanPassContext& ctx,
+        const VulkanComputeStorageBufferTest& test);
 
     struct VulkanHiZInputs
     {
@@ -89,7 +143,7 @@ namespace ic
     // DrawIndexed submission loop for a prepared scene draw list, or the
     // vkCmdDrawIndexedIndirectCount-per-bin path when useGpuDriven is set.
     // This is the draw-submission body shared by the depth prepass and the
-    // forward scene pass alike — both pipelines route scene geometry through
+    // forward scene pass alike. Both pipelines route scene geometry through
     // this same recorder, differing only in bound descriptor set/pixel
     // output, which the caller sets up beforehand.
     void recordSceneGeometryDraws(

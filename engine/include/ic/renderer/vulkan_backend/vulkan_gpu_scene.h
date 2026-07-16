@@ -41,9 +41,9 @@ namespace ic
         VulkanBuffer frameConstants;
         VulkanBuffer objects;
         VulkanBuffer materials;
-        VulkanBuffer visibleLights;
-        VulkanBuffer instanceBounds;
-        VulkanBuffer drawInputs;
+        // visibleLights and the GPU-driven cull inputs are NOT here:
+        // they are frame-graph-registry owned (per frame slot) and uploaded into
+        // by the backend, so there is no duplicate backend allocation.
 
         VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
         VkDescriptorPool hiZDescriptorPool = VK_NULL_HANDLE;
@@ -52,9 +52,6 @@ namespace ic
 
         uint32_t objectCapacity = 0;
         uint32_t materialCapacity = 0;
-        uint32_t visibleLightCapacity = 0;
-        uint32_t instanceBoundsCapacity = 0;
-        uint32_t drawInputCapacity = 0;
         uint32_t bindlessTextureCount = 0;
         uint32_t bindlessSamplerCount = 0;
         uint64_t environmentVersion = UINT64_MAX;
@@ -130,6 +127,23 @@ namespace ic
         {
             return static_cast<uint32_t>(m_prepared.instanceBounds().size());
         }
+        // Prepared GPU-driven cull inputs, uploaded by the backend into the
+        // graph-owned per-frame-slot buffers.
+        [[nodiscard]] std::span<const GpuInstanceBounds>
+            preparedInstanceBounds() const noexcept
+        {
+            return m_prepared.instanceBounds();
+        }
+        [[nodiscard]] std::span<const GpuDrawInput>
+            preparedDrawInputs() const noexcept
+        {
+            return m_prepared.drawInputs();
+        }
+        [[nodiscard]] std::span<const GpuVisibleLight>
+            preparedVisibleLights() const noexcept
+        {
+            return m_prepared.visibleLights();
+        }
 
         [[nodiscard]] VulkanGpuSceneFrameResources& frameResources(
             uint32_t frameSlot) noexcept
@@ -146,22 +160,8 @@ namespace ic
             return static_cast<uint32_t>(m_frames.size());
         }
 
-        // Ensures the GPU-driven cull/indirect buffers exist for the given
-        // capacity. Mirrors the caller's own recreate-on-resize guard timing;
-        // it does not decide when to recreate, only how.
-        void ensureCullBuffers(uint32_t maxInstances, uint32_t maxBins);
-        void destroyCullBuffers();
-
-        // Public: consumed directly by the pass recorders, the combined
-        // descriptor-set builder, and the graphics draw path.
-        VulkanBuffer visibleInstances;
-        VulkanBuffer visibleInstanceCount;
-        VulkanBuffer visibleInstanceCountReadback;
-        VulkanBuffer indirectArguments;
-        VulkanBuffer drawMetadata;
-        VulkanBuffer binCounts;
-        uint32_t maxInstances = 0;
-        uint32_t lastVisibleInstanceCount = 0;
+        // The GPU-driven cull/indirect buffers are owned by the frame-graph
+        // registry, not this class.
         bool loggedGpuCull = false;
 
     private:

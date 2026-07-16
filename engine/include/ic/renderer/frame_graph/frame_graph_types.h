@@ -68,6 +68,49 @@ namespace ic
         Imported
     };
 
+    // How many physical instances a graph resource is backed by across frames
+    // in flight. This is orthogonal to ownership (transient vs persistent):
+    //   - Single       : one physical resource reused every frame. Correct only
+    //                     for resources whose cross-frame reuse is otherwise
+    //                     serialized (persistent buffers, borrowed imports).
+    //   - PerFrameSlot  : one physical resource per frame-in-flight slot. The
+    //                     registry hands out the current slot's instance, so two
+    //                     frames in flight never touch the same physical memory.
+    //                     This is the default for transient resources.
+    //   - History       : per-frame-slot instances PLUS explicit access to the
+    //                     previous frame's instance (registry previousEntry),
+    //                     for temporal / ping-pong techniques.
+    enum class ResourceMultiplicity : uint8_t
+    {
+        Single,
+        PerFrameSlot,
+        History
+    };
+
+    // Physical instance selection within a resource's N-instance ring. Both are
+    // driven by a monotonic per-submitted-frame counter (NOT frameIndex), so
+    // skipped frames, where render() returns before recording, never advance
+    // the ring and therefore never make the previous instance stale. current and
+    // previous are always distinct when instanceCount > 1, and
+    // previousFrameInstanceIndex(counter) == currentFrameInstanceIndex(counter-1)
+    // so "previous" always resolves to the immediately preceding submitted frame.
+    [[nodiscard]] inline uint32_t currentFrameInstanceIndex(
+        uint64_t frameCounter, uint32_t instanceCount) noexcept
+    {
+        return instanceCount <= 1u
+            ? 0u
+            : static_cast<uint32_t>(frameCounter % instanceCount);
+    }
+
+    [[nodiscard]] inline uint32_t previousFrameInstanceIndex(
+        uint64_t frameCounter, uint32_t instanceCount) noexcept
+    {
+        return instanceCount <= 1u
+            ? 0u
+            : static_cast<uint32_t>(
+                  (frameCounter + instanceCount - 1u) % instanceCount);
+    }
+
     enum class GraphResourceSemantic : uint8_t
     {
         Generic = 0,
@@ -76,7 +119,19 @@ namespace ic
         ClusterLightIndices,
         ClusterLightCounter,
         VisibleLights,
-        PathTraceTonemap
+        PathTraceTonemap,
+        // GPU-driven buffers owned by the graph registry and bound by both
+        // backends. Inputs (InstanceBounds, DrawInputs) are CPU-uploaded per
+        // frame slot; the rest are compute-cull outputs. IndirectArguments
+        // carries a backend-defined native command stride (see
+        // BufferDesc::elementCount).
+        GpuDrivenInstanceBounds,
+        GpuDrivenDrawInputs,
+        GpuDrivenVisibleInstances,
+        GpuDrivenVisibleCount,
+        GpuDrivenIndirectArguments,
+        GpuDrivenDrawMetadata,
+        GpuDrivenBinCounts
     };
 
     enum class ImportedResource : uint8_t
@@ -98,6 +153,9 @@ namespace ic
         ResourceUsage oldUsage;
         ResourceUsage newUsage;
         bool firstUse = false;
+        // Targets the previous-frame instance of a history resource rather than
+        // the current instance, so the backend transitions previousEntry().
+        bool previousVersion = false;
     };
 
     struct ResourceAccess
@@ -109,6 +167,11 @@ namespace ic
 
         bool external = false;
         bool firstUse = false;
+        // A read of the previous-frame version of a history resource. Such
+        // accesses form their own resource chain in the compiler so they never
+        // create an intra-frame dependency on this frame's writer of the same
+        // resource (which would be a false dependency or a cycle).
+        bool previousVersion = false;
     };
 
     struct ResourceState
@@ -130,6 +193,7 @@ namespace ic
         GraphResourceType type;
         ResourceOwnership ownership;
         ImportedResource imported;
+        ResourceMultiplicity multiplicity = ResourceMultiplicity::Single;
         GraphResourceSemantic semantic = GraphResourceSemantic::Generic;
         ResourceUsage initialUsage;
         AccessType initialAccess;
@@ -225,6 +289,31 @@ namespace ic
         uint32_t resourceAccessCount = 0;
     };
 
+    // A cross-frame GPU ordering edge derived from a genuine shared-resource
+    // hazard. It replaces the old blanket "every level-0 batch waits for the
+    // previous frame's whole graph" rule: only submissions that actually touch a
+    // resource whose physical memory is reused across frames are ordered, and
+    // only against the specific previous-frame submission that last used it.
+    //
+    // Semantics: this frame's `consumerSubmission` must wait for the PREVIOUS
+    // frame's `producerSubmission` to complete, but only when `consumerNode`
+    // actually executes this frame (a cadence-skipped writer creates no hazard,
+    // so per-frame-slot-only and skipped-write frames overlap freely).
+    //   - Single/persistent written resource (WAR/WAW): consumerNode = the first
+    //     writer this frame; producerSubmission = the submission that last
+    //     accessed the resource (so the new write waits for the old last read).
+    //   - History previous-instance read (RAW): consumerNode = the previous-
+    //     version reader; producerSubmission = the submission that writes the
+    //     current instance (the one the next frame reads).
+    // Per-frame-slot and imported resources never appear here.
+    struct CrossFrameDependency
+    {
+        GraphResourceId resource;
+        GraphNodeId consumerNode;
+        uint32_t consumerSubmission;
+        uint32_t producerSubmission;
+    };
+
     static_assert(sizeof(QueueType) == 1);
     static_assert(sizeof(GraphNodeType) == 1);
     static_assert(sizeof(GraphResourceType) == 1);
@@ -234,7 +323,7 @@ namespace ic
     static_assert(sizeof(ImportedResource) == 1);
 
     static_assert(sizeof(ResourceBarrier) == 20);
-    static_assert(sizeof(ResourceAccess) == 12);
+    static_assert(sizeof(ResourceAccess) == 16);
     static_assert(sizeof(ResourceState) == 2);
     static_assert(sizeof(ImportedResourceDesc) == 2);
 
@@ -249,4 +338,5 @@ namespace ic
     static_assert(sizeof(QueueSubmissionWait) == 4);
     static_assert(sizeof(QueueSubmissionBatch) == 24);
     static_assert(sizeof(ExecutionNode) == 36);
+    static_assert(sizeof(CrossFrameDependency) == 16);
 }

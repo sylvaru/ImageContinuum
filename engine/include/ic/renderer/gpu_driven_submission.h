@@ -26,16 +26,25 @@ namespace ic
         FrameGraphBuilder& builder)
     {
         GpuDrivenGraphResources resources{};
+
+        // Cull inputs are CPU-uploaded each frame; the registry hands out a
+        // per-frame-slot mapped instance so the backend memcpys straight into
+        // the graph-owned buffer (no separate backend upload buffer).
         resources.instanceBounds = builder.createBuffer({
             .size = MaxGpuDrivenDraws * sizeof(GpuInstanceBounds),
             .usage = BufferUsageFlags::Storage,
-            .memoryUsage = ResourceMemoryUsage::GpuOnly,
+            .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+            .mappedAtCreation = true,
             .debugName = "GpuDriven.InstanceBounds" });
         resources.drawInputs = builder.createBuffer({
             .size = MaxGpuDrivenDraws * sizeof(GpuDrawInput),
             .usage = BufferUsageFlags::Storage,
-            .memoryUsage = ResourceMemoryUsage::GpuOnly,
+            .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+            .mappedAtCreation = true,
             .debugName = "GpuDriven.DrawInputs" });
+
+        // Cull outputs are GPU-only; the graph's barriers own their state and
+        // the queue/UAV ordering (no manual backend state tracking).
         resources.visibleInstances = builder.createBuffer({
             .size = MaxGpuDrivenDraws * sizeof(uint32_t),
             .usage = BufferUsageFlags::Storage,
@@ -46,10 +55,13 @@ namespace ic
             .usage = BufferUsageFlags::Storage | BufferUsageFlags::TransferSrc,
             .memoryUsage = ResourceMemoryUsage::GpuOnly,
             .debugName = "GpuDriven.VisibleCount" });
+        // Native command stride is backend-defined: declare by element count and
+        // let each backend's registry size it (DX12 36 bytes w/ root constants,
+        // Vulkan 20-byte VkDrawIndexedIndirectCommand). See BufferDesc.
         resources.indirectArguments = builder.createBuffer({
-            .size = MaxGpuDrivenDraws * sizeof(GpuIndexedIndirectArguments),
             .usage = BufferUsageFlags::Storage | BufferUsageFlags::Indirect,
             .memoryUsage = ResourceMemoryUsage::GpuOnly,
+            .elementCount = MaxGpuDrivenDraws,
             .debugName = "GpuDriven.IndirectArguments" });
         resources.drawMetadata = builder.createBuffer({
             .size = MaxGpuDrivenDraws * sizeof(GpuDrawMetadata),
@@ -61,6 +73,28 @@ namespace ic
             .usage = BufferUsageFlags::Storage | BufferUsageFlags::Indirect,
             .memoryUsage = ResourceMemoryUsage::GpuOnly,
             .debugName = "GpuDriven.BinCounts" });
+
+        builder.setResourceSemantic(
+            resources.instanceBounds,
+            GraphResourceSemantic::GpuDrivenInstanceBounds);
+        builder.setResourceSemantic(
+            resources.drawInputs,
+            GraphResourceSemantic::GpuDrivenDrawInputs);
+        builder.setResourceSemantic(
+            resources.visibleInstances,
+            GraphResourceSemantic::GpuDrivenVisibleInstances);
+        builder.setResourceSemantic(
+            resources.visibleCount,
+            GraphResourceSemantic::GpuDrivenVisibleCount);
+        builder.setResourceSemantic(
+            resources.indirectArguments,
+            GraphResourceSemantic::GpuDrivenIndirectArguments);
+        builder.setResourceSemantic(
+            resources.drawMetadata,
+            GraphResourceSemantic::GpuDrivenDrawMetadata);
+        builder.setResourceSemantic(
+            resources.binCounts,
+            GraphResourceSemantic::GpuDrivenBinCounts);
         return resources;
     }
 

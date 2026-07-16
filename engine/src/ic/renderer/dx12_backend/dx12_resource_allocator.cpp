@@ -307,15 +307,15 @@ namespace ic
         D3D12_RESOURCE_FLAGS flags =
             D3D12_RESOURCE_FLAG_NONE;
 
-        if (hasFlag(desc.usage, BufferUsageFlags::Storage))
+        // Only GPU-only storage buffers become UAVs. A non-GPU-only storage
+        // buffer lives on the upload heap (which cannot carry the UAV flag) and
+        // is a shader-readable structured buffer bound as an SRV, such as the
+        // graph-owned, CPU-uploaded GPU-driven cull inputs. Vulkan expresses the
+        // same buffers with VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, so the shared
+        // API-neutral declaration carries BufferUsageFlags::Storage for both.
+        if (hasFlag(desc.usage, BufferUsageFlags::Storage) &&
+            desc.memoryUsage == ResourceMemoryUsage::GpuOnly)
         {
-            if (desc.memoryUsage != ResourceMemoryUsage::GpuOnly)
-            {
-                throw std::runtime_error(
-                    std::string("DX12 storage/UAV buffers must be GPU-only: ") +
-                    (desc.debugName ? desc.debugName : "<unnamed>"));
-            }
-
             flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         }
 

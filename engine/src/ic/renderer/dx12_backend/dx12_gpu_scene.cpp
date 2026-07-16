@@ -39,16 +39,11 @@ namespace ic
 
     void DX12GpuScene::shutdown()
     {
-        destroyCullBuffers();
-
         for (DX12GpuSceneFrameResources& frame : m_frames)
         {
             m_resourceAllocator->destroyBuffer(frame.frameConstants);
             m_resourceAllocator->destroyBuffer(frame.objects);
             m_resourceAllocator->destroyBuffer(frame.materials);
-            m_resourceAllocator->destroyBuffer(frame.visibleLights);
-            m_resourceAllocator->destroyBuffer(frame.instanceBounds);
-            m_resourceAllocator->destroyBuffer(frame.drawInputs);
             m_descriptorSystem->releaseResourceDescriptors(frame.objectSrv);
             m_descriptorSystem->releaseResourceDescriptors(frame.materialSrv);
         }
@@ -57,68 +52,6 @@ namespace ic
         m_device = nullptr;
         m_resourceAllocator = nullptr;
         m_descriptorSystem = nullptr;
-    }
-
-    void DX12GpuScene::ensureCullBuffers(
-        ID3D12Device5* device,
-        uint32_t maxCullInstances,
-        uint32_t maxBins)
-    {
-        destroyCullBuffers();
-
-        maxInstances = maxCullInstances;
-
-        visibleInstances = m_resourceAllocator->createBuffer({
-            .size = maxCullInstances * sizeof(uint32_t),
-            .usage = BufferUsageFlags::Storage,
-            .memoryUsage = ResourceMemoryUsage::GpuOnly,
-            .debugName = "DX12 GPU cull visible instances"
-        });
-        visibleInstanceCount = m_resourceAllocator->createBuffer({
-            .size = sizeof(uint32_t),
-            .usage = BufferUsageFlags::Storage | BufferUsageFlags::TransferSrc,
-            .memoryUsage = ResourceMemoryUsage::GpuOnly,
-            .debugName = "DX12 GPU cull visible count"
-        });
-        visibleInstanceCountReadback = m_resourceAllocator->createBuffer({
-            .size = sizeof(uint32_t),
-            .usage = BufferUsageFlags::TransferDst,
-            .memoryUsage = ResourceMemoryUsage::GpuToCpu,
-            .mappedAtCreation = true,
-            .debugName = "DX12 GPU cull visible count readback"
-        });
-        indirectArguments = m_resourceAllocator->createBuffer({
-            .size = maxCullInstances * sizeof(DX12GpuIndexedIndirectCommand),
-            .usage = BufferUsageFlags::Storage | BufferUsageFlags::Indirect,
-            .memoryUsage = ResourceMemoryUsage::GpuOnly,
-            .debugName = "DX12 GPU-driven indirect arguments"
-        });
-        binCounts = m_resourceAllocator->createBuffer({
-            .size = maxBins * sizeof(uint32_t),
-            .usage = BufferUsageFlags::Storage | BufferUsageFlags::Indirect,
-            .memoryUsage = ResourceMemoryUsage::GpuOnly,
-            .debugName = "DX12 GPU-driven bin counts"
-        });
-
-        visibleInstancesState = visibleInstances.initialState;
-        visibleInstanceCountState = visibleInstanceCount.initialState;
-        indirectArgumentsState = indirectArguments.initialState;
-        binCountsState = binCounts.initialState;
-
-        (void)device;
-    }
-
-    void DX12GpuScene::destroyCullBuffers()
-    {
-        m_resourceAllocator->destroyBuffer(visibleInstances);
-        m_resourceAllocator->destroyBuffer(visibleInstanceCount);
-        m_resourceAllocator->destroyBuffer(visibleInstanceCountReadback);
-        m_resourceAllocator->destroyBuffer(indirectArguments);
-        m_resourceAllocator->destroyBuffer(binCounts);
-        visibleInstancesState = D3D12_RESOURCE_STATE_COMMON;
-        visibleInstanceCountState = D3D12_RESOURCE_STATE_COMMON;
-        indirectArgumentsState = D3D12_RESOURCE_STATE_COMMON;
-        binCountsState = D3D12_RESOURCE_STATE_COMMON;
     }
 
     ID3D12CommandSignature* DX12GpuScene::indirectCommandSignature(
@@ -185,10 +118,10 @@ namespace ic
             m_prepared.materials();
         const std::span<const GpuVisibleLight> visibleLights =
             m_prepared.visibleLights();
+        // Only the count is needed here (for GpuFrameData); the bounds/inputs
+        // themselves are uploaded by the backend into the graph-owned buffers.
         const std::span<const GpuInstanceBounds> instanceBounds =
             m_prepared.instanceBounds();
-        const std::span<const GpuDrawInput> drawInputs =
-            m_prepared.drawInputs();
 
         DX12GpuSceneFrameResources& frameResources = m_frames[frameSlot];
 
@@ -279,48 +212,8 @@ namespace ic
                 frameResources.materialSrv.cpuStart);
         }
 
-        if (visibleLights.size() > frameResources.visibleLightCapacity)
-        {
-            m_resourceAllocator->destroyBuffer(frameResources.visibleLights);
-            frameResources.visibleLights =
-                m_resourceAllocator->createBuffer({
-                    .size = visibleLights.size() * sizeof(GpuVisibleLight),
-                    .usage = BufferUsageFlags::None,
-                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                    .mappedAtCreation = true,
-                    .debugName = "DX12 clustered visible lights"
-                });
-            frameResources.visibleLightCapacity =
-                static_cast<uint32_t>(visibleLights.size());
-        }
-
-        if (instanceBounds.size() > frameResources.instanceBoundsCapacity)
-        {
-            m_resourceAllocator->destroyBuffer(frameResources.instanceBounds);
-            frameResources.instanceBounds =
-                m_resourceAllocator->createBuffer({
-                    .size = instanceBounds.size() * sizeof(GpuInstanceBounds),
-                    .usage = BufferUsageFlags::None,
-                    .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                    .mappedAtCreation = true,
-                    .debugName = "DX12 GPU cull instance bounds"
-                });
-            frameResources.instanceBoundsCapacity =
-                static_cast<uint32_t>(instanceBounds.size());
-        }
-        if (drawInputs.size() > frameResources.drawInputCapacity)
-        {
-            m_resourceAllocator->destroyBuffer(frameResources.drawInputs);
-            frameResources.drawInputs = m_resourceAllocator->createBuffer({
-                .size = drawInputs.size() * sizeof(GpuDrawInput),
-                .usage = BufferUsageFlags::None,
-                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
-                .mappedAtCreation = true,
-                .debugName = "DX12 GPU-driven draw inputs" });
-            frameResources.drawInputCapacity =
-                static_cast<uint32_t>(drawInputs.size());
-        }
-
+        // visibleLights / instanceBounds / drawInputs are uploaded by the
+        // backend into the graph-owned per-frame-slot buffers, not here.
         const GpuFrameData frameData = buildFrameData(
             static_cast<uint32_t>(visibleLights.size()),
             static_cast<uint32_t>(instanceBounds.size()),
@@ -338,18 +231,6 @@ namespace ic
             frameResources.materials.mapped,
             materials.data(),
             materials.size() * sizeof(GpuMaterialData));
-        std::memcpy(
-            frameResources.visibleLights.mapped,
-            visibleLights.data(),
-            visibleLights.size() * sizeof(GpuVisibleLight));
-        std::memcpy(
-            frameResources.instanceBounds.mapped,
-            instanceBounds.data(),
-            instanceBounds.size() * sizeof(GpuInstanceBounds));
-        std::memcpy(
-            frameResources.drawInputs.mapped,
-            drawInputs.data(),
-            drawInputs.size() * sizeof(GpuDrawInput));
 
         return true;
     }

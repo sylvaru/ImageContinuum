@@ -84,8 +84,72 @@ namespace ic
         spdlog::info("[DX12Device] Shutdown");
     }
 
+    void DX12Device::logDeviceRemovedDred()
+    {
+        if (!m_device || m_device->GetDeviceRemovedReason() == S_OK)
+        {
+            return;
+        }
+        static bool logged = false;
+        if (logged)
+        {
+            return;
+        }
+        logged = true;
+
+        Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData1> dred;
+        if (FAILED(m_device.As(&dred)))
+        {
+            spdlog::error("[DRED] Extended data interface unavailable.");
+            return;
+        }
+
+        D3D12_DRED_PAGE_FAULT_OUTPUT1 pageFault{};
+        if (SUCCEEDED(dred->GetPageFaultAllocationOutput1(&pageFault)))
+        {
+            spdlog::error(
+                "[DRED] PageFaultVA = 0x{:016x}",
+                static_cast<uint64_t>(pageFault.PageFaultVA));
+            const auto logAllocs =
+                [](const D3D12_DRED_ALLOCATION_NODE1* node, const char* which)
+                {
+                    for (; node != nullptr; node = node->pNext)
+                    {
+                        spdlog::error(
+                            "[DRED]   {} alloc: '{}' type={}",
+                            which,
+                            node->ObjectNameA ? node->ObjectNameA : "<unnamed>",
+                            static_cast<int>(node->AllocationType));
+                    }
+                };
+            logAllocs(pageFault.pHeadExistingAllocationNode, "existing");
+            logAllocs(pageFault.pHeadRecentFreedAllocationNode, "freed");
+        }
+
+        D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 crumbs{};
+        if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput1(&crumbs)))
+        {
+            for (const D3D12_AUTO_BREADCRUMB_NODE1* node =
+                     crumbs.pHeadAutoBreadcrumbNode;
+                 node != nullptr; node = node->pNext)
+            {
+                const uint32_t last = node->pLastBreadcrumbValue
+                    ? *node->pLastBreadcrumbValue : 0u;
+                spdlog::error(
+                    "[DRED] Breadcrumb cmdlist='{}' queue='{}' completed={}/{}",
+                    node->pCommandListDebugNameA
+                        ? node->pCommandListDebugNameA : "?",
+                    node->pCommandQueueDebugNameA
+                        ? node->pCommandQueueDebugNameA : "?",
+                    last, node->BreadcrumbCount);
+            }
+        }
+    }
+
     void DX12Device::logValidationMessages()
     {
+        logDeviceRemovedDred();
+
         if (!m_infoQueue)
         {
             return;

@@ -15,6 +15,7 @@
 #include "ic/renderer/vulkan_backend/vulkan_upload_scheduler.h"
 #include "ic/renderer/vulkan_backend/vulkan_retirement_queue.h"
 #include "ic/renderer/vulkan_backend/vulkan_gpu_scene.h"
+#include "ic/renderer/vulkan_backend/vulkan_pass_recorders.h"
 #include "ic/renderer/renderer_gpu_assets.h"
 #include "ic/renderer/path_tracing/path_tracer_types.h"
 
@@ -40,6 +41,8 @@ namespace ic
 
         void shutdown() override;
 
+        [[nodiscard]] RenderSurfaceState reconcileRenderSurface() override;
+
         [[nodiscard]] bool execute(
             const CompiledGraphPlan& plan,
             const GraphExecutionContext& execution,
@@ -62,6 +65,10 @@ namespace ic
         void setHiZDebugViewEnabled(bool enabled) override;
         uint32_t hiZDebugMip() const override;
         void setHiZDebugMip(uint32_t mip) override;
+        // A dedicated compute queue is selected at device creation and buffers
+        // use VK_SHARING_MODE_CONCURRENT across queue families, so async batches
+        // need only the timeline-semaphore sync the frame executor already emits.
+        bool supportsAsyncCompute() const override;
 
         VulkanResourceAllocator& resourceAllocator()
         {
@@ -178,10 +185,9 @@ namespace ic
         // light clustering or debug visualization).
         struct ClusteredForwardResources
         {
-            VulkanBuffer clusterBounds;
-            VulkanBuffer clusterLightGrid;
-            VulkanBuffer clusterLightIndices;
-            VulkanBuffer clusterLightCounter;
+            // Cluster bounds/grid/indices/counter are frame-graph-registry
+            // owned (materialized from the path's declarations, bound by
+            // semantic). There is no backend-owned copy, matching DX12.
             VkSampler hiZDebugSampler = VK_NULL_HANDLE;
             std::vector<VkImageView> hiZDebugViews;
             std::vector<VkDescriptorSet> hiZDebugDescriptors;
@@ -230,6 +236,84 @@ namespace ic
             const SceneRenderView& scene,
             VkCommandBuffer cmd,
             VkImage swapchainImage);
+
+        // Constructs the lightweight per-pass context handed to the recorders:
+        // command buffer, plan/node, frame + scene views, and narrow references
+        // to the shared subsystems plus the swapchain extent. Backend-private
+        // per-technique resources are NOT exposed here. Each wrapper resolves
+        // those into a pass-specific *Inputs struct.
+        VulkanPassContext makePassContext(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            VkCommandBuffer cmd);
+
+        // Per-payload recorder entry points. dispatchNode std::visits the node's
+        // PassPayload variant onto this overload set, so the dispatch is
+        // exhaustive by construction: adding a new PassPayload alternative
+        // without a matching overload fails to compile, rather than silently
+        // no-oping the way the previous get_if chain did. Each overload takes the
+        // uniform (plan, node, ctx, scene, cmd, swapchainImage) tuple even when a
+        // given pass ignores part of it, so the visit lambda stays a single
+        // generic call. Mirrors the DX12 backend's dispatch spine.
+        void recordPassPayload(
+            const GraphicsPassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            VkCommandBuffer cmd, VkImage swapchainImage);
+        void recordPassPayload(
+            const ComputePassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            VkCommandBuffer cmd, VkImage swapchainImage);
+        void recordPassPayload(
+            const PathTracePassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            VkCommandBuffer cmd, VkImage swapchainImage);
+        void recordPassPayload(
+            const TonemapPassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            VkCommandBuffer cmd, VkImage swapchainImage);
+        void recordPassPayload(
+            const EnvironmentConvertPassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            VkCommandBuffer cmd, VkImage swapchainImage);
+        void recordPassPayload(
+            const TransferPassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            VkCommandBuffer cmd, VkImage swapchainImage);
+        // Declared-but-unused PassPayload alternatives keep the visit exhaustive
+        // and record nothing (the graph still emits their barriers and queue
+        // ordering); collapse them into real recorders when a pass adopts one.
+        void recordPassPayload(
+            const GeometryPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            VkCommandBuffer, VkImage) {}
+        void recordPassPayload(
+            const LightingPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            VkCommandBuffer, VkImage) {}
+        void recordPassPayload(
+            const ShadowPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            VkCommandBuffer, VkImage) {}
+        void recordPassPayload(
+            const PostProcessPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            VkCommandBuffer, VkImage) {}
+        void recordPassPayload(
+            const ClearPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            VkCommandBuffer, VkImage) {}
+        void recordPassPayload(
+            const PresentPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            VkCommandBuffer, VkImage) {}
 
         void recordBarrier(
             VkCommandBuffer cmd,
@@ -323,18 +407,73 @@ namespace ic
         void ensureComputeTestResources(
             const VulkanComputePipeline& pipeline);
         void ensureClusteredForwardResources();
-        void ensureGpuDrivenResources();
+
+        // Graph-registry-owned GPU-driven buffers for the current frame,
+        // resolved by semantic once per frame (serial, after materialize) so the
+        // parallel recorders and updateFrameDescriptors read stable handles.
+        struct GpuDrivenBuffers
+        {
+            VkBuffer instanceBounds = VK_NULL_HANDLE;
+            VkDeviceSize instanceBoundsSize = 0;
+            VkBuffer drawInputs = VK_NULL_HANDLE;
+            VkDeviceSize drawInputsSize = 0;
+            VkBuffer visibleInstances = VK_NULL_HANDLE;
+            VkDeviceSize visibleInstancesSize = 0;
+            VkBuffer visibleCount = VK_NULL_HANDLE;
+            VkDeviceSize visibleCountSize = 0;
+            VkBuffer indirectArguments = VK_NULL_HANDLE;
+            VkDeviceSize indirectArgumentsSize = 0;
+            VkBuffer drawMetadata = VK_NULL_HANDLE;
+            VkDeviceSize drawMetadataSize = 0;
+            VkBuffer binCounts = VK_NULL_HANDLE;
+            VkDeviceSize binCountsSize = 0;
+            // Registry entries for the CPU-uploaded inputs (mapped pointer +
+            // flush target); valid for the frame after resolveGpuDrivenBuffers.
+            VulkanGraphResourceEntry* instanceBoundsEntry = nullptr;
+            VulkanGraphResourceEntry* drawInputsEntry = nullptr;
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return indirectArguments != VK_NULL_HANDLE &&
+                    binCounts != VK_NULL_HANDLE;
+            }
+        };
+        // Resolves the current frame's graph-owned GPU-driven buffer handles by
+        // semantic (serial, after materialize, before recording).
+        void resolveGpuDrivenBuffers(const CompiledGraphPlan& plan);
+        // Uploads this frame's prepared cull inputs into the resolved graph
+        // buffers (serial, after prepareSceneResources populated them).
+        void uploadGpuDrivenInputs();
+
+        // Graph-registry-owned clustered-forward buffers for the current frame,
+        // resolved by semantic (serial, before recording). Mirrors the DX12
+        // clusterBufferAddress model so both backends bind the graph resource.
+        struct ClusterBuffers
+        {
+            VkBuffer bounds = VK_NULL_HANDLE;
+            VkDeviceSize boundsSize = 0;
+            VkBuffer lightGrid = VK_NULL_HANDLE;
+            VkDeviceSize lightGridSize = 0;
+            VkBuffer lightIndices = VK_NULL_HANDLE;
+            VkDeviceSize lightIndicesSize = 0;
+            VkBuffer lightCounter = VK_NULL_HANDLE;
+            VkDeviceSize lightCounterSize = 0;
+            // CPU-uploaded visible lights (graph-owned, per frame slot).
+            VkBuffer visibleLights = VK_NULL_HANDLE;
+            VkDeviceSize visibleLightsSize = 0;
+            VulkanGraphResourceEntry* visibleLightsEntry = nullptr;
+            [[nodiscard]] bool valid() const noexcept
+            {
+                return bounds != VK_NULL_HANDLE && lightGrid != VK_NULL_HANDLE &&
+                    lightIndices != VK_NULL_HANDLE &&
+                    lightCounter != VK_NULL_HANDLE;
+            }
+        };
+        void resolveClusterBuffers(const CompiledGraphPlan& plan);
+
         bool bindClusteredForwardCompute(
             const VulkanComputePipeline& pipeline,
             const FrameContext& ctx,
             const SceneRenderView& scene,
-            VkCommandBuffer cmd);
-        void bindClusteredForwardGraphics(
-            const VulkanGraphicsPipeline& pipeline,
-            const FrameContext& ctx,
-            VkCommandBuffer cmd);
-        void readbackVisibleInstanceCount(
-            const FrameContext& ctx,
             VkCommandBuffer cmd);
         void destroyClusteredForwardResources();
 
@@ -384,6 +523,11 @@ namespace ic
 
         VulkanGraphResourceRegistry m_graphResourceRegistry;
         VulkanFrameExecutor m_frameExecutor;
+        // Authoritative render-surface generation, bumped on every swapchain
+        // (re)creation so the renderer rebuilds the graph to the new extent.
+        uint64_t m_swapchainGeneration = 1;
+        uint32_t m_lastFramebufferWidth = 0;
+        uint32_t m_lastFramebufferHeight = 0;
         VulkanUploadScheduler m_uploadScheduler;
         VulkanRetirementQueue m_retirementQueue;
 
@@ -414,6 +558,8 @@ namespace ic
         std::unordered_map<uint64_t, UploadedTexture> m_uploadedTextures;
         std::unordered_map<uint64_t, UploadedSampler> m_uploadedSamplers;
         VulkanGpuScene m_gpuScene;
+        GpuDrivenBuffers m_gpuDrivenBuffers;
+        ClusterBuffers m_clusterBuffers;
         uint32_t m_workerSlots = 1;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;

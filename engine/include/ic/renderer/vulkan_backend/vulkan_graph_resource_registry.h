@@ -55,6 +55,17 @@ namespace ic
             VulkanGraphResourceEntry&&) noexcept = default;
     };
 
+    // All physical instances backing one logical graph resource. Single-instance
+    // resources (persistent, imported) hold one slot; per-frame-slot and history
+    // resources hold one slot per frame in flight so two frames never share the
+    // same physical memory. entry() hands out the current frame's slot,
+    // previousEntry() the prior frame's slot.
+    struct VulkanGraphResourceInstances
+    {
+        ResourceMultiplicity multiplicity = ResourceMultiplicity::Single;
+        std::vector<VulkanGraphResourceEntry> slots;
+    };
+
     class VulkanGraphResourceRegistry final
     {
     public:
@@ -91,10 +102,28 @@ namespace ic
             uint32_t defaultHeight,
             const VulkanGraphResourceImports& imports);
 
+        // Current frame slot's instance for this resource.
         [[nodiscard]] VulkanGraphResourceEntry* entry(
             GraphResourceId id) noexcept;
         [[nodiscard]] const VulkanGraphResourceEntry* entry(
             GraphResourceId id) const noexcept;
+
+        // Previous frame slot's instance, for history/ping-pong resources. For
+        // single-instance resources this returns the same instance as entry().
+        // Returns nullptr if the resource has not been materialized.
+        [[nodiscard]] VulkanGraphResourceEntry* previousEntry(
+            GraphResourceId id) noexcept;
+        [[nodiscard]] const VulkanGraphResourceEntry* previousEntry(
+            GraphResourceId id) const noexcept;
+
+        // Byte stride of one native GPU-driven indirect command on this backend
+        // (Vulkan: sizeof(VkDrawIndexedIndirectCommand)). Set by the backend at
+        // init so element-count buffers (GpuDrivenIndirectArguments) are sized
+        // at their native layout.
+        void setNativeIndirectCommandStride(uint32_t stride) noexcept
+        {
+            m_indirectCommandStride = stride;
+        }
 
         [[nodiscard]] size_t size() const noexcept
         {
@@ -102,8 +131,21 @@ namespace ic
         }
 
     private:
+
+        // Resolves a buffer's effective byte size: for a native-stride semantic
+        // (GpuDrivenIndirectArguments) declared by element count, size becomes
+        // elementCount * m_indirectCommandStride; otherwise desc.size stands.
+        [[nodiscard]] BufferDesc resolvedBufferDesc(
+            const GraphResource& resource) const noexcept;
         using EntryMap =
-            std::unordered_map<GraphResourceId, VulkanGraphResourceEntry>;
+            std::unordered_map<GraphResourceId, VulkanGraphResourceInstances>;
+
+        [[nodiscard]] uint32_t instanceCountFor(
+            ResourceMultiplicity multiplicity) const noexcept;
+        [[nodiscard]] uint32_t currentInstanceIndex(
+            const VulkanGraphResourceInstances& instances) const noexcept;
+        [[nodiscard]] uint32_t previousInstanceIndex(
+            const VulkanGraphResourceInstances& instances) const noexcept;
 
         [[nodiscard]] bool entryMatches(
             const VulkanGraphResourceEntry& entry,
@@ -138,5 +180,16 @@ namespace ic
         EntryMap m_entries;
         std::vector<std::vector<VulkanGraphResourceEntry>> m_retiredByFrameSlot;
         uint64_t m_contentGeneration = 0;
+        uint32_t m_framesInFlight = 1;
+        // Native byte stride of one GPU-driven indirect command on this backend
+        // (Vulkan: sizeof(VkDrawIndexedIndirectCommand)).
+        uint32_t m_indirectCommandStride = 0;
+        // Executor frame slot for the current frame: drives per-frame-slot
+        // instance selection so it aligns with frame-slot-indexed backend state.
+        uint32_t m_frameSlot = 0;
+        // Monotonic count of submitted frames (materialize calls): drives
+        // history current/previous selection. Independent of frameIndex so
+        // skipped frames never advance the history ring.
+        uint64_t m_frameCounter = 0;
     };
 }

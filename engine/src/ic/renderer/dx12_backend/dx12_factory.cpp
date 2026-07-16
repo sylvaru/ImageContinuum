@@ -27,6 +27,22 @@ namespace ic
 
         if (enableValidation)
         {
+            // Enable DRED page-fault + breadcrumb tracking BEFORE device
+            // creation so a device removal can report the faulting GPU virtual
+            // address and the resources straddling it.
+            Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings1>
+                dred;
+            if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dred))))
+            {
+                dred->SetAutoBreadcrumbsEnablement(
+                    D3D12_DRED_ENABLEMENT_FORCED_ON);
+                dred->SetPageFaultEnablement(
+                    D3D12_DRED_ENABLEMENT_FORCED_ON);
+                dred->SetBreadcrumbContextEnablement(
+                    D3D12_DRED_ENABLEMENT_FORCED_ON);
+                spdlog::info("[DX12Factory] DRED page-fault tracking enabled.");
+            }
+
             Microsoft::WRL::ComPtr<ID3D12Debug> debug;
             if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
             {

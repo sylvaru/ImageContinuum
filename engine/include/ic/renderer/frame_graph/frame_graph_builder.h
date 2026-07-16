@@ -154,26 +154,46 @@ namespace ic
 
         GraphicsPassBuilder addGraphicsPass(std::string_view name);
 
-        // A compute pass defaults to the graphics queue.
+        // A compute pass defaults to the graphics queue. Pass
+        // QueueType::Compute to opt a pass onto the async compute queue.
         //
-        // Every compute pass the renderer currently records (GPU cull, Hi-Z
-        // build, cluster build, light culling) is a link in a serial chain that
-        // both consumes and feeds graphics work in the same frame
-        // (depth -> Hi-Z -> cull -> cluster -> opaque shading), so an async
-        // compute queue has nothing to overlap and buys no parallelism.
+        // Async is correct only for a pass (or serial sub-chain) that has no
+        // dependency on graphics work it would overlap, and whose resources are
+        // handed across the queue boundary safely. The submission machinery is
+        // in place on both backends:
+        //   - The frame executors submit each queue's per-level batch with real
+        //     cross-queue synchronization (DX12 per-queue ID3D12Fence waits;
+        //     Vulkan timeline semaphores), and wait on the previous frame's
+        //     graphics completion before a level-0 async batch so reused
+        //     buffers cannot be overwritten while last frame still reads them.
+        //   - The compiler synthesizes the cross-queue ordering edges and the
+        //     submission waits from the pass read/write declarations, and emits
+        //     boundary transitions for graph-registry resources.
         //
-        // It would also be unsafe as written: several of these passes touch
-        // backend-managed resources (scene depth, the cluster/light buffers)
-        // that live outside the frame graph's barrier tracking, and D3D12
-        // requires any resource handed between the graphics and compute queues
-        // to pass through the COMMON state at the boundary. That cross-queue
-        // COMMON handoff is not implemented for those non-graph resources, and
-        // omitting it is what triggers DXGI_ERROR_ACCESS_DENIED device removal.
+        // Live example: the clustered-forward path (clustered_forward.h) runs
+        // BuildClusters -> ResetClusterLightCounter -> CullLightsToClusters on
+        // the compute queue, overlapping the depth prepass + Hi-Z on graphics.
+        // That chain never touches sceneDepth, so sceneDepth never crosses the
+        // boundary (Hi-Z and GPU-driven cull stay on graphics precisely because
+        // they touch sceneDepth / feed the depth prepass. Moving those across
+        // without a sceneDepth handoff is what previously caused device removal).
         //
-        // Passing QueueType::Compute explicitly opts a pass into the async queue
-        // and is only correct once a workload has independent work to overlap
-        // AND the cross-queue COMMON handoff above is implemented for every
-        // resource it shares with another queue.
+        // Both backends run this split async by default
+        // (RendererBackend::supportsAsyncCompute() returns true):
+        //   - Vulkan: VK_SHARING_MODE_CONCURRENT means no queue-family ownership
+        //     transfer, so the executor's timeline semaphores suffice.
+        //   - DX12: the frame-graph-owned cluster buffers use implicit buffer
+        //     promotion/decay for their cross-queue handoff (no before-state
+        //     asserted across queues; see DX12Backend::supportsAsyncCompute), and
+        //     the per-frame upload fence is waited on only by the graphics
+        //     (consumer) queue, not the async compute queue.
+        //   Both validated clean under GPU validation over repeated frame-0 and
+        //   sustained runs, with the cluster passes confirmed overlapping the
+        //   graphics work on separate queues.
+        //
+        // Async is gated at graph-build time by the renderer (backend support
+        // AND a runtime toggle); when the toggle is off, callers pass
+        // QueueType::Graphics and behavior is byte-identical to the serial path.
         ComputePassBuilder addComputePass(
             std::string_view name,
             QueueType queue = QueueType::Graphics);
@@ -185,6 +205,11 @@ namespace ic
 		GraphResourceId createBuffer(const BufferDesc& desc = {});
         GraphResourceId createPersistentTexture(const TextureDesc& desc = {});
         GraphResourceId createPersistentBuffer(const BufferDesc& desc = {});
+        // History (ping-pong) resources are per-frame-slot instanced and expose
+        // the previous frame's instance through the backend registry. Intended
+        // for temporal techniques (previous-frame Hi-Z, TAA, temporal AO).
+        GraphResourceId createHistoryTexture(const TextureDesc& desc = {});
+        GraphResourceId createHistoryBuffer(const BufferDesc& desc = {});
         void setResourceSemantic(
             GraphResourceId resource,
             GraphResourceSemantic semantic);
@@ -199,6 +224,17 @@ namespace ic
 			GraphNodeId node,
 			GraphResourceId resource,
 			ResourceUsage usage);
+
+        // Declares that this pass reads the PREVIOUS frame's instance of a
+        // history resource (write the current instance with the normal write()).
+        // The compiler keeps previous-version reads in a separate resource chain
+        // so they never create an intra-frame dependency on this frame's writer
+        // of the same resource, and emits the transition barrier against the
+        // previous physical instance. Bind the data with registry previousEntry.
+        void readPrevious(
+            GraphNodeId node,
+            GraphResourceId resource,
+            ResourceUsage usage);
 
 		GraphResourceId importTexture(ImportedResourceDesc desc);
 

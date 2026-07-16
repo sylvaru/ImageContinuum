@@ -1,5 +1,7 @@
 #include "ic/renderer/vulkan_backend/vulkan_frame_executor.h"
 
+#include <spdlog/spdlog.h>
+
 #include <stdexcept>
 
 namespace ic
@@ -75,6 +77,11 @@ namespace ic
     {
         destroySwapchainSync();
 
+        // A swapchain recreate drains the GPU and rebuilds the graph; drop the
+        // previous frame's submission signals so no cross-frame edge waits on a
+        // value from a plan that no longer exists.
+        m_prevSubmissionSignals.clear();
+
         const size_t imageCount = m_swapchain->images().size();
 
         m_imageRenderFinished.resize(imageCount, VK_NULL_HANDLE);
@@ -115,7 +122,7 @@ namespace ic
         }
 
         m_nextGraphTimelineValues = { 1, 1, 1 };
-        m_lastGraphCompletionValue = 0;
+        m_prevSubmissionSignals.clear();
         m_currentSwapchainImage = 0;
         m_device = nullptr;
         m_swapchain = nullptr;
@@ -227,6 +234,7 @@ namespace ic
         const CompiledGraphPlan& plan,
         std::span<const VkCommandBuffer> commandBuffers,
         uint32_t frameSlot,
+        const GraphExecutionContext& execution,
         VulkanUploadDependency uploadDependency)
     {
         FrameSync& sync = m_frameSync[frameSlot];
@@ -237,6 +245,45 @@ namespace ic
         {
             return static_cast<uint32_t>(queue);
         };
+
+        // Translate the compiler's cross-frame edges into per-submission waits on
+        // the PREVIOUS frame's producing submission (see the DX12 executor for the
+        // shared rationale). Only edges whose consumer node executes this frame
+        // are applied, and only while the previous-frame signal map still matches
+        // this plan (dropped on a GPU drain / graph rebuild).
+        std::vector<std::vector<CrossFrameSignal>> crossFrameWaits(
+            plan.queueSubmissions.size());
+        const bool prevSignalsUsable =
+            m_prevSubmissionSignals.size() == plan.queueSubmissions.size();
+        if (prevSignalsUsable)
+        {
+            for (const CrossFrameDependency& dep : plan.crossFrameDependencies)
+            {
+                if (!execution.shouldExecute(dep.consumerNode) ||
+                    dep.consumerSubmission >= crossFrameWaits.size() ||
+                    dep.producerSubmission >= m_prevSubmissionSignals.size())
+                {
+                    continue;
+                }
+                const CrossFrameSignal& producer =
+                    m_prevSubmissionSignals[dep.producerSubmission];
+                if (producer.value != 0)
+                {
+                    crossFrameWaits[dep.consumerSubmission].push_back(producer);
+                }
+            }
+        }
+
+        static bool loggedCrossFrame = false;
+        if (!loggedCrossFrame)
+        {
+            spdlog::info(
+                "[VulkanFrameExecutor] cross-frame deps={} "
+                "(0 => consecutive frames overlap fully; the old blanket "
+                "previous-frame barrier is removed)",
+                plan.crossFrameDependencies.size());
+            loggedCrossFrame = true;
+        }
         auto queueFor = [this](QueueType queue)
         {
             switch (queue)
@@ -305,7 +352,15 @@ namespace ic
             std::vector<uint64_t> waitValues;
             std::vector<VkPipelineStageFlags> waitStages;
             const VkQueue batchQueue = queueFor(batch.queue);
-            if (uploadDependency.value != 0 &&
+            // Per-frame uploads (model geometry/textures) are consumed only by
+            // graphics scene-geometry draw passes, so only the graphics queue
+            // synchronizes with the upload. Making the async compute/transfer
+            // queue wait on it is unnecessary (no such pass reads uploaded data)
+            // and needlessly serializes the async work behind the upload; on
+            // D3D12 the analogous cross-queue wait also caused device removal.
+            // See DX12FrameExecutor::submitAndPresent for the full rationale.
+            if (batch.queue == QueueType::Graphics &&
+                uploadDependency.value != 0 &&
                 batchQueue != uploadDependency.queue &&
                 std::ranges::find(uploadWaitedQueues, batchQueue) ==
                     uploadWaitedQueues.end())
@@ -333,14 +388,19 @@ namespace ic
                 waitValues.push_back(source.value);
                 waitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
-            if (batch.levelIndex == 0 &&
-                m_lastGraphCompletionValue != 0 &&
-                queueFor(batch.queue) != m_device->graphicsQueue())
+            // Minimal cross-frame ordering: this submission waits only for the
+            // specific prior-frame submissions that last used a resource it now
+            // reuses (persistent writes, history previous-reads). Per-frame-slot
+            // resources are absent from this list, so consecutive frames overlap
+                // freely. The blanket "level-0 waits for the whole previous frame"
+            // rule is gone. Cross-frame hazards carry no intra-frame barrier, so
+            // even a same-queue timeline wait is meaningful here.
+            for (const CrossFrameSignal& wait :
+                 crossFrameWaits[submissionIndex])
             {
                 waitSemaphores.push_back(
-                    m_graphTimelines[
-                        static_cast<uint32_t>(QueueType::Graphics)]);
-                waitValues.push_back(m_lastGraphCompletionValue);
+                    m_graphTimelines[queueIndex(wait.queue)]);
+                waitValues.push_back(wait.value);
                 waitStages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             }
             // Do not stall unrelated compute/transfer work on image acquire.
@@ -403,6 +463,16 @@ namespace ic
             submissionSignals[submissionIndex] = {
                 batch.queue, signalValue };
             lastQueueSignals[destinationQueue] = signalValue;
+        }
+
+        // Publish this frame's per-submission timeline values so the next frame's
+        // cross-frame edges can wait on the exact producing submission.
+        m_prevSubmissionSignals.assign(
+            plan.queueSubmissions.size(), CrossFrameSignal{});
+        for (uint32_t i = 0; i < submissionSignals.size(); ++i)
+        {
+            m_prevSubmissionSignals[i] = {
+                submissionSignals[i].queue, submissionSignals[i].value };
         }
 
         std::vector<VkSemaphore> finalWaitSemaphores;
@@ -477,7 +547,6 @@ namespace ic
             vkQueueSubmit(
                 m_device->graphicsQueue(), 1, &finalSubmit, sync.inFlightFence),
             "Failed to join Vulkan graph queues.");
-        m_lastGraphCompletionValue = completionValue;
 
         if (imageIndex < m_swapchainImageLayouts.size())
         {

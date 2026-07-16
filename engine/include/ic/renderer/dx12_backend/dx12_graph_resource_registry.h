@@ -85,9 +85,17 @@ namespace ic
         {
             return textureDesc.mipLevels;
         }
+    };
 
-    private:
-        friend class DX12GraphResourceRegistry;
+    // All physical instances backing one logical graph resource. Single-instance
+    // resources (persistent, imported) hold one slot; per-frame-slot and history
+    // resources hold one slot per frame in flight so two frames never share the
+    // same physical memory. The registry hands out the current frame's slot from
+    // entry() and the prior frame's slot from previousEntry().
+    struct DX12GraphResourceInstances
+    {
+        ResourceMultiplicity multiplicity = ResourceMultiplicity::Single;
+        std::vector<DX12GraphResourceEntry> slots;
         uint64_t materializationGeneration = 0;
     };
 
@@ -127,15 +135,32 @@ namespace ic
             uint32_t defaultHeight,
             const DX12GraphResourceImports& imports);
 
+        // Current frame slot's instance for this resource.
         [[nodiscard]] DX12GraphResourceEntry* entry(
             GraphResourceId id) noexcept;
         [[nodiscard]] const DX12GraphResourceEntry* entry(
+            GraphResourceId id) const noexcept;
+
+        // Previous frame slot's instance, for history/ping-pong resources. For
+        // single-instance resources this returns the same instance as entry().
+        // Returns nullptr if the resource has not been materialized.
+        [[nodiscard]] DX12GraphResourceEntry* previousEntry(
+            GraphResourceId id) noexcept;
+        [[nodiscard]] const DX12GraphResourceEntry* previousEntry(
             GraphResourceId id) const noexcept;
 
         [[nodiscard]] ID3D12Resource* nativeResource(
             GraphResourceId id) const noexcept;
         [[nodiscard]] D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle(
             GraphResourceId id) const noexcept;
+
+        // Byte stride of one native GPU-driven indirect command on this backend.
+        // Set by the backend at init so the registry can size element-count
+        // buffers (GpuDrivenIndirectArguments) at their native layout.
+        void setNativeIndirectCommandStride(uint32_t stride) noexcept
+        {
+            m_indirectCommandStride = stride;
+        }
 
         [[nodiscard]] uint32_t frameSlotCount() const noexcept
         {
@@ -149,7 +174,15 @@ namespace ic
 
     private:
         using EntryMap =
-            std::unordered_map<GraphResourceId, DX12GraphResourceEntry>;
+            std::unordered_map<GraphResourceId, DX12GraphResourceInstances>;
+
+        // Ring size for a multiplicity: single instance, or one per frame slot.
+        [[nodiscard]] uint32_t instanceCountFor(
+            ResourceMultiplicity multiplicity) const noexcept;
+        [[nodiscard]] uint32_t currentInstanceIndex(
+            const DX12GraphResourceInstances& instances) const noexcept;
+        [[nodiscard]] uint32_t previousInstanceIndex(
+            const DX12GraphResourceInstances& instances) const noexcept;
 
         static TextureDesc resolvedTextureDesc(
             const TextureDesc& desc,
@@ -161,6 +194,12 @@ namespace ic
         static bool bufferDescMatches(
             const BufferDesc& lhs,
             const BufferDesc& rhs) noexcept;
+
+        // Resolves a buffer's effective byte size: for a native-stride semantic
+        // (GpuDrivenIndirectArguments) declared by element count, size becomes
+        // elementCount * m_indirectCommandStride; otherwise desc.size stands.
+        [[nodiscard]] BufferDesc resolvedBufferDesc(
+            const GraphResource& resource) const noexcept;
 
         [[nodiscard]] bool entryMatches(
             const DX12GraphResourceEntry& entry,
@@ -193,5 +232,16 @@ namespace ic
         std::vector<std::vector<DX12GraphResourceEntry>>
             m_retiredByFrameSlot;
         uint64_t m_materializationGeneration = 0;
+        uint32_t m_framesInFlight = 1;
+        // Native byte stride of one GPU-driven indirect command on this backend
+        // (DX12: sizeof(DX12GpuIndexedIndirectCommand)).
+        uint32_t m_indirectCommandStride = 0;
+        // Executor frame slot for the current frame: drives per-frame-slot
+        // instance selection so it aligns with frame-slot-indexed backend state.
+        uint32_t m_frameSlot = 0;
+        // Monotonic count of submitted frames (materialize calls): drives
+        // history current/previous selection. Independent of frameIndex so
+        // skipped frames never advance the history ring.
+        uint64_t m_frameCounter = 0;
     };
 }

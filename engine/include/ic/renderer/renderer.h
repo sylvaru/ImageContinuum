@@ -45,6 +45,11 @@ namespace ic
         void setHiZDebugViewEnabled(bool enabled);
         [[nodiscard]] uint32_t hiZDebugMip() const;
         void setHiZDebugMip(uint32_t mip);
+        // Whether cross-queue async compute is currently active. This is the
+        // effective value: the runtime toggle AND backend support. Toggling it
+        // rebuilds the frame graph on the next frame so queue assignments update.
+        [[nodiscard]] bool asyncComputeEnabled() const;
+        void setAsyncComputeEnabled(bool enabled);
         [[nodiscard]] RenderPathType renderPathType() const;
         
         void buildOrRebuildFrameGraph();

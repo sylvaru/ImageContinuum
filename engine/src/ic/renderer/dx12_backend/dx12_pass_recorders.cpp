@@ -1,33 +1,68 @@
 #include "ic/renderer/dx12_backend/dx12_pass_recorders.h"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <iterator>
 
 namespace ic
 {
-    namespace
+    void recordTransferCopy(
+        ID3D12GraphicsCommandList4* cmd,
+        const DX12TransferCopy& copy)
     {
-        void transitionResource(
-            ID3D12GraphicsCommandList4* cmd,
-            ID3D12Resource* resource,
-            D3D12_RESOURCE_STATES before,
-            D3D12_RESOURCE_STATES after)
+        if (!copy.source || !copy.destination)
         {
-            if (!resource || before == after)
-            {
-                return;
-            }
-
-            D3D12_RESOURCE_BARRIER barrier{};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-            barrier.Transition.pResource = resource;
-            barrier.Transition.Subresource =
-                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            barrier.Transition.StateBefore = before;
-            barrier.Transition.StateAfter = after;
-            cmd->ResourceBarrier(1, &barrier);
+            spdlog::error(
+                "Transfer pass '{}' could not resolve its resources",
+                copy.passName);
+            return;
         }
+
+        const D3D12_RESOURCE_DESC sourceNativeDesc = copy.source->GetDesc();
+        const D3D12_RESOURCE_DESC destinationNativeDesc =
+            copy.destination->GetDesc();
+        if (copy.type == GraphResourceType::Buffer)
+        {
+            cmd->CopyBufferRegion(
+                copy.destination,
+                0,
+                copy.source,
+                0,
+                std::min(sourceNativeDesc.Width, destinationNativeDesc.Width));
+            return;
+        }
+
+        if (sourceNativeDesc.Dimension != destinationNativeDesc.Dimension ||
+            sourceNativeDesc.Width != destinationNativeDesc.Width ||
+            sourceNativeDesc.Height != destinationNativeDesc.Height ||
+            sourceNativeDesc.DepthOrArraySize !=
+                destinationNativeDesc.DepthOrArraySize ||
+            sourceNativeDesc.MipLevels != destinationNativeDesc.MipLevels ||
+            sourceNativeDesc.Format != destinationNativeDesc.Format ||
+            sourceNativeDesc.SampleDesc.Count !=
+                destinationNativeDesc.SampleDesc.Count)
+        {
+            spdlog::error(
+                "Transfer pass '{}' requires matching texture descriptions",
+                copy.passName);
+            return;
+        }
+        cmd->CopyResource(copy.destination, copy.source);
+    }
+
+    void recordComputeStorageBufferTest(
+        const DX12PassContext& ctx,
+        const DX12ComputeStorageBufferTest& test)
+    {
+        ID3D12GraphicsCommandList4* cmd = ctx.cmd;
+        cmd->SetComputeRootUnorderedAccessView(0, test.bufferAddr);
+        cmd->Dispatch(test.groupCountX, test.groupCountY, test.groupCountZ);
+
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        barrier.UAV.pResource = test.bufferResource;
+        cmd->ResourceBarrier(1, &barrier);
     }
 
     bool recordHiZPyramid(
@@ -252,26 +287,6 @@ namespace ic
         const DX12CullBuffers& buffers)
     {
         ID3D12GraphicsCommandList4* cmd = ctx.cmd;
-
-        auto transitionUav =
-            [&](ID3D12Resource* resource, D3D12_RESOURCE_STATES* state)
-            {
-                if (*state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
-                {
-                    transitionResource(
-                        cmd,
-                        resource,
-                        *state,
-                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-                    *state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-                }
-            };
-
-        transitionUav(buffers.visibleInstances, buffers.visibleInstancesState);
-        transitionUav(
-            buffers.visibleInstanceCount, buffers.visibleInstanceCountState);
-        transitionUav(buffers.indirectArguments, buffers.indirectArgumentsState);
-        transitionUav(buffers.binCounts, buffers.binCountsState);
 
         cmd->SetComputeRootConstantBufferView(0, buffers.frameConstantsAddr);
         cmd->SetComputeRootShaderResourceView(1, buffers.instanceBoundsAddr);

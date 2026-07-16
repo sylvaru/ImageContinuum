@@ -40,6 +40,11 @@ namespace ic
         std::span<const GraphResource> resources;
 
         std::span<const PassPayload> payloads;
+
+        // Minimal cross-frame GPU ordering edges (see CrossFrameDependency).
+        // Empty means no resource's physical memory is reused across frames with
+        // a hazard, so consecutive frames may overlap fully on the GPU.
+        std::span<const CrossFrameDependency> crossFrameDependencies;
     };
 
     struct GraphExecutionContext
@@ -74,6 +79,26 @@ namespace ic
             if (access.usage == usage)
             {
                 return access.resource;
+            }
+        }
+        return InvalidGraphResourceId;
+    }
+
+    // Resolves the single graph resource carrying the given semantic. Backends
+    // use this to bind the frame-graph-owned (registry) resource instead of a
+    // duplicate backend-managed buffer, so the graph's barrier/queue machinery
+    // owns that resource's state, transitions and lifetime. Semantics are unique
+    // per graph (set via FrameGraphBuilder::setResourceSemantic), so a global
+    // lookup is correct and independent of which pass is being recorded.
+    [[nodiscard]] inline GraphResourceId findResourceBySemantic(
+        const CompiledGraphPlan& plan,
+        GraphResourceSemantic semantic) noexcept
+    {
+        for (GraphResourceId id = 0; id < plan.resources.size(); ++id)
+        {
+            if (plan.resources[id].semantic == semantic)
+            {
+                return id;
             }
         }
         return InvalidGraphResourceId;

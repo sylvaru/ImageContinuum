@@ -82,6 +82,7 @@ namespace ic
             const CompiledGraphPlan& plan,
             std::span<const VkCommandBuffer> commandBuffers,
             uint32_t frameSlot,
+            const GraphExecutionContext& execution,
             VulkanUploadDependency uploadDependency = {});
 
     private:
@@ -90,6 +91,18 @@ namespace ic
             VkFence inFlightFence = VK_NULL_HANDLE;
             VkSemaphore imageAvailable = VK_NULL_HANDLE;
         };
+
+        // The producing queue + timeline value each of the PREVIOUS frame's
+        // submissions signaled, indexed by submission index. Cross-frame ordering
+        // edges make this frame's consuming submission wait on the producer's
+        // prior-frame value. This is the minimal replacement for the old blanket
+        // previous-frame barrier. Reset on a full GPU drain / graph rebuild.
+        struct CrossFrameSignal
+        {
+            QueueType queue = QueueType::Graphics;
+            uint64_t value = 0;
+        };
+        std::vector<CrossFrameSignal> m_prevSubmissionSignals;
 
         void destroyFrameSync();
         void destroySwapchainSync();
@@ -103,7 +116,6 @@ namespace ic
         std::vector<VkImageLayout> m_swapchainImageLayouts;
         std::array<VkSemaphore, 3> m_graphTimelines{};
         std::array<uint64_t, 3> m_nextGraphTimelineValues{ 1, 1, 1 };
-        uint64_t m_lastGraphCompletionValue = 0;
         uint32_t m_currentSwapchainImage = 0;
     };
 }

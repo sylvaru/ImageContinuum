@@ -82,6 +82,7 @@ namespace ic
         buildExecutionOrder();
         buildExecutionLevels();
         buildQueueSubmissions();
+        buildCrossFrameDependencies(builder);
         buildResourceLifetimes();
         buildBarriers();
         buildNodeSchedules();
@@ -112,7 +113,9 @@ namespace ic
             .resourceLifetimes = std::span<const ResourceLifetime>(m_resourceLifetimes),
             .resourceAccesses = std::span<const ResourceAccess>(m_resourceAccesses),
             .resources = std::span<const GraphResource>(resources),
-            .payloads = std::span<const PassPayload>(payloads)
+            .payloads = std::span<const PassPayload>(payloads),
+            .crossFrameDependencies =
+                std::span<const CrossFrameDependency>(m_crossFrameDependencies)
         };
     }
 
@@ -418,8 +421,8 @@ namespace ic
         m_queueSubmissionNodes.clear();
         m_queueSubmissionWaits.clear();
 
-        std::pmr::vector<uint32_t> nodeSubmission(
-            m_nodes.size(), UINT32_MAX, m_nodes.get_allocator());
+        m_nodeSubmission.assign(m_nodes.size(), UINT32_MAX);
+        std::pmr::vector<uint32_t>& nodeSubmission = m_nodeSubmission;
 
         for (uint32_t levelIndex = 0;
              levelIndex < m_executionLevels.size();
@@ -516,6 +519,158 @@ namespace ic
         }
     }
 
+    void FrameGraphCompiler::buildCrossFrameDependencies(
+        const FrameGraphBuilder& builder)
+    {
+        m_crossFrameDependencies.clear();
+
+        const auto resources = builder.resources();
+
+        std::pmr::vector<uint32_t> execIndex(
+            m_nodes.size(), 0, m_nodes.get_allocator());
+        for (uint32_t i = 0; i < m_executionOrder.size(); ++i)
+        {
+            execIndex[m_executionOrder[i]] = i;
+        }
+
+        const auto submissionOf = [&](GraphNodeId node) -> uint32_t
+        {
+            return node < m_nodeSubmission.size()
+                ? m_nodeSubmission[node]
+                : UINT32_MAX;
+        };
+
+        // Scan a chain's REAL (non-synthetic) accesses for the earliest writer,
+        // the latest access, and the latest writer, all in execution order.
+        const auto scanChain =
+            [&](const ResourceChain& chain,
+                const ResourceAccess*& firstWriter,
+                const ResourceAccess*& lastAccess,
+                const ResourceAccess*& lastWriter)
+        {
+            firstWriter = nullptr;
+            lastAccess = nullptr;
+            lastWriter = nullptr;
+            for (const ResourceAccess& access : chain.accesses)
+            {
+                if (access.external)
+                {
+                    // Synthetic "produced earlier" marker, not a real access.
+                    continue;
+                }
+                const uint32_t idx = execIndex[access.node];
+                if (!lastAccess || idx > execIndex[lastAccess->node])
+                {
+                    lastAccess = &access;
+                }
+                if (access.access != AccessType::Read)
+                {
+                    if (!firstWriter || idx < execIndex[firstWriter->node])
+                    {
+                        firstWriter = &access;
+                    }
+                    if (!lastWriter || idx > execIndex[lastWriter->node])
+                    {
+                        lastWriter = &access;
+                    }
+                }
+            }
+        };
+
+        for (const ResourceChain& chain : m_resourceChains)
+        {
+            if (chain.accesses.empty() ||
+                chain.resource >= resources.size())
+            {
+                continue;
+            }
+            const GraphResource& resource = resources[chain.resource];
+            if (resource.ownership == ResourceOwnership::Imported)
+            {
+                // Imported (swapchain) cross-frame safety is owned by image
+                // acquire + present, not the graph.
+                continue;
+            }
+
+            const ResourceAccess* firstWriter = nullptr;
+            const ResourceAccess* lastAccess = nullptr;
+            const ResourceAccess* lastWriter = nullptr;
+            scanChain(chain, firstWriter, lastAccess, lastWriter);
+
+            if (chain.previousVersion)
+            {
+                // History RAW: this frame's previous-instance reader must wait
+                // for the previous frame's current-instance writer. The current-
+                // version chain lives at index == resource id.
+                if (chain.resource >= m_resourceChains.size())
+                {
+                    continue;
+                }
+                const ResourceAccess* curFirstWriter = nullptr;
+                const ResourceAccess* curLastAccess = nullptr;
+                const ResourceAccess* curLastWriter = nullptr;
+                scanChain(
+                    m_resourceChains[chain.resource],
+                    curFirstWriter, curLastAccess, curLastWriter);
+                if (!lastAccess || !curLastWriter)
+                {
+                    continue;
+                }
+                // consumer = first real previous-version read.
+                const ResourceAccess* consumer = nullptr;
+                for (const ResourceAccess& access : chain.accesses)
+                {
+                    if (access.external)
+                    {
+                        continue;
+                    }
+                    if (!consumer ||
+                        execIndex[access.node] < execIndex[consumer->node])
+                    {
+                        consumer = &access;
+                    }
+                }
+                const uint32_t consumerSub = submissionOf(consumer->node);
+                const uint32_t producerSub = submissionOf(curLastWriter->node);
+                if (consumerSub == UINT32_MAX || producerSub == UINT32_MAX)
+                {
+                    continue;
+                }
+                m_crossFrameDependencies.push_back({
+                    .resource = chain.resource,
+                    .consumerNode = consumer->node,
+                    .consumerSubmission = consumerSub,
+                    .producerSubmission = producerSub });
+                continue;
+            }
+
+            // Current-version chain. Per-frame-slot (and the current instance of
+            // a history resource) get a fresh physical instance each frame, so
+        // adjacent frames never collide. CPU frame-slot pacing already
+            // guards the ring reuse. Only Single/persistent instances are shared.
+            if (resource.multiplicity != ResourceMultiplicity::Single)
+            {
+                continue;
+            }
+            // Read-only-across-frames persistent resources (no writer) are safe.
+            if (!firstWriter || !lastAccess)
+            {
+                continue;
+            }
+            const uint32_t consumerSub = submissionOf(firstWriter->node);
+            const uint32_t producerSub = submissionOf(lastAccess->node);
+            if (consumerSub == UINT32_MAX || producerSub == UINT32_MAX)
+            {
+                continue;
+            }
+            m_crossFrameDependencies.push_back({
+                .resource = chain.resource,
+                .consumerNode = firstWriter->node,
+                .consumerSubmission = consumerSub,
+                .producerSubmission = producerSub });
+        }
+    }
+
     void FrameGraphCompiler::buildResourceLifetimes()
     {
         m_resourceLifetimes.clear();
@@ -534,6 +689,12 @@ namespace ic
         for (auto& chain : m_resourceChains)
         {
             if (chain.accesses.empty())
+                continue;
+
+            // The previous-version chain shares the resource's physical lifetime
+            // with its current-version chain; it must not emit a second, shorter
+            // lifetime for the same resource id.
+            if (chain.previousVersion)
                 continue;
 
             auto sorted = chain.accesses;
@@ -569,30 +730,71 @@ namespace ic
         // GraphResourceId is a dense builder-owned index, so direct indexing
         // avoids hash computation, per-entry allocations, and a second
         // unordered-map-to-vector flattening pass.
-        std::pmr::vector<uint32_t> accessCounts(
+        //
+        // Current-version accesses form one chain per resource (indexed by id).
+        // Previous-version reads (history resources) form an additional chain
+        // per resource, appended after the current chains, so the two frame
+        // versions are analyzed as distinct instances.
+        std::pmr::vector<uint32_t> currentCounts(
+            resources.size(), 0, m_nodes.get_allocator());
+        std::pmr::vector<uint32_t> previousCounts(
             resources.size(), 0, m_nodes.get_allocator());
         for (const ResourceAccess& access : accesses)
         {
             assert(access.resource < resources.size());
-            ++accessCounts[access.resource];
+            if (access.previousVersion)
+            {
+                ++previousCounts[access.resource];
+            }
+            else
+            {
+                ++currentCounts[access.resource];
+            }
         }
 
-        m_resourceChains.reserve(resources.size());
+        m_resourceChains.reserve(resources.size() * 2u);
         for (GraphResourceId resource = 0;
              resource < resources.size();
              ++resource)
         {
             m_resourceChains.emplace_back(resource, builder.get_allocator());
             m_resourceChains.back().accesses.reserve(
-                static_cast<size_t>(accessCounts[resource]) + 1u);
+                static_cast<size_t>(currentCounts[resource]) + 1u);
+        }
+
+        // Map each resource with previous-version reads to its appended chain.
+        std::pmr::vector<uint32_t> previousChainIndex(
+            resources.size(), UINT32_MAX, m_nodes.get_allocator());
+        for (GraphResourceId resource = 0;
+             resource < resources.size();
+             ++resource)
+        {
+            if (previousCounts[resource] == 0)
+            {
+                continue;
+            }
+            previousChainIndex[resource] =
+                static_cast<uint32_t>(m_resourceChains.size());
+            m_resourceChains.emplace_back(resource, builder.get_allocator());
+            m_resourceChains.back().previousVersion = true;
+            m_resourceChains.back().accesses.reserve(
+                static_cast<size_t>(previousCounts[resource]) + 1u);
         }
 
         for (const ResourceAccess& access : accesses)
         {
-            ResourceChain& chain = m_resourceChains[access.resource];
+            const uint32_t chainIndex = access.previousVersion
+                ? previousChainIndex[access.resource]
+                : access.resource;
+            ResourceChain& chain = m_resourceChains[chainIndex];
             if (chain.accesses.empty())
             {
                 const GraphResource& resource = resources[access.resource];
+                // The previous-version chain's synthetic first access models
+                // "produced by the previous frame": external (creates no
+                // intra-frame dependency) and firstUse. Its physical instance's
+                // real prior state is carried by the registry, and the executor's
+                // cross-frame ordering guarantees that producer has completed.
                 chain.accesses.push_back({
                     .node = access.node,
                     .resource = access.resource,
@@ -601,7 +803,8 @@ namespace ic
                     .usage = resource.ownership == ResourceOwnership::Imported
                         ? resource.initialUsage : access.usage,
                     .external = true,
-                    .firstUse = true
+                    .firstUse = true,
+                    .previousVersion = access.previousVersion
                 });
             }
             chain.accesses.push_back(access);
@@ -649,10 +852,21 @@ namespace ic
             {
                 const auto& curr = sorted[i];
 
-                const bool needsBarrier =
+                bool needsBarrier =
                     prev.access != AccessType::Read ||
                     curr.access != AccessType::Read ||
                     prev.usage != curr.usage;
+
+                // The previous-version chain's first real access must always
+                // emit a barrier: the previous physical instance was last left
+                // in whatever state it held as a current instance (e.g. a UAV
+                // write or a different layout), so it needs an explicit
+                // transition into the read state on its own instance. The
+                // backend resolves the real "before" state from the registry.
+                if (chain.previousVersion && i == 1)
+                {
+                    needsBarrier = true;
+                }
 
                 if (needsBarrier)
                 {
@@ -664,7 +878,8 @@ namespace ic
                         .toAccess = curr.access,
                         .oldUsage = prev.usage,
                         .newUsage = curr.usage,
-                        .firstUse = prev.firstUse
+                        .firstUse = prev.firstUse,
+                        .previousVersion = chain.previousVersion
                         });
                 }
 

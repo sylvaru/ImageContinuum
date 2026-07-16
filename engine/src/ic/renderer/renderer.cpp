@@ -70,7 +70,14 @@ namespace ic
         bool hasActiveSceneEnvironmentBake = false;
 
         RenderExtent renderExtent{};
+        // Last render-surface generation the graph was built against. A change
+        // (swapchain recreation) forces a rebuild so the graph, swapchain and
+        // materialized resources always share one extent.
+        uint64_t lastSurfaceGeneration = 0;
         bool graphDirty = true;
+        // User-facing async-compute toggle. The effective state also requires
+        // backend->supportsAsyncCompute(); see buildOrRebuildFrameGraph.
+        bool asyncComputeEnabled = true;
         FrameGraphBuildReason rebuildReason =
             FrameGraphBuildReason::Startup;
         RenderPathType pathType = RenderPathType::Forward;
@@ -146,13 +153,35 @@ namespace ic
     {
         auto& runtime = *m_runtime;
 
-        const RenderExtent frameExtent{
-            std::max(1u, frame.windowWidth),
-            std::max(1u, frame.windowHeight) };
-        if (frameExtent.width != runtime.renderExtent.width ||
-            frameExtent.height != runtime.renderExtent.height)
+        if (!runtime.backend)
         {
-            runtime.renderExtent = frameExtent;
+            return;
+        }
+
+        // Reconcile the swapchain to the window and adopt its framebuffer extent
+        // as the single authoritative render extent for this frame. This runs
+        // before the graph is (re)built, so the compiled graph and every
+        // materialized attachment match the backbuffer. No swapchain recreation
+        // happens later in the frame to desynchronize them. A non-renderable
+        // surface (minimized / zero area) skips the whole frame; because
+        // materialize is never reached, the per-slot/history rings do not
+        // advance, so a skipped frame cannot stale history.
+        const RenderSurfaceState surface =
+            runtime.backend->reconcileRenderSurface();
+        if (!surface.renderable)
+        {
+            return;
+        }
+
+        const RenderExtent authoritativeExtent{
+            std::max(1u, surface.width),
+            std::max(1u, surface.height) };
+        if (authoritativeExtent.width != runtime.renderExtent.width ||
+            authoritativeExtent.height != runtime.renderExtent.height ||
+            surface.generation != runtime.lastSurfaceGeneration)
+        {
+            runtime.renderExtent = authoritativeExtent;
+            runtime.lastSurfaceGeneration = surface.generation;
             runtime.graphDirty = true;
             runtime.rebuildReason = FrameGraphBuildReason::Resize;
             runtime.pendingInvalidation |= PassInvalidation::Resize;
@@ -289,6 +318,9 @@ namespace ic
         RendererPathContext rctx;
         rctx.renderExtent = m_runtime->renderExtent;
         rctx.rebuildReason = rt.rebuildReason;
+        rctx.asyncComputeEnabled =
+            rt.asyncComputeEnabled &&
+            rt.backend && rt.backend->supportsAsyncCompute();
 
         rt.path->buildFrameGraph(rctx, rt.builder);
 
@@ -364,204 +396,6 @@ namespace ic
         }
     }
 
-    void Renderer::drawFrameGraphDebugWindow()
-    {
-        if (!ImGui::GetCurrentContext() || !m_runtime)
-        {
-            return;
-        }
-
-        static bool open = true;
-        if (!open)
-        {
-            return;
-        }
-        if (!ImGui::Begin("Frame Graph Queues", &open))
-        {
-            ImGui::End();
-            return;
-        }
-
-        const CompiledGraphPlan& plan = m_runtime->compiledGraphPlan;
-        ImGui::Text("Passes %u | Levels %u | Batches %u",
-            static_cast<uint32_t>(plan.nodes.size()),
-            static_cast<uint32_t>(plan.executionLevels.size()),
-            static_cast<uint32_t>(plan.queueSubmissions.size()));
-        ImGui::TextDisabled(
-            "CPU Parallel = recorded together. GPU Async = different queues may overlap.");
-
-        auto queueName = [](QueueType queue)
-        {
-            switch (queue)
-            {
-            case QueueType::Graphics: return "Graphics";
-            case QueueType::Compute: return "Compute";
-            case QueueType::Transfer: return "Transfer";
-            }
-            return "Unknown";
-        };
-
-        auto passName = [&plan](GraphNodeId node) -> const char*
-        {
-            if (node >= plan.nodes.size()) return "Invalid";
-            const ExecutionNode& execution = plan.nodes[node];
-            if (execution.payloadIndex >= plan.payloads.size()) return "Unnamed";
-            const PassPayload& payload = plan.payloads[execution.payloadIndex];
-            if (const auto* pass = std::get_if<GraphicsPassData>(&payload))
-                return pass->name.c_str();
-            if (const auto* pass = std::get_if<ComputePassData>(&payload))
-                return pass->name.c_str();
-            if (const auto* pass = std::get_if<TransferPassData>(&payload))
-                return pass->name.c_str();
-            if (std::holds_alternative<EnvironmentConvertPassData>(payload))
-                return "EnvironmentConvert";
-            if (std::holds_alternative<PathTracePassData>(payload))
-                return "PathTrace";
-            if (std::holds_alternative<TonemapPassData>(payload))
-                return "Tonemap";
-            if (std::holds_alternative<PresentPassData>(payload))
-                return "Present";
-            return "Unnamed";
-        };
-
-        // Author-declared execution cadence (see PassCadence). Only Graphics,
-        // Compute and Transfer passes carry it; anything else is treated as
-        // per-frame.
-        auto passCadence = [&plan](GraphNodeId node) -> PassCadence
-        {
-            if (node >= plan.nodes.size()) return PassCadence::PerFrame;
-            const ExecutionNode& execution = plan.nodes[node];
-            if (execution.payloadIndex >= plan.payloads.size())
-                return PassCadence::PerFrame;
-            const PassPayload& payload = plan.payloads[execution.payloadIndex];
-            if (const auto* pass = std::get_if<GraphicsPassData>(&payload))
-                return pass->execution.cadence;
-            if (const auto* pass = std::get_if<ComputePassData>(&payload))
-                return pass->execution.cadence;
-            if (const auto* pass = std::get_if<TransferPassData>(&payload))
-                return pass->execution.cadence;
-            return PassCadence::PerFrame;
-        };
-
-        if (ImGui::BeginTable("GraphQueueSchedule", 9,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
-        {
-            ImGui::TableSetupColumn("Level");
-            ImGui::TableSetupColumn("Queue");
-            ImGui::TableSetupColumn("Pass");
-            ImGui::TableSetupColumn("Cadence");
-            ImGui::TableSetupColumn("Run");
-            ImGui::TableSetupColumn("Waits");
-            ImGui::TableSetupColumn("CPU Parallel");
-            ImGui::TableSetupColumn("GPU Async");
-            ImGui::TableSetupColumn("Node");
-            ImGui::TableHeadersRow();
-
-            for (const QueueSubmissionBatch& batch : plan.queueSubmissions)
-            {
-                uint32_t batchesInLevel = 0;
-                for (const QueueSubmissionBatch& other : plan.queueSubmissions)
-                {
-                    batchesInLevel +=
-                        other.levelIndex == batch.levelIndex ? 1u : 0u;
-                }
-
-                const bool cpuParallel =
-                    batch.levelIndex < plan.executionLevels.size() &&
-                    plan.executionLevels[batch.levelIndex].nodeCount > 1;
-                for (uint32_t i = 0; i < batch.nodeCount; ++i)
-                {
-                    const GraphNodeId node =
-                        plan.queueSubmissionNodes[batch.firstNode + i];
-                    ImGui::TableNextRow();
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%u", batch.levelIndex);
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(queueName(batch.queue));
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(passName(node));
-                    ImGui::TableNextColumn();
-                    switch (passCadence(node))
-                    {
-                    case PassCadence::Once:
-                        ImGui::TextColored(
-                            ImVec4(0.55f, 0.75f, 1.0f, 1.0f), "Once");
-                        break;
-                    case PassCadence::OnResize:
-                        ImGui::TextColored(
-                            ImVec4(1.0f, 0.8f, 0.35f, 1.0f), "On Resize");
-                        break;
-                    case PassCadence::OnInvalidation:
-                        ImGui::TextColored(
-                            ImVec4(1.0f, 0.8f, 0.35f, 1.0f), "Invalidated");
-                        break;
-                    case PassCadence::PerFrame:
-                    default:
-                        ImGui::TextDisabled("Per-Frame");
-                        break;
-                    }
-                    ImGui::TableNextColumn();
-                    const bool scheduled =
-                        node < m_runtime->executeNodes.size() &&
-                        m_runtime->executeNodes[node] != 0;
-                    ImGui::TextUnformatted(scheduled ? "Execute" : "Barrier only");
-                    ImGui::TableNextColumn();
-                    if (batch.waitCount == 0)
-                    {
-                        ImGui::TextDisabled("-");
-                    }
-                    else
-                    {
-                        std::string waits;
-                        for (uint32_t wait = 0; wait < batch.waitCount; ++wait)
-                        {
-                            const uint32_t sourceIndex =
-                                plan.queueSubmissionWaits[
-                                    batch.firstWait + wait].submissionIndex;
-                            if (sourceIndex >= plan.queueSubmissions.size()) continue;
-                            if (!waits.empty()) waits += "; ";
-                            const QueueSubmissionBatch& source =
-                                plan.queueSubmissions[sourceIndex];
-                            waits += queueName(source.queue);
-                            waits += ": ";
-                            if (source.nodeCount == 0)
-                            {
-                                waits += "submission ";
-                                waits += std::to_string(sourceIndex);
-                            }
-                            else
-                            {
-                                const GraphNodeId sourceNode =
-                                    plan.queueSubmissionNodes[source.firstNode];
-                                waits += passName(sourceNode);
-                                if (source.nodeCount > 1)
-                                {
-                                    waits += " +";
-                                    waits += std::to_string(source.nodeCount - 1);
-                                    waits += " pass";
-                                    if (source.nodeCount > 2) waits += "es";
-                                }
-                            }
-                        }
-                        ImGui::TextUnformatted(waits.c_str());
-                    }
-                    ImGui::TableNextColumn();
-                    ImGui::TextUnformatted(cpuParallel ? "Yes" : "No");
-                    ImGui::TableNextColumn();
-                    if (batchesInLevel > 1)
-                        ImGui::TextColored(
-                            ImVec4(0.25f, 0.9f, 0.35f, 1.0f), "Eligible");
-                    else
-                        ImGui::TextDisabled("No");
-                    ImGui::TableNextColumn();
-                    ImGui::Text("%u", node);
-                }
-            }
-            ImGui::EndTable();
-        }
-        ImGui::End();
-    }
-
     bool Renderer::vsyncEnabled() const
     {
         return m_runtime &&
@@ -620,6 +454,29 @@ namespace ic
         {
             m_runtime->backend->setHiZDebugMip(mip);
         }
+    }
+
+    bool Renderer::asyncComputeEnabled() const
+    {
+        return m_runtime &&
+            m_runtime->asyncComputeEnabled &&
+            m_runtime->backend &&
+            m_runtime->backend->supportsAsyncCompute();
+    }
+
+    void Renderer::setAsyncComputeEnabled(bool enabled)
+    {
+        if (!m_runtime || m_runtime->asyncComputeEnabled == enabled)
+        {
+            return;
+        }
+        m_runtime->asyncComputeEnabled = enabled;
+        // Queue assignment is baked at graph-build time; rebuild on the next
+        // frame (matching the resize path) so the change takes effect safely
+        // outside GPU recording.
+        m_runtime->graphDirty = true;
+        m_runtime->rebuildReason = FrameGraphBuildReason::Explicit;
+        m_runtime->pendingInvalidation |= PassInvalidation::GraphRebuild;
     }
 
     RenderPathType Renderer::renderPathType() const
@@ -776,5 +633,285 @@ namespace ic
         }
     }
 
+    void Renderer::drawFrameGraphDebugWindow()
+    {
+        if (!ImGui::GetCurrentContext() || !m_runtime)
+        {
+            return;
+        }
 
+        static bool open = true;
+        if (!open)
+        {
+            return;
+        }
+        if (!ImGui::Begin("Frame Graph Queues", &open))
+        {
+            ImGui::End();
+            return;
+        }
+
+        const CompiledGraphPlan& plan = m_runtime->compiledGraphPlan;
+
+        // Per-level count of distinct queue submissions. The compiler emits at
+        // most one batch per (level, queue), so a level with >1 batch is one
+        // where passes on different queues actually execute concurrently on the
+        // GPU (only re-synchronized by the queue fences). That is the ground
+        // truth for "real overlap occurred", distinct from mere eligibility.
+        std::vector<uint32_t> queuesPerLevel(plan.executionLevels.size(), 0u);
+        for (const QueueSubmissionBatch& batch : plan.queueSubmissions)
+        {
+            if (batch.levelIndex < queuesPerLevel.size())
+                ++queuesPerLevel[batch.levelIndex];
+        }
+        uint32_t overlappingLevels = 0;
+        uint32_t computeBatches = 0;
+        for (uint32_t count : queuesPerLevel)
+            overlappingLevels += count > 1 ? 1u : 0u;
+        for (const QueueSubmissionBatch& batch : plan.queueSubmissions)
+            computeBatches += batch.queue == QueueType::Compute ? 1u : 0u;
+
+        const float framerate = ImGui::GetIO().Framerate;
+        ImGui::Text("%.1f FPS (%.2f ms) | %s", framerate,
+            framerate > 0.0f ? 1000.0f / framerate : 0.0f,
+            vsyncEnabled() ? "VSync on" : "VSync off");
+        ImGui::Text("Passes %u | Levels %u | Batches %u",
+            static_cast<uint32_t>(plan.nodes.size()),
+            static_cast<uint32_t>(plan.executionLevels.size()),
+            static_cast<uint32_t>(plan.queueSubmissions.size()));
+
+        const bool backendAsync =
+            m_runtime->backend && m_runtime->backend->supportsAsyncCompute();
+        bool asyncToggle = m_runtime->asyncComputeEnabled;
+        ImGui::BeginDisabled(!backendAsync);
+        if (ImGui::Checkbox("Async compute", &asyncToggle))
+        {
+            setAsyncComputeEnabled(asyncToggle);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (!backendAsync)
+            ImGui::TextDisabled("(backend has no async queue)");
+        else if (!asyncComputeEnabled())
+            ImGui::TextDisabled("(graphics fallback)");
+        else if (overlappingLevels > 0)
+            ImGui::TextColored(ImVec4(0.25f, 0.9f, 0.35f, 1.0f),
+                "(active: %u compute pass%s overlap graphics across %u level%s)",
+                computeBatches, computeBatches == 1 ? "" : "es",
+                overlappingLevels, overlappingLevels == 1 ? "" : "s");
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.35f, 1.0f),
+                "(on compute queue, but no level overlaps graphics)");
+
+        ImGui::TextDisabled(
+            "Queue = actual submit queue. Async/Overlap: Overlap = runs "
+            "concurrently with another queue; Eligible = compute pass on the "
+            "graphics queue (async off).");
+
+        auto queueName = [](QueueType queue)
+            {
+                switch (queue)
+                {
+                case QueueType::Graphics: return "Graphics";
+                case QueueType::Compute: return "Compute";
+                case QueueType::Transfer: return "Transfer";
+                }
+                return "Unknown";
+            };
+
+        auto passName = [&plan](GraphNodeId node) -> const char*
+            {
+                if (node >= plan.nodes.size()) return "Invalid";
+                const ExecutionNode& execution = plan.nodes[node];
+                if (execution.payloadIndex >= plan.payloads.size()) return "Unnamed";
+                const PassPayload& payload = plan.payloads[execution.payloadIndex];
+                if (const auto* pass = std::get_if<GraphicsPassData>(&payload))
+                    return pass->name.c_str();
+                if (const auto* pass = std::get_if<ComputePassData>(&payload))
+                    return pass->name.c_str();
+                if (const auto* pass = std::get_if<TransferPassData>(&payload))
+                    return pass->name.c_str();
+                if (std::holds_alternative<EnvironmentConvertPassData>(payload))
+                    return "EnvironmentConvert";
+                if (std::holds_alternative<PathTracePassData>(payload))
+                    return "PathTrace";
+                if (std::holds_alternative<TonemapPassData>(payload))
+                    return "Tonemap";
+                if (std::holds_alternative<PresentPassData>(payload))
+                    return "Present";
+                return "Unnamed";
+            };
+
+        // Author-declared execution cadence (see PassCadence). Only Graphics,
+        // Compute and Transfer passes carry it; anything else is treated as
+        // per-frame.
+        auto passCadence = [&plan](GraphNodeId node) -> PassCadence
+            {
+                if (node >= plan.nodes.size()) return PassCadence::PerFrame;
+                const ExecutionNode& execution = plan.nodes[node];
+                if (execution.payloadIndex >= plan.payloads.size())
+                    return PassCadence::PerFrame;
+                const PassPayload& payload = plan.payloads[execution.payloadIndex];
+                if (const auto* pass = std::get_if<GraphicsPassData>(&payload))
+                    return pass->execution.cadence;
+                if (const auto* pass = std::get_if<ComputePassData>(&payload))
+                    return pass->execution.cadence;
+                if (const auto* pass = std::get_if<TransferPassData>(&payload))
+                    return pass->execution.cadence;
+                return PassCadence::PerFrame;
+            };
+
+        if (ImGui::BeginTable("GraphQueueSchedule", 8,
+            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
+        {
+            ImGui::TableSetupColumn("Level");
+            ImGui::TableSetupColumn("Queue");
+            ImGui::TableSetupColumn("Pass");
+            ImGui::TableSetupColumn("Cadence");
+            ImGui::TableSetupColumn("Waits");
+            ImGui::TableSetupColumn("CPU Parallel");
+            ImGui::TableSetupColumn("Async/Overlap");
+            ImGui::TableSetupColumn("Node");
+            ImGui::TableHeadersRow();
+
+            for (const QueueSubmissionBatch& batch : plan.queueSubmissions)
+            {
+                const bool cpuParallel =
+                    batch.levelIndex < plan.executionLevels.size() &&
+                    plan.executionLevels[batch.levelIndex].nodeCount > 1;
+                for (uint32_t i = 0; i < batch.nodeCount; ++i)
+                {
+                    const GraphNodeId node =
+                        plan.queueSubmissionNodes[batch.firstNode + i];
+                    ImGui::TableNextRow();
+                    const bool levelOverlaps =
+                        batch.levelIndex < queuesPerLevel.size() &&
+                        queuesPerLevel[batch.levelIndex] > 1;
+
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", batch.levelIndex);
+                    ImGui::TableNextColumn();
+                    // Actual submit queue. Highlight non-graphics queues so it is
+                    // obvious at a glance which passes left the graphics queue.
+                    if (batch.queue == QueueType::Compute)
+                        ImGui::TextColored(
+                            ImVec4(1.0f, 0.65f, 0.25f, 1.0f), "Compute");
+                    else if (batch.queue == QueueType::Transfer)
+                        ImGui::TextColored(
+                            ImVec4(0.6f, 0.7f, 1.0f, 1.0f), "Transfer");
+                    else
+                        ImGui::TextUnformatted("Graphics");
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(passName(node));
+                    // Cadence carries both the author-declared policy and the
+                    // live per-frame gating result: a scheduled pass shows its
+                    // colored policy label, a pass skipped this frame (only
+                    // possible for Once/OnResize/Invalidated) is dimmed and
+                    // marked "(idle)". This folds in what used to be a separate
+                    // "Run" column, which was fully redundant for Per-Frame.
+                    ImGui::TableNextColumn();
+                    const bool scheduled =
+                        node < m_runtime->executeNodes.size() &&
+                        m_runtime->executeNodes[node] != 0;
+                    switch (passCadence(node))
+                    {
+                    case PassCadence::Once:
+                        if (scheduled)
+                            ImGui::TextColored(
+                                ImVec4(0.55f, 0.75f, 1.0f, 1.0f), "Once");
+                        else
+                            ImGui::TextDisabled("Once (idle)");
+                        break;
+                    case PassCadence::OnResize:
+                        if (scheduled)
+                            ImGui::TextColored(
+                                ImVec4(1.0f, 0.8f, 0.35f, 1.0f), "On Resize");
+                        else
+                            ImGui::TextDisabled("On Resize (idle)");
+                        break;
+                    case PassCadence::OnInvalidation:
+                        if (scheduled)
+                            ImGui::TextColored(
+                                ImVec4(1.0f, 0.8f, 0.35f, 1.0f), "Invalidated");
+                        else
+                            ImGui::TextDisabled("Invalidated (idle)");
+                        break;
+                    case PassCadence::PerFrame:
+                    default:
+                        ImGui::TextDisabled("Per-Frame");
+                        break;
+                    }
+                    ImGui::TableNextColumn();
+                    if (batch.waitCount == 0)
+                    {
+                        ImGui::TextDisabled("-");
+                    }
+                    else
+                    {
+                        std::string waits;
+                        for (uint32_t wait = 0; wait < batch.waitCount; ++wait)
+                        {
+                            const uint32_t sourceIndex =
+                                plan.queueSubmissionWaits[
+                                    batch.firstWait + wait].submissionIndex;
+                            if (sourceIndex >= plan.queueSubmissions.size()) continue;
+                            if (!waits.empty()) waits += "; ";
+                            const QueueSubmissionBatch& source =
+                                plan.queueSubmissions[sourceIndex];
+                            waits += queueName(source.queue);
+                            waits += ": ";
+                            if (source.nodeCount == 0)
+                            {
+                                waits += "submission ";
+                                waits += std::to_string(sourceIndex);
+                            }
+                            else
+                            {
+                                const GraphNodeId sourceNode =
+                                    plan.queueSubmissionNodes[source.firstNode];
+                                waits += passName(sourceNode);
+                                if (source.nodeCount > 1)
+                                {
+                                    waits += " +";
+                                    waits += std::to_string(source.nodeCount - 1);
+                                    waits += " pass";
+                                    if (source.nodeCount > 2) waits += "es";
+                                }
+                            }
+                        }
+                        ImGui::TextUnformatted(waits.c_str());
+                    }
+                    ImGui::TableNextColumn();
+                    ImGui::TextUnformatted(cpuParallel ? "Yes" : "No");
+                    ImGui::TableNextColumn();
+                    // Distinguish real overlap from mere eligibility:
+                    //  - Overlap: this pass's level has another queue's batch, so
+                    //    it truly executes concurrently on the GPU.
+                    //  - Compute: on the async queue but nothing on another queue
+                    //    shares its level (scheduled async, no overlap this level).
+                    //  - Eligible: a compute-type pass sitting on the graphics
+        //    queue (async disabled / unsupported) could overlap.
+                    //  - dash: a graphics pass with no concurrent async work.
+                    const bool isComputeType =
+                        node < plan.nodes.size() &&
+                        plan.nodes[node].type == GraphNodeType::Compute;
+                    if (levelOverlaps)
+                        ImGui::TextColored(
+                            ImVec4(0.25f, 0.9f, 0.35f, 1.0f), "Overlap");
+                    else if (batch.queue == QueueType::Compute)
+                        ImGui::TextColored(
+                            ImVec4(1.0f, 0.8f, 0.35f, 1.0f), "Compute");
+                    else if (isComputeType)
+                        ImGui::TextColored(
+                            ImVec4(0.7f, 0.7f, 0.5f, 1.0f), "Eligible");
+                    else
+                        ImGui::TextDisabled("-");
+                    ImGui::TableNextColumn();
+                    ImGui::Text("%u", node);
+                }
+            }
+            ImGui::EndTable();
+        }
+        ImGui::End();
+    }
 }

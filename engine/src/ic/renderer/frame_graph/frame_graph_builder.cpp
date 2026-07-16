@@ -263,6 +263,7 @@ namespace ic
 			.id = id,
 			.type = GraphResourceType::Texture,
 			.ownership = ResourceOwnership::Transient,
+            .multiplicity = ResourceMultiplicity::PerFrameSlot,
             .initialUsage = ResourceUsage::StorageTexture,
             .initialAccess = AccessType::Write,
             .textureDesc = desc,
@@ -284,6 +285,7 @@ namespace ic
 			.id = id,
 			.type = GraphResourceType::Buffer,
 			.ownership = ResourceOwnership::Transient,
+            .multiplicity = ResourceMultiplicity::PerFrameSlot,
             .initialUsage = ResourceUsage::StorageBuffer,
             .initialAccess = AccessType::Write,
             .bufferDesc = desc,
@@ -299,6 +301,9 @@ namespace ic
     {
         const GraphResourceId id = createTexture(desc);
         m_resources[id].ownership = ResourceOwnership::Persistent;
+        // Persistent resources are a single physical instance whose cross-frame
+        // reuse is ordered by the executor, not double-buffered.
+        m_resources[id].multiplicity = ResourceMultiplicity::Single;
         return id;
     }
 
@@ -307,6 +312,29 @@ namespace ic
     {
         const GraphResourceId id = createBuffer(desc);
         m_resources[id].ownership = ResourceOwnership::Persistent;
+        m_resources[id].multiplicity = ResourceMultiplicity::Single;
+        return id;
+    }
+
+    GraphResourceId FrameGraphBuilder::createHistoryTexture(
+        const TextureDesc& desc)
+    {
+        // A history resource is transient storage (recreated with the graph)
+        // but backed by one instance per frame-in-flight slot, so the previous
+        // frame's contents remain intact while the current frame writes a new
+        // instance. Consumers reach last frame's instance via the registry's
+        // previousEntry(); the executor's cross-frame ordering guarantees the
+        // previous producer has completed before this frame reads it.
+        const GraphResourceId id = createTexture(desc);
+        m_resources[id].multiplicity = ResourceMultiplicity::History;
+        return id;
+    }
+
+    GraphResourceId FrameGraphBuilder::createHistoryBuffer(
+        const BufferDesc& desc)
+    {
+        const GraphResourceId id = createBuffer(desc);
+        m_resources[id].multiplicity = ResourceMultiplicity::History;
         return id;
     }
 
@@ -365,6 +393,20 @@ namespace ic
 			.usage = usage
 			});
 	}
+
+    void FrameGraphBuilder::readPrevious(
+            GraphNodeId node,
+            GraphResourceId resource,
+            ResourceUsage usage)
+    {
+        m_accesses.push_back({
+            .node = node,
+            .resource = resource,
+            .access = AccessType::Read,
+            .usage = usage,
+            .previousVersion = true
+            });
+    }
 
 	void FrameGraphBuilder::clear()
 	{

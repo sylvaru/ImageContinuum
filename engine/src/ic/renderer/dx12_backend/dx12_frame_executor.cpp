@@ -53,7 +53,7 @@ namespace ic
 
         m_nextFenceValue = 1;
         m_nextQueueFenceValues = { 1, 1, 1 };
-        m_lastGraphCompletionValue = 0;
+        m_prevSubmissionSignals.clear();
     }
 
     void DX12FrameExecutor::shutdown()
@@ -70,9 +70,9 @@ namespace ic
             queueFence.Reset();
         }
         m_frameSync.clear();
+        m_prevSubmissionSignals.clear();
         m_nextFenceValue = 1;
         m_nextQueueFenceValues = { 1, 1, 1 };
-        m_lastGraphCompletionValue = 0;
         m_device = nullptr;
         m_swapchain = nullptr;
     }
@@ -107,7 +107,6 @@ namespace ic
             "Failed to signal DX12 frame fence.");
 
         m_frameSync[frameSlot].fenceValue = fenceValue;
-        m_lastGraphCompletionValue = fenceValue;
     }
 
     void DX12FrameExecutor::waitForGpu()
@@ -136,30 +135,77 @@ namespace ic
         {
             sync.fenceValue = 0;
         }
+        // The GPU is idle: no previous-frame work remains to order against, and
+        // the graph is typically rebuilt after a drain (submission indices would
+        // no longer correspond). Drop the stale signals.
+        m_prevSubmissionSignals.clear();
     }
 
     bool DX12FrameExecutor::submitAndPresent(
         const CompiledGraphPlan& plan,
         const std::vector<ID3D12CommandList*>& commandLists,
         uint32_t frameSlot,
+        const GraphExecutionContext& execution,
         const DX12UploadDependency& uploadDependency)
     {
-        std::array<bool, 3> uploadDependencyApplied{};
         const auto queueIndex = [](QueueType queue)
         {
             return static_cast<uint32_t>(queue);
         };
+
+        // Translate the compiler's cross-frame edges into per-submission waits on
+        // the PREVIOUS frame's producing submission. Only edges whose consumer
+        // node actually executes this frame are applied (a cadence-skipped writer
+        // creates no hazard), and only when the previous-frame signal map still
+        // lines up with this plan (it is dropped on a GPU drain / graph rebuild).
+        std::vector<std::vector<CrossFrameSignal>> crossFrameWaits(
+            plan.queueSubmissions.size());
+        const bool prevSignalsUsable =
+            m_prevSubmissionSignals.size() == plan.queueSubmissions.size();
+        if (prevSignalsUsable)
+        {
+            for (const CrossFrameDependency& dep : plan.crossFrameDependencies)
+            {
+                if (!execution.shouldExecute(dep.consumerNode) ||
+                    dep.consumerSubmission >= crossFrameWaits.size() ||
+                    dep.producerSubmission >= m_prevSubmissionSignals.size())
+                {
+                    continue;
+                }
+                const CrossFrameSignal& producer =
+                    m_prevSubmissionSignals[dep.producerSubmission];
+                if (producer.value != 0)
+                {
+                    crossFrameWaits[dep.consumerSubmission].push_back(producer);
+                }
+            }
+        }
+        // Per-frame uploads (model geometry/textures) are consumed ONLY by
+        // graphics scene-geometry draw passes, so only the graphics queue needs
+        // to synchronize with the upload. With the current DX12UploadScheduler
+        // the upload runs on the graphics queue itself, so this is pure
+        // submission order (no fence wait); were the upload moved to a dedicated
+        // queue, the graphics queue would wait on its fence here.
+        //
+        // Critically, the wait must NOT be applied to the compute/copy queues:
+        // no async compute/copy pass reads scheduler-uploaded data (the cluster
+        // passes read CPU-mapped upload-heap constants/lights, not model
+        // geometry), and making the async compute queue wait on the graphics
+        // upload fence synchronizes it after the upload's graphics-queue
+        // resource-state transitions, which triggers DXGI_ERROR_ACCESS_DENIED
+        // device removal. A non-graphics consumer, if ever added, must be modeled
+        // as a frame-graph transfer pass so the normal cross-queue fence
+        // machinery orders it explicitly.
+        bool uploadWaitApplied = false;
         auto waitForUploads =
             [&](ID3D12CommandQueue* queue, QueueType queueType)
             {
-                const uint32_t index = queueIndex(queueType);
-                if (!uploadDependency.valid() ||
-                    uploadDependencyApplied[index])
+                if (!uploadDependency.valid() || uploadWaitApplied ||
+                    queueType != QueueType::Graphics)
                 {
                     return;
                 }
-                // Submission order is already sufficient on the upload queue.
-                // All other queues require an explicit GPU-side fence wait.
+                uploadWaitApplied = true;
                 if (queue != uploadDependency.queue)
                 {
                     throwIfFailed(
@@ -168,7 +214,6 @@ namespace ic
                             uploadDependency.value),
                         "Failed to enqueue DX12 upload dependency.");
                 }
-                uploadDependencyApplied[index] = true;
             };
 
         if (!plan.queueSubmissions.empty())
@@ -184,6 +229,11 @@ namespace ic
                         i, batch.levelIndex, static_cast<uint32_t>(batch.queue),
                         batch.nodeCount, batch.waitCount);
                 }
+                spdlog::info(
+                    "[DX12FrameExecutor] cross-frame deps={} "
+                    "(0 => consecutive frames overlap fully; the old blanket "
+                    "previous-frame barrier is removed)",
+                    plan.crossFrameDependencies.size());
                 loggedSchedule = true;
             }
             std::vector<uint32_t> commandIndexByNode(
@@ -223,13 +273,20 @@ namespace ic
                 ID3D12CommandQueue* queue = queueFor(submission.queue);
                 waitForUploads(queue, submission.queue);
 
-                if (submission.levelIndex == 0 &&
-                    m_lastGraphCompletionValue != 0)
+                // Minimal cross-frame ordering: wait only for the specific prior-
+                // frame submissions that last used a resource this submission now
+                // reuses. Cross-frame hazards have no intra-frame barrier between
+                // them, so even a same-queue wait is meaningful here (unlike the
+                // intra-frame same-queue waits below, which submission order
+                // already satisfies).
+                for (const CrossFrameSignal& wait :
+                     crossFrameWaits[submissionIndex])
                 {
                     throwIfFailed(
                         queue->Wait(
-                            m_fence.Get(), m_lastGraphCompletionValue),
-                        "Failed to wait for prior DX12 graph frame.");
+                            m_queueFences[queueIndex(wait.queue)].Get(),
+                            wait.value),
+                        "Failed to enqueue DX12 cross-frame wait.");
                 }
 
                 for (uint32_t i = 0; i < submission.waitCount; ++i)
@@ -283,6 +340,17 @@ namespace ic
                 submissionSignals[submissionIndex] = {
                     submission.queue, signal };
                 lastQueueSignals[signalQueue] = signal;
+
+            }
+
+            // Publish this frame's per-submission signals so the next frame's
+            // cross-frame edges can wait on the exact producing submission.
+            m_prevSubmissionSignals.assign(
+                plan.queueSubmissions.size(), CrossFrameSignal{});
+            for (uint32_t i = 0; i < submissionSignals.size(); ++i)
+            {
+                m_prevSubmissionSignals[i] = {
+                    submissionSignals[i].queue, submissionSignals[i].value };
             }
 
             const uint32_t computeIndex = queueIndex(QueueType::Compute);

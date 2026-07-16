@@ -23,7 +23,7 @@ namespace ic
     class DX12Swapchain
     {
     public:
-        static constexpr uint32_t MaxImages = 3;
+        static constexpr uint32_t MaxImages = 4;
 
         void init(
             const DX12Factory& factory,
@@ -76,6 +76,14 @@ namespace ic
             return m_state == DX12SwapchainState::Valid;
         }
 
+        // Current OS window framebuffer size (authoritative surface extent).
+        // Zero on either axis means the window is minimized / has no drawable
+        // area this frame.
+        void windowFramebufferSize(uint32_t& width, uint32_t& height) const
+        {
+            queryWindowSize(width, height);
+        }
+
         bool vsyncEnabled() const
         {
             return m_vsync;
@@ -105,6 +113,11 @@ namespace ic
         uint32_t m_width = 0;
         uint32_t m_height = 0;
         bool m_vsync = true;
+        // Whether the swapchain was created with DXGI_SWAP_CHAIN_FLAG_ALLOW_-
+        // TEARING. Required (with the matching present flag) for genuinely
+        // uncapped, non-vsynced present on a flip-model swapchain. Without it,
+        // syncInterval 0 still locks to the display refresh (or half of it).
+        bool m_allowTearing = false;
 
         DXGI_FORMAT m_format = DXGI_FORMAT_R8G8B8A8_UNORM;
         DX12SwapchainState m_state = DX12SwapchainState::OutOfDate;

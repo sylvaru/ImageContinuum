@@ -10,6 +10,11 @@ namespace ic
     {
         GraphResourceId resource;
         std::pmr::vector<ResourceAccess> accesses;
+        // When true this chain tracks the PREVIOUS-frame instance of a history
+        // resource. It is kept separate from the resource's current-version
+        // chain so dependency and barrier synthesis treat the two frame
+        // versions as distinct physical instances.
+        bool previousVersion = false;
 
         ResourceChain(
             GraphResourceId r,
@@ -41,6 +46,8 @@ namespace ic
             , m_queueSubmissions(memory)
             , m_queueSubmissionNodes(memory)
             , m_queueSubmissionWaits(memory)
+            , m_nodeSubmission(memory)
+            , m_crossFrameDependencies(memory)
             , m_incomingBarrierIndices(memory)
             , m_outgoingBarrierIndices(memory)
         {}
@@ -53,6 +60,12 @@ namespace ic
         void buildExecutionOrder();
         void buildExecutionLevels();
         void buildQueueSubmissions();
+
+        // Derives the minimal cross-frame GPU ordering edges from shared-resource
+        // hazards (Single/persistent writes and history previous-instance reads).
+        // Must run after buildQueueSubmissions (needs the node->submission map)
+        // and buildExecutionOrder (needs access ordering).
+        void buildCrossFrameDependencies(const FrameGraphBuilder& builder);
 
         void buildResourceLifetimes();
 
@@ -84,6 +97,9 @@ namespace ic
         std::pmr::vector<QueueSubmissionBatch> m_queueSubmissions;
         std::pmr::vector<GraphNodeId> m_queueSubmissionNodes;
         std::pmr::vector<QueueSubmissionWait> m_queueSubmissionWaits;
+        // node id -> owning submission index (UINT32_MAX if unscheduled).
+        std::pmr::vector<uint32_t> m_nodeSubmission;
+        std::pmr::vector<CrossFrameDependency> m_crossFrameDependencies;
         std::pmr::vector<uint32_t> m_incomingBarrierIndices;
         std::pmr::vector<uint32_t> m_outgoingBarrierIndices;
     };

@@ -19,6 +19,21 @@ namespace ic
     class PipelineLibrary;
     class Window;
 
+    // The authoritative render surface for a frame: the backend's swapchain
+    // framebuffer extent plus a generation that increments on every swapchain
+    // (re)creation. The renderer treats this, rather than the OS window size, as the
+    // single source of truth for the render extent, so the compiled graph and
+    // all materialized attachments always match the backbuffer. renderable is
+    // false when the surface cannot be drawn to this frame (minimized, zero
+    // area, or a failed reconcile); the renderer then skips the whole frame.
+    struct RenderSurfaceState
+    {
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint64_t generation = 0;
+        bool renderable = false;
+    };
+
     class RendererBackend
     {
     public:
@@ -31,6 +46,13 @@ namespace ic
             uint32_t workerCount
         ) = 0;
         virtual void shutdown() = 0;
+
+        // Reconciles the swapchain to the current window framebuffer size,
+        // recreating it (bumping the generation) when the framebuffer changed or
+        // the swapchain is no longer valid. Called once per frame BEFORE the
+        // renderer builds the graph, so the returned extent is stable for the
+        // whole frame. Must not be called between record and present.
+        [[nodiscard]] virtual RenderSurfaceState reconcileRenderSurface() = 0;
 
         [[nodiscard]] virtual bool execute(
             const CompiledGraphPlan& plan,
@@ -102,6 +124,16 @@ namespace ic
 
         virtual void setHiZDebugMip(uint32_t)
         {
+        }
+
+        // Reports whether this backend can dispatch frame-graph compute passes on
+        // a dedicated async queue that overlaps graphics work. When false, the
+        // renderer keeps every compute pass on the graphics queue regardless of
+        // the async toggle. Defaults to unsupported; real backends with a
+        // separate compute queue override this.
+        virtual bool supportsAsyncCompute() const
+        {
+            return false;
         }
     };
 }

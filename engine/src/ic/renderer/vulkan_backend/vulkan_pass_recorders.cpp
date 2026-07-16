@@ -8,6 +8,77 @@
 
 namespace ic
 {
+    void recordTransferCopy(
+        VkCommandBuffer cmd,
+        const VulkanTransferCopy& copy)
+    {
+        if (copy.isBuffer)
+        {
+            VkBufferCopy region{};
+            region.size = copy.bufferSize;
+            vkCmdCopyBuffer(
+                cmd,
+                copy.sourceBuffer,
+                copy.destinationBuffer,
+                1,
+                &region);
+            return;
+        }
+
+        VkImageCopy region{};
+        region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.srcSubresource.layerCount = 1;
+        region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.dstSubresource.layerCount = 1;
+        region.extent = { copy.width, copy.height, 1 };
+        vkCmdCopyImage(
+            cmd,
+            copy.sourceImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            copy.destinationImage,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &region);
+    }
+
+    void recordComputeStorageBufferTest(
+        const VulkanPassContext& ctx,
+        const VulkanComputeStorageBufferTest& test)
+    {
+        VkCommandBuffer cmd = ctx.cmd;
+        vkCmdBindDescriptorSets(
+            cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            test.pipelineLayout,
+            0,
+            1,
+            &test.descriptorSet,
+            0,
+            nullptr);
+        vkCmdDispatch(
+            cmd, test.groupCountX, test.groupCountY, test.groupCountZ);
+
+        VkBufferMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = test.buffer;
+        barrier.offset = 0;
+        barrier.size = test.bufferSize;
+
+        vkCmdPipelineBarrier(
+            cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0, nullptr,
+            1, &barrier,
+            0, nullptr);
+    }
+
     bool recordHiZPyramid(
         const VulkanPassContext& ctx,
         const VulkanComputePipeline& pipeline,

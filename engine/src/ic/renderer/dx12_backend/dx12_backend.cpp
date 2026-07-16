@@ -9,6 +9,9 @@
 #include "ic/renderer/pipeline_library.h"
 #include "ic/renderer/gpu_driven_submission.h"
 #include "ic/renderer/dx12_backend/dx12_pass_recorders.h"
+#include "ic/renderer/dx12_backend/dx12_offscreen_pass_recorder.h"
+#include "ic/renderer/dx12_backend/dx12_scene_pass_recorder.h"
+#include "ic/renderer/dx12_backend/dx12_barrier_util.h"
 #include "ic/renderer/renderer_specification.h"
 #include "ic/renderer/path_tracing/path_trace_scene_builder.h"
 #include "ic/renderer/renderer_common/renderer_util.h"
@@ -51,23 +54,6 @@ namespace ic
             }
             return levels;
         }
-
-        void transitionResource(
-            ID3D12GraphicsCommandList4* cmd,
-            ID3D12Resource* resource,
-            D3D12_RESOURCE_STATES before,
-            D3D12_RESOURCE_STATES after)
-        {
-            if (!resource || before == after) return;
-            D3D12_RESOURCE_BARRIER barrier{};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            barrier.Transition.pResource = resource;
-            barrier.Transition.Subresource =
-                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            barrier.Transition.StateBefore = before;
-            barrier.Transition.StateAfter = after;
-            cmd->ResourceBarrier(1, &barrier);
-        }
     }
 
 
@@ -93,11 +79,19 @@ namespace ic
 
         m_swapchain.setVsyncEnabled(spec.settings.vsync);
 
+        // A flip-model swapchain needs at least one more back buffer than the
+        // number of frames the CPU may have in flight, otherwise every present
+        // stalls waiting for a buffer to free. With VSync, this collapses to
+        // half the refresh rate. framesInFlight + 1 gives full-rate pacing.
         m_swapchain.init(
             m_factory,
             m_device,
             window,
-            framesInFlight);
+            framesInFlight + 1u);
+        // Seed the authoritative framebuffer size so the first reconcile does
+        // not spuriously recreate a just-created swapchain.
+        m_lastFramebufferWidth = m_swapchain.width();
+        m_lastFramebufferHeight = m_swapchain.height();
 
         m_frameExecutor.init(m_device, m_swapchain, framesInFlight);
 
@@ -112,6 +106,10 @@ namespace ic
             m_resourceAllocator,
             m_descriptorSystem,
             framesInFlight);
+        // The graph-owned GPU-driven indirect-argument buffer is sized in native
+        // DX12 command units (draw args + embedded root constants).
+        m_graphResourceRegistry.setNativeIndirectCommandStride(
+            sizeof(DX12GpuIndexedIndirectCommand));
         m_gpuScene.init(
             m_device,
             m_resourceAllocator,
@@ -157,6 +155,46 @@ namespace ic
         spdlog::info("[DX12Backend] Shutdown");
     }
 
+    RenderSurfaceState DX12Backend::reconcileRenderSurface()
+    {
+        RenderSurfaceState surface{};
+
+        uint32_t framebufferWidth = 0;
+        uint32_t framebufferHeight = 0;
+        m_swapchain.windowFramebufferSize(framebufferWidth, framebufferHeight);
+
+        // Minimized / zero drawable area: leave the swapchain untouched and
+        // report the frame as non-renderable so the renderer skips it entirely.
+        if (framebufferWidth == 0 || framebufferHeight == 0)
+        {
+            return surface;
+        }
+
+        // Recreate when the framebuffer changed or the swapchain is no longer
+        // valid (e.g. a prior out-of-date present). recreateSwapchain bumps the
+        // generation, so the renderer rebuilds the graph to the new extent and
+        // re-materializes every resource before this frame records anything.
+        if (framebufferWidth != m_lastFramebufferWidth ||
+            framebufferHeight != m_lastFramebufferHeight ||
+            !m_swapchain.validForRendering())
+        {
+            recreateSwapchain();
+            m_lastFramebufferWidth = framebufferWidth;
+            m_lastFramebufferHeight = framebufferHeight;
+        }
+
+        if (!m_swapchain.validForRendering())
+        {
+            return surface;
+        }
+
+        surface.width = m_swapchain.width();
+        surface.height = m_swapchain.height();
+        surface.generation = m_swapchainGeneration;
+        surface.renderable = true;
+        return surface;
+    }
+
     bool DX12Backend::execute(
         const CompiledGraphPlan& plan,
         const GraphExecutionContext& execution,
@@ -175,14 +213,14 @@ namespace ic
         m_frameExecutor.waitForFrame(frameSlot);
         m_retirementQueue.beginFrame(frameSlot);
 
-        if (!m_swapchain.updateSizeFromWindow())
+        // The swapchain was already reconciled to the window this frame in
+        // reconcileRenderSurface(), and the graph was (re)built to match the
+        // extent it returned. This is a pure guard: no size change or recreate
+        // happens mid-frame, so the backbuffer and graph attachments cannot
+        // diverge in extent.
+        if (!m_swapchain.validForRendering())
         {
-            recreateSwapchain();
-
-            if (!m_swapchain.validForRendering())
-            {
-                return false;
-            }
+            return false;
         }
 
         m_uploadScheduler.beginFrame(frameSlot);
@@ -223,7 +261,7 @@ namespace ic
         const DX12UploadDependency uploadDependency =
             m_uploadScheduler.flush();
         const bool presented = m_frameExecutor.submitAndPresent(
-            plan, commandLists, frameSlot, uploadDependency);
+            plan, commandLists, frameSlot, execution, uploadDependency);
 
         if (!presented)
         {
@@ -265,6 +303,11 @@ namespace ic
                 (void)computePipelineForNode(plan, node);
             }
         }
+
+        // Upload this frame's cull inputs into the graph-owned per-frame-slot
+        // buffers before any worker records the cull dispatch. Serial, after
+        // prepareSceneResources has populated the prepared scene above.
+        uploadGpuDrivenInputs(plan, ctx);
 
         auto recordNode =
             [&](GraphNodeId nodeId, uint32_t workerIndex)
@@ -416,7 +459,11 @@ namespace ic
         DX12GraphResourceEntry* graphEntry = nullptr;
         if (resource.ownership != ResourceOwnership::Imported)
         {
-            graphEntry = m_graphResourceRegistry.entry(barrier.resource);
+            // A previous-version barrier transitions the previous frame's
+            // physical instance of a history resource, not the current one.
+            graphEntry = barrier.previousVersion
+                ? m_graphResourceRegistry.previousEntry(barrier.resource)
+                : m_graphResourceRegistry.entry(barrier.resource);
             if (graphEntry)
             {
                 dxResource = graphEntry->type == GraphResourceType::Texture
@@ -454,6 +501,38 @@ namespace ic
                 return usageToState(usage);
             };
 
+        // Buffers are never explicitly transitioned. D3D12 buffers implicitly
+        // promote from COMMON to whatever state an access needs and decay back
+        // to COMMON after every ExecuteCommandLists, on any queue. This is the
+        // single, correct policy for graph-owned buffers:
+        //   - No explicit transition barrier can go stale against the driver's
+        //     implicit decay (the graph does not model decay), and none asserts
+        //     a cross-queue before-state the other queue cannot validate. The
+        //     exact source of the DXGI_ERROR_ACCESS_DENIED device removal when a
+        //     buffer produced on one queue is consumed on another.
+        //   - A UAV barrier still orders write -> read/write on the same queue.
+        //     Cross-queue ordering + memory visibility come from the executor's
+        //     queue fence, so no barrier is emitted for the cross-queue edge.
+        // The tracked state is pinned to COMMON so any later same-queue barrier
+        // for this buffer starts from the state the driver actually decays to.
+        // (Textures still transition explicitly below because they have real layouts.)
+        if (resource.type == GraphResourceType::Buffer)
+        {
+            const bool writeHazard =
+                !crossQueueRelease && !crossQueueAcquire &&
+                (barrier.fromAccess != AccessType::Read ||
+                 barrier.toAccess != AccessType::Read);
+            if (writeHazard)
+            {
+                D3D12_RESOURCE_BARRIER uav{};
+                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                uav.UAV.pResource = dxResource;
+                cmd->ResourceBarrier(1, &uav);
+            }
+            if (graphEntry) graphEntry->state = D3D12_RESOURCE_STATE_COMMON;
+            return;
+        }
+
         const bool tracked = graphEntry != nullptr;
         const D3D12_RESOURCE_STATES before = tracked
             ? graphEntry->state
@@ -489,6 +568,32 @@ namespace ic
 
     }
 
+    DX12PassContext DX12Backend::makePassContext(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd,
+        ID3D12Resource* swapchainImage)
+    {
+        DX12PassContext passCtx{};
+        passCtx.cmd = cmd;
+        passCtx.plan = &plan;
+        passCtx.node = &node;
+        passCtx.frame = &ctx;
+        passCtx.scene = &scene;
+        passCtx.resources = &m_graphResourceRegistry;
+        passCtx.descriptors = &m_descriptorSystem;
+        passCtx.pipelines = &m_pipelineManager;
+        passCtx.gpuScene = &m_gpuScene;
+        passCtx.swapchainImage = swapchainImage;
+        passCtx.surfaceWidth = m_swapchain.width();
+        passCtx.surfaceHeight = m_swapchain.height();
+        passCtx.fallbackRtv = m_swapchain.currentRtv();
+        passCtx.fallbackDsv = m_depthDsv.cpuStart;
+        return passCtx;
+    }
+
     void DX12Backend::dispatchNode(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
@@ -497,23 +602,77 @@ namespace ic
         ID3D12GraphicsCommandList4* cmd,
         ID3D12Resource* swapchainImage)
     {
-        switch (node.type)
+        if (node.payloadIndex >= plan.payloads.size())
         {
-        case GraphNodeType::Graphics:
-            executeGraphicsNode(plan, node, ctx, scene, cmd, swapchainImage);
-            break;
-
-        case GraphNodeType::Compute:
-            executeComputeNode(plan, node, ctx, scene, cmd);
-            break;
-
-        case GraphNodeType::Transfer:
-            executeTransferNode(plan, node, ctx, cmd, swapchainImage);
-            break;
-
-        case GraphNodeType::Present:
-            break;
+            return;
         }
+
+        // Exhaustive payload dispatch: the visit binds the node's variant to the
+        // matching recordPassPayload overload. Overload resolution replaces the
+        // former node.type switch and the compute-node get_if cascade in one
+        // place, and a new PassPayload alternative without an overload is a
+        // compile error instead of a silently skipped pass.
+        std::visit(
+            [&](const auto& payload)
+            {
+                recordPassPayload(
+                    payload, plan, node, ctx, scene, cmd, swapchainImage);
+            },
+            plan.payloads[node.payloadIndex]);
+    }
+
+    void DX12Backend::recordPassPayload(
+        const GraphicsPassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd, ID3D12Resource* swapchainImage)
+    {
+        executeGraphicsNode(plan, node, ctx, scene, cmd, swapchainImage);
+    }
+
+    void DX12Backend::recordPassPayload(
+        const ComputePassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd, ID3D12Resource*)
+    {
+        executeComputeNode(plan, node, ctx, scene, cmd);
+    }
+
+    void DX12Backend::recordPassPayload(
+        const PathTracePassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd, ID3D12Resource*)
+    {
+        executePathTraceNode(plan, node, ctx, scene, cmd);
+    }
+
+    void DX12Backend::recordPassPayload(
+        const TonemapPassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView&,
+        ID3D12GraphicsCommandList4* cmd, ID3D12Resource*)
+    {
+        executeTonemapNode(plan, node, ctx, cmd);
+    }
+
+    void DX12Backend::recordPassPayload(
+        const EnvironmentConvertPassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView& scene,
+        ID3D12GraphicsCommandList4* cmd, ID3D12Resource*)
+    {
+        executeEnvironmentConvertNode(plan, node, ctx, scene, cmd);
+    }
+
+    void DX12Backend::recordPassPayload(
+        const TransferPassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView&,
+        ID3D12GraphicsCommandList4* cmd, ID3D12Resource* swapchainImage)
+    {
+        executeTransferNode(plan, node, ctx, cmd, swapchainImage);
     }
 
     void DX12Backend::executeGraphicsNode(
@@ -662,171 +821,66 @@ namespace ic
             return;
         }
 
-        const std::span<const DX12GpuScene::DrawItem> draws = m_gpuScene.draws();
-
         const uint32_t frameSlot =
             static_cast<uint32_t>(ctx.frameIndex % m_gpuScene.frameSlotCount());
         DX12GpuSceneFrameResources& frameResources =
             m_gpuScene.frameResources(frameSlot);
 
-        ID3D12DescriptorHeap* heaps[] =
-        {
-            m_descriptorSystem.shaderResourceHeap(),
-            m_descriptorSystem.samplerHeap()
-        };
-
-        cmd->SetDescriptorHeaps(
-            static_cast<UINT>(std::size(heaps)),
-            heaps);
-
-        cmd->SetGraphicsRootSignature(pipeline->rootSignature.Get());
-        cmd->SetPipelineState(pipeline->pipelineState.Get());
-        if (pipeline->desc.bindingLayout ==
-                PipelineBindingLayoutKind::ClusteredForward &&
-            usesClusterData)
-        {
-            bindClusteredForwardGraphics(*pipeline, ctx, cmd);
-        }
-        else
-        {
-            cmd->SetGraphicsRootConstantBufferView(
-                0,
-                frameResources.frameConstants.gpuAddress);
-            cmd->SetGraphicsRootDescriptorTable(
-                1,
-                frameResources.objectSrv.gpuStart);
-            cmd->SetGraphicsRootDescriptorTable(
-                2,
-                frameResources.materialSrv.gpuStart);
-            cmd->SetGraphicsRootDescriptorTable(
-                4,
-                m_descriptorSystem.shaderResourceGpuStart());
-            cmd->SetGraphicsRootDescriptorTable(
-                5,
-                m_descriptorSystem.samplerGpuStart());
-            if (m_environmentResources.iblBaked)
-            {
-                cmd->SetGraphicsRootDescriptorTable(
-                    6,
-                    m_environmentResources.irradianceSrv.gpuStart);
-                cmd->SetGraphicsRootDescriptorTable(
-                    7,
-                    m_environmentResources.prefilteredSrv.gpuStart);
-                cmd->SetGraphicsRootDescriptorTable(
-                    8,
-                    m_environmentResources.brdfLutSrv.gpuStart);
-                cmd->SetGraphicsRootDescriptorTable(
-                    9,
-                    m_environmentResources.sampler.gpuStart);
-            }
-        }
-        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-        const DrawConstants unusedFallbackConstants{};
-        cmd->SetGraphicsRoot32BitConstants(
-            3,
-            4,
-            &unusedFallbackConstants,
-            0);
-
+        // Resolve the GPU-driven indirect stream (graph-registry owned). The
+        // indirect-argument and bin-count buffers are read as INDIRECT_ARGUMENT;
+        // D3D12 implicitly promotes them from COMMON (the graph pins buffers to
+        // COMMON and orders the cull->draw write/read with a UAV barrier), so no
+        // explicit transition is recorded. The cluster buffers follow the same policy
+        // use. Cluster buffers likewise decay to COMMON after this command
+        // list's ExecuteCommandLists, keeping the graphics->compute (next frame)
+        // handoff legal without asserting a cross-queue before-state.
+        DX12GraphResourceEntry* indirectArgsEntry = gpuDrivenBufferEntry(
+            plan, GraphResourceSemantic::GpuDrivenIndirectArguments);
+        DX12GraphResourceEntry* binCountsEntry = gpuDrivenBufferEntry(
+            plan, GraphResourceSemantic::GpuDrivenBinCounts);
         ID3D12CommandSignature* indirectSignature =
             m_gpuScene.indirectCommandSignature(pipeline->rootSignature.Get());
         const bool useGpuDriven =
             indirectSignature &&
-            m_gpuScene.indirectArguments &&
-            m_gpuScene.binCounts &&
+            indirectArgsEntry && indirectArgsEntry->buffer &&
+            binCountsEntry && binCountsEntry->buffer &&
             !m_gpuScene.geometryBins().empty();
-        if (useGpuDriven)
-        {
-            if (m_gpuScene.indirectArgumentsState !=
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)
-            {
-                transitionResource(cmd,
-                    m_gpuScene.indirectArguments.resource.Get(),
-                    m_gpuScene.indirectArgumentsState,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-                m_gpuScene.indirectArgumentsState =
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-            }
-            if (m_gpuScene.binCountsState !=
-                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT)
-            {
-                transitionResource(cmd,
-                    m_gpuScene.binCounts.resource.Get(),
-                    m_gpuScene.binCountsState,
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
-                m_gpuScene.binCountsState =
-                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
-            }
-        }
 
-        DX12IndirectDrawStream indirectStream{};
-        indirectStream.commandSignature = indirectSignature;
-        indirectStream.indirectArguments =
-            m_gpuScene.indirectArguments.resource.Get();
-        indirectStream.binCounts = m_gpuScene.binCounts.resource.Get();
-        indirectStream.commandStride = sizeof(DX12GpuIndexedIndirectCommand);
-
-        // Shared by the depth prepass and the forward pass: both pipelines
-        // route scene geometry through this same recorder (see
-        // dx12_pass_recorders.h for why there is no separate depth-only path).
-        recordSceneGeometryDraws(
-            cmd,
-            draws,
-            m_gpuScene.geometryBins(),
-            useGpuDriven,
-            indirectStream,
+        DX12ForwardSceneInputs sceneInputs{};
+        sceneInputs.pipeline = pipeline;
+        sceneInputs.usesClusterData = usesClusterData;
+        sceneInputs.frameConstantsAddr =
+            frameResources.frameConstants.gpuAddress;
+        sceneInputs.objectSrv = frameResources.objectSrv.gpuStart;
+        sceneInputs.materialSrv = frameResources.materialSrv.gpuStart;
+        sceneInputs.iblBaked = m_environmentResources.iblBaked;
+        sceneInputs.irradianceSrv =
+            m_environmentResources.irradianceSrv.gpuStart;
+        sceneInputs.prefilteredSrv =
+            m_environmentResources.prefilteredSrv.gpuStart;
+        sceneInputs.brdfLutSrv = m_environmentResources.brdfLutSrv.gpuStart;
+        sceneInputs.environmentSampler =
+            m_environmentResources.sampler.gpuStart;
+        sceneInputs.useGpuDriven = useGpuDriven;
+        sceneInputs.indirectStream.commandSignature = indirectSignature;
+        sceneInputs.indirectStream.indirectArguments = useGpuDriven
+            ? indirectArgsEntry->buffer.resource.Get() : nullptr;
+        sceneInputs.indirectStream.binCounts = useGpuDriven
+            ? binCountsEntry->buffer.resource.Get() : nullptr;
+        sceneInputs.indirectStream.commandStride =
+            sizeof(DX12GpuIndexedIndirectCommand);
+        sceneInputs.draws = m_gpuScene.draws();
+        sceneInputs.geometryBins = m_gpuScene.geometryBins();
+        sceneInputs.resolveNativeModel =
             [this](AssetHandle handle) -> DX12UploadedModel*
             {
                 auto it = m_uploadedModels.find(handle);
                 return it != m_uploadedModels.end() ? &it->second : nullptr;
-            });
+            };
 
-        // Backend-owned GPU-scene buffers are represented by graph dependency
-        // tokens, but are not allocated by the graph registry. Return every
-        // resource that crosses to the compute queue to COMMON on the queue
-        // that last used it; the graph fence wait then makes the handoff legal.
-        if (useGpuDriven)
-        {
-            if (m_gpuScene.indirectArgumentsState != D3D12_RESOURCE_STATE_COMMON)
-            {
-                transitionResource(
-                    cmd, m_gpuScene.indirectArguments.resource.Get(),
-                    m_gpuScene.indirectArgumentsState,
-                    D3D12_RESOURCE_STATE_COMMON);
-                m_gpuScene.indirectArgumentsState = D3D12_RESOURCE_STATE_COMMON;
-            }
-            if (m_gpuScene.binCountsState != D3D12_RESOURCE_STATE_COMMON)
-            {
-                transitionResource(
-                    cmd, m_gpuScene.binCounts.resource.Get(),
-                    m_gpuScene.binCountsState, D3D12_RESOURCE_STATE_COMMON);
-                m_gpuScene.binCountsState = D3D12_RESOURCE_STATE_COMMON;
-            }
-        }
-
-        if (pipeline->desc.bindingLayout ==
-                PipelineBindingLayoutKind::ClusteredForward &&
-            usesClusterData)
-        {
-            ID3D12Resource* resources[] = {
-                m_clusteredForwardResources.clusterBounds.resource.Get(),
-                m_clusteredForwardResources.clusterLightGrid.resource.Get(),
-                m_clusteredForwardResources.clusterLightIndices.resource.Get(),
-                m_clusteredForwardResources.clusterLightCounter.resource.Get() };
-            D3D12_RESOURCE_STATES* states[] = {
-                &m_clusteredForwardResources.boundsState,
-                &m_clusteredForwardResources.gridState,
-                &m_clusteredForwardResources.indicesState,
-                &m_clusteredForwardResources.counterState };
-            for (uint32_t i = 0; i < std::size(resources); ++i)
-            {
-                transitionResource(
-                    cmd, resources[i], *states[i],
-                    D3D12_RESOURCE_STATE_COMMON);
-                *states[i] = D3D12_RESOURCE_STATE_COMMON;
-            }
-        }
+        DX12PassContext passCtx =
+            makePassContext(plan, node, ctx, scene, cmd, swapchainImage);
+        recordForwardScene(passCtx, sceneInputs);
     }
 
     void DX12Backend::executeComputeNode(
@@ -836,30 +890,9 @@ namespace ic
         [[maybe_unused]] const SceneRenderView& scene,
         [[maybe_unused]] ID3D12GraphicsCommandList4* cmd)
     {
-        if (node.payloadIndex >= plan.payloads.size())
-        {
-            return;
-        }
-
-        if (std::get_if<PathTracePassData>(&plan.payloads[node.payloadIndex]))
-        {
-            executePathTraceNode(plan, node, ctx, scene, cmd);
-            return;
-        }
-
-        if (std::get_if<EnvironmentConvertPassData>(
-                &plan.payloads[node.payloadIndex]))
-        {
-            executeEnvironmentConvertNode(plan, node, ctx, scene, cmd);
-            return;
-        }
-
-        if (std::get_if<TonemapPassData>(&plan.payloads[node.payloadIndex]))
-        {
-            executeTonemapNode(plan, node, ctx, cmd);
-            return;
-        }
-
+        // dispatchNode's std::visit routes PathTrace/Tonemap/EnvironmentConvert
+        // payloads to their own recorders, so this node is now only reached for a
+        // generic ComputePassData; the per-layout decision below is owned here.
         const ComputePassData* pass =
             std::get_if<ComputePassData>(&plan.payloads[node.payloadIndex]);
         if (!pass || !pass->pipeline)
@@ -894,9 +927,16 @@ namespace ic
                     D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
             }
 
-            cmd->SetComputeRootUnorderedAccessView(
-                0,
-                m_computeTestBuffer.gpuAddress);
+            DX12PassContext passCtx{};
+            passCtx.cmd = cmd;
+            DX12ComputeStorageBufferTest test{};
+            test.bufferAddr = m_computeTestBuffer.gpuAddress;
+            test.bufferResource = m_computeTestBuffer.resource.Get();
+            test.groupCountX = pass->groupCountX;
+            test.groupCountY = pass->groupCountY;
+            test.groupCountZ = pass->groupCountZ;
+            recordComputeStorageBufferTest(passCtx, test);
+            return;
         }
         else if (pipeline->desc.bindingLayout ==
             PipelineBindingLayoutKind::HiZDepthPyramid)
@@ -954,22 +994,35 @@ namespace ic
             passCtx.resources = &m_graphResourceRegistry;
             passCtx.descriptors = &m_descriptorSystem;
 
+            // Resolve every cull buffer from the graph registry (per frame
+            // slot). The graph owns their state and cross-pass ordering; the
+            // recorder only binds addresses.
+            DX12GraphResourceEntry* visibleInstances = gpuDrivenBufferEntry(
+                plan, GraphResourceSemantic::GpuDrivenVisibleInstances);
+            DX12GraphResourceEntry* visibleCount = gpuDrivenBufferEntry(
+                plan, GraphResourceSemantic::GpuDrivenVisibleCount);
+            DX12GraphResourceEntry* indirectArgs = gpuDrivenBufferEntry(
+                plan, GraphResourceSemantic::GpuDrivenIndirectArguments);
+            DX12GraphResourceEntry* binCounts = gpuDrivenBufferEntry(
+                plan, GraphResourceSemantic::GpuDrivenBinCounts);
+            DX12GraphResourceEntry* instanceBounds = gpuDrivenBufferEntry(
+                plan, GraphResourceSemantic::GpuDrivenInstanceBounds);
+            DX12GraphResourceEntry* drawInputs = gpuDrivenBufferEntry(
+                plan, GraphResourceSemantic::GpuDrivenDrawInputs);
+            if (!visibleInstances || !visibleCount || !indirectArgs ||
+                !binCounts || !instanceBounds || !drawInputs)
+            {
+                return;
+            }
+
             DX12CullBuffers cull{};
-            cull.visibleInstances = g.visibleInstances.resource.Get();
-            cull.visibleInstancesState = &g.visibleInstancesState;
-            cull.visibleInstancesAddr = g.visibleInstances.gpuAddress;
-            cull.visibleInstanceCount = g.visibleInstanceCount.resource.Get();
-            cull.visibleInstanceCountState = &g.visibleInstanceCountState;
-            cull.visibleInstanceCountAddr = g.visibleInstanceCount.gpuAddress;
-            cull.indirectArguments = g.indirectArguments.resource.Get();
-            cull.indirectArgumentsState = &g.indirectArgumentsState;
-            cull.indirectArgumentsAddr = g.indirectArguments.gpuAddress;
-            cull.binCounts = g.binCounts.resource.Get();
-            cull.binCountsState = &g.binCountsState;
-            cull.binCountsAddr = g.binCounts.gpuAddress;
+            cull.visibleInstancesAddr = visibleInstances->buffer.gpuAddress;
+            cull.visibleInstanceCountAddr = visibleCount->buffer.gpuAddress;
+            cull.indirectArgumentsAddr = indirectArgs->buffer.gpuAddress;
+            cull.binCountsAddr = binCounts->buffer.gpuAddress;
             cull.frameConstantsAddr = frameResources.frameConstants.gpuAddress;
-            cull.instanceBoundsAddr = frameResources.instanceBounds.gpuAddress;
-            cull.drawInputsAddr = frameResources.drawInputs.gpuAddress;
+            cull.instanceBoundsAddr = instanceBounds->buffer.gpuAddress;
+            cull.drawInputsAddr = drawInputs->buffer.gpuAddress;
 
             recordGpuFrustumCull(passCtx, cull);
 
@@ -984,7 +1037,7 @@ namespace ic
         else if (pipeline->desc.bindingLayout ==
             PipelineBindingLayoutKind::ClusteredForward)
         {
-            if (!bindClusteredForwardCompute(*pipeline, ctx, scene, cmd))
+            if (!bindClusteredForwardCompute(*pipeline, plan, ctx, scene, cmd))
             {
                 return;
             }
@@ -1010,75 +1063,11 @@ namespace ic
                 pass->groupCountZ);
         }
 
-        if (pipeline->desc.bindingLayout ==
-            PipelineBindingLayoutKind::ComputeStorageBuffer)
-        {
-            D3D12_RESOURCE_BARRIER barrier{};
-            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barrier.UAV.pResource = m_computeTestBuffer.resource.Get();
-            cmd->ResourceBarrier(1, &barrier);
-        }
-        else if (pipeline->desc.bindingLayout ==
-            PipelineBindingLayoutKind::ClusteredForward)
-        {
-            ID3D12Resource* resources[] = {
-                m_clusteredForwardResources.clusterBounds.resource.Get(),
-                m_clusteredForwardResources.clusterLightGrid.resource.Get(),
-                m_clusteredForwardResources.clusterLightIndices.resource.Get(),
-                m_clusteredForwardResources.clusterLightCounter.resource.Get() };
-            D3D12_RESOURCE_STATES* states[] = {
-                &m_clusteredForwardResources.boundsState,
-                &m_clusteredForwardResources.gridState,
-                &m_clusteredForwardResources.indicesState,
-                &m_clusteredForwardResources.counterState };
-            for (uint32_t i = 0; i < std::size(resources); ++i)
-            {
-                D3D12_RESOURCE_BARRIER uav{};
-                uav.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                uav.UAV.pResource = resources[i];
-                cmd->ResourceBarrier(1, &uav);
-                transitionResource(
-                    cmd, resources[i], *states[i],
-                    D3D12_RESOURCE_STATE_COMMON);
-                *states[i] = D3D12_RESOURCE_STATE_COMMON;
-            }
-        }
-        else if (pipeline->desc.bindingLayout ==
-            PipelineBindingLayoutKind::GpuFrustumCull)
-        {
-            D3D12_RESOURCE_BARRIER barriers[4]{};
-            barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barriers[0].UAV.pResource =
-                m_gpuScene.visibleInstances.resource.Get();
-            barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barriers[1].UAV.pResource =
-                m_gpuScene.visibleInstanceCount.resource.Get();
-            barriers[2].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barriers[2].UAV.pResource =
-                m_gpuScene.indirectArguments.resource.Get();
-            barriers[3].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-            barriers[3].UAV.pResource =
-                m_gpuScene.binCounts.resource.Get();
-            cmd->ResourceBarrier(4, barriers);
-            ID3D12Resource* resources[] = {
-                m_gpuScene.visibleInstances.resource.Get(),
-                m_gpuScene.visibleInstanceCount.resource.Get(),
-                m_gpuScene.indirectArguments.resource.Get(),
-                m_gpuScene.binCounts.resource.Get() };
-            D3D12_RESOURCE_STATES* states[] = {
-                &m_gpuScene.visibleInstancesState,
-                &m_gpuScene.visibleInstanceCountState,
-                &m_gpuScene.indirectArgumentsState,
-                &m_gpuScene.binCountsState };
-            for (uint32_t i = 0; i < std::size(resources); ++i)
-            {
-                transitionResource(
-                    cmd, resources[i], *states[i],
-                    D3D12_RESOURCE_STATE_COMMON);
-                *states[i] = D3D12_RESOURCE_STATE_COMMON;
-            }
-            readbackVisibleInstanceCount(ctx, cmd);
-        }
+        // The GPU-driven cull buffers (and the clustered cluster buffers) are
+        // frame-graph owned: the graph emits the write->read barriers from the
+        // declared dependencies and D3D12 implicit buffer promotion/decay carries
+        // the state across the cull -> indirect-draw handoff, so no manual
+        // post-dispatch barrier or state transition is recorded here.
     }
 
     void DX12Backend::executeEnvironmentConvertNode(
@@ -1160,35 +1149,21 @@ namespace ic
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         }
 
-        ID3D12DescriptorHeap* heaps[] =
+        DX12PassContext passCtx{};
+        passCtx.cmd = cmd;
+        passCtx.descriptors = &m_descriptorSystem;
+
+        DX12EnvironmentConvertInputs convertInputs{};
+        convertInputs.pipeline = &pipeline;
+        convertInputs.sourceSrv = textureIt->second.srv.gpuStart;
+        convertInputs.cubemapUav = m_environmentResources.cubemapUav.gpuStart;
+        convertInputs.sampler = m_environmentResources.sampler.gpuStart;
+        convertInputs.cubemap = m_environmentResources.cubemap.resource.Get();
+        convertInputs.cubemapSize = m_environmentResources.cubemapSize;
+        if (!recordEnvironmentConvert(passCtx, convertInputs))
         {
-            m_descriptorSystem.shaderResourceHeap(),
-            m_descriptorSystem.samplerHeap()
-        };
-        cmd->SetDescriptorHeaps(
-            static_cast<UINT>(std::size(heaps)),
-            heaps);
-        cmd->SetComputeRootSignature(pipeline.rootSignature.Get());
-        if (!pipeline.pipelineState.Get())
-        {
-            spdlog::error(
-                "[DX12] Environment conversion PSO is null; skipping HDR conversion");
             return false;
         }
-        cmd->SetPipelineState(pipeline.pipelineState.Get());
-        cmd->SetComputeRootDescriptorTable(0, textureIt->second.srv.gpuStart);
-        cmd->SetComputeRootDescriptorTable(1, m_environmentResources.cubemapUav.gpuStart);
-        cmd->SetComputeRootDescriptorTable(2, m_environmentResources.sampler.gpuStart);
-        cmd->Dispatch(
-            (m_environmentResources.cubemapSize + 7u) / 8u,
-            (m_environmentResources.cubemapSize + 7u) / 8u,
-            6u);
-
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        barrier.UAV.pResource =
-            m_environmentResources.cubemap.resource.Get();
-        cmd->ResourceBarrier(1, &barrier);
 
         transitionResource(
             cmd,
@@ -1265,32 +1240,10 @@ namespace ic
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         }
 
-        PathTraceConstants constants{};
-        constants.renderWidth = m_pathTraceResources.width;
-        constants.renderHeight = m_pathTraceResources.height;
-        constants.frameIndex = static_cast<uint32_t>(ctx.frameIndex);
-        constants.accumulatedSampleCount =
-            m_pathTraceResources.accumulatedSampleCount;
-        constants.exposure = m_pathTraceResources.tonemapExposure;
-        constants.resetAccumulation =
-            m_pathTraceResources.resetAccumulation ? 1u : 0u;
-        constants.maxBounces = DefaultPathTraceMaxBounces;
-        constants.samplesPerPixel = DefaultPathTraceSamplesPerPixel;
-        constants.sceneVertexCount =
-            m_pathTraceResources.sceneVertexCount;
-        constants.sceneMaterialCount =
-            m_pathTraceResources.sceneMaterialCount;
-        constants.sceneTriangleCount =
-            m_pathTraceResources.sceneTriangleCount;
-        constants.sceneBvhNodeCount =
-            m_pathTraceResources.sceneBvhNodeCount;
-        constants.sceneEmissiveTriangleIndex =
-            m_pathTraceResources.firstEmissiveTriangleIndex;
-        constants.useSceneGeometry =
-            m_pathTraceResources.sceneTriangleCount != 0u &&
-            m_pathTraceResources.sceneBvhNodeCount != 0u
-                ? 1u
-                : 0u;
+        // Environment lifetime/conversion is the backend's job; hoisting it here
+        // (ahead of the CPU-only constants build the recorder now owns) leaves
+        // the RECORDED command order identical: accumulation transition, then any
+        // environment-convert dispatch, then the path-trace dispatch.
         const bool environmentResourcesAvailable =
             ensureEnvironmentResources(ctx, scene, cmd);
         if (!environmentResourcesAvailable)
@@ -1311,28 +1264,36 @@ namespace ic
         }
         const bool environmentReady = m_environmentResources.converted;
 
-        constants.environmentEnabled = environmentReady ? 1u : 0u;
-        constants.environmentIntensity = scene.environment.settings.intensity;
-        constants.environmentExposure =
-            scene.environment.settings.pathTraceExposure;
-        fillPathTraceCameraConstants(
-            scene.camera,
-            m_pathTraceResources.width,
-            m_pathTraceResources.height,
-            constants);
-        for (const SceneLightRenderItem& light : scene.lights)
+        DX12ComputePipeline* pipeline =
+            m_pipelineManager.computePipeline(pathTracePipelineHandle);
+        if (!pipeline)
         {
-            if (light.type != LightType::Point ||
-                constants.pointLightCount >= MaxPathTracePointLights)
-            {
-                continue;
-            }
+            return;
+        }
 
-            const uint32_t lightIndex = constants.pointLightCount++;
-            constants.pointLightPositionRange[lightIndex] =
-                glm::vec4(light.position, light.range);
-            constants.pointLightColorIntensity[lightIndex] =
-                glm::vec4(light.color, light.intensity);
+        // Patch the environment cubemap SRV into the scene descriptor table.
+        // Resource-view creation is backend resolution, not command recording.
+        if (m_pathTraceResources.sceneSrvs.valid() &&
+            m_environmentResources.cubemapSrv.valid() &&
+            m_environmentResources.cubemap.resource &&
+            m_pathTraceResources.sceneSrvs.count > 4u)
+        {
+            D3D12_CPU_DESCRIPTOR_HANDLE environmentDst =
+                m_pathTraceResources.sceneSrvs.cpuStart;
+            environmentDst.ptr +=
+                static_cast<SIZE_T>(4u) *
+                m_pathTraceResources.sceneSrvs.descriptorSize;
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Shader4ComponentMapping =
+                D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.Format = m_environmentResources.cubemap.desc.Format;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+            srv.TextureCube.MipLevels = 1;
+            m_device.device()->CreateShaderResourceView(
+                m_environmentResources.cubemap.resource.Get(),
+                &srv,
+                environmentDst);
         }
 
         const uint32_t frameSlot =
@@ -1342,91 +1303,40 @@ namespace ic
         DX12Buffer& pathTraceConstants =
             m_pathTraceResources.pathTraceConstants[frameSlot];
 
-        std::memcpy(
-            pathTraceConstants.mapped,
-            &constants,
-            sizeof(constants));
+        DX12PathTraceInputs inputs{};
+        inputs.pipeline = pipeline;
+        inputs.constantsMapped = pathTraceConstants.mapped;
+        inputs.constantsAddr = pathTraceConstants.gpuAddress;
+        inputs.accumulationUav = m_pathTraceResources.accumulationUav.gpuStart;
+        inputs.sceneSrvsValid = m_pathTraceResources.sceneSrvs.valid();
+        inputs.sceneSrvs = m_pathTraceResources.sceneSrvs.gpuStart;
+        inputs.samplerValid = m_environmentResources.sampler.valid();
+        inputs.sampler = m_environmentResources.sampler.gpuStart;
+        inputs.accumulation = m_pathTraceResources.accumulation.resource.Get();
+        inputs.width = m_pathTraceResources.width;
+        inputs.height = m_pathTraceResources.height;
+        inputs.frameIndex = static_cast<uint32_t>(ctx.frameIndex);
+        inputs.accumulatedSampleCount =
+            m_pathTraceResources.accumulatedSampleCount;
+        inputs.exposure = m_pathTraceResources.tonemapExposure;
+        inputs.resetAccumulation = m_pathTraceResources.resetAccumulation;
+        inputs.sceneVertexCount = m_pathTraceResources.sceneVertexCount;
+        inputs.sceneMaterialCount = m_pathTraceResources.sceneMaterialCount;
+        inputs.sceneTriangleCount = m_pathTraceResources.sceneTriangleCount;
+        inputs.sceneBvhNodeCount = m_pathTraceResources.sceneBvhNodeCount;
+        inputs.firstEmissiveTriangleIndex =
+            m_pathTraceResources.firstEmissiveTriangleIndex;
+        inputs.environmentReady = environmentReady;
+        inputs.environmentIntensity = scene.environment.settings.intensity;
+        inputs.environmentExposure =
+            scene.environment.settings.pathTraceExposure;
 
-        ID3D12DescriptorHeap* heaps[] =
-        {
-            m_descriptorSystem.shaderResourceHeap(),
-            m_descriptorSystem.samplerHeap()
-        };
-        cmd->SetDescriptorHeaps(
-            static_cast<UINT>(std::size(heaps)),
-            heaps);
-
-        DX12ComputePipeline* pipeline =
-            m_pipelineManager.computePipeline(pathTracePipelineHandle);
-        if (!pipeline)
+        DX12PassContext passCtx =
+            makePassContext(plan, node, ctx, scene, cmd, nullptr);
+        if (!recordPathTrace(passCtx, inputs))
         {
             return;
         }
-        if (!pipeline->rootSignature || !pipeline->pipelineState)
-        {
-            spdlog::error(
-                "[DX12] Path trace pipeline is incomplete; skipping dispatch");
-            return;
-        }
-        cmd->SetComputeRootSignature(pipeline->rootSignature.Get());
-        cmd->SetPipelineState(pipeline->pipelineState.Get());
-        cmd->SetComputeRootConstantBufferView(
-            0,
-            pathTraceConstants.gpuAddress);
-        cmd->SetComputeRootDescriptorTable(
-            1,
-            m_pathTraceResources.accumulationUav.gpuStart);
-        if (m_pathTraceResources.sceneSrvs.valid())
-        {
-            if (m_environmentResources.cubemapSrv.valid() &&
-                m_environmentResources.cubemap.resource &&
-                m_pathTraceResources.sceneSrvs.count > 4u)
-            {
-                D3D12_CPU_DESCRIPTOR_HANDLE environmentDst =
-                    m_pathTraceResources.sceneSrvs.cpuStart;
-                environmentDst.ptr +=
-                    static_cast<SIZE_T>(4u) *
-                    m_pathTraceResources.sceneSrvs.descriptorSize;
-
-                D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
-                srv.Shader4ComponentMapping =
-                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-                srv.Format = m_environmentResources.cubemap.desc.Format;
-                srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-                srv.TextureCube.MipLevels = 1;
-                m_device.device()->CreateShaderResourceView(
-                    m_environmentResources.cubemap.resource.Get(),
-                    &srv,
-                    environmentDst);
-            }
-            cmd->SetComputeRootDescriptorTable(
-                2,
-                m_pathTraceResources.sceneSrvs.gpuStart);
-        }
-        if (m_environmentResources.sampler.valid())
-        {
-            cmd->SetComputeRootDescriptorTable(
-                3,
-                m_environmentResources.sampler.gpuStart);
-        }
-        cmd->SetComputeRootDescriptorTable(
-            4,
-            m_descriptorSystem.shaderResourceGpuStart());
-        cmd->SetComputeRootDescriptorTable(
-            5,
-            m_descriptorSystem.samplerGpuStart());
-
-        const uint32_t groupCountX =
-            (m_pathTraceResources.width + 7u) / 8u;
-        const uint32_t groupCountY =
-            (m_pathTraceResources.height + 7u) / 8u;
-        cmd->Dispatch(groupCountX, groupCountY, 1);
-
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        barrier.UAV.pResource =
-            m_pathTraceResources.accumulation.resource.Get();
-        cmd->ResourceBarrier(1, &barrier);
 
         ++m_pathTraceResources.accumulatedSampleCount;
         m_pathTraceResources.resetAccumulation = false;
@@ -1474,11 +1384,6 @@ namespace ic
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
         }
 
-        TonemapConstants constants{};
-        constants.renderWidth = m_pathTraceResources.width;
-        constants.renderHeight = m_pathTraceResources.height;
-        constants.exposure = m_pathTraceResources.tonemapExposure;
-
         const uint32_t frameSlot =
             static_cast<uint32_t>(
                 ctx.frameIndex %
@@ -1486,39 +1391,24 @@ namespace ic
         DX12Buffer& tonemapConstants =
             m_pathTraceResources.tonemapConstants[frameSlot];
 
-        std::memcpy(
-            tonemapConstants.mapped,
-            &constants,
-            sizeof(constants));
+        DX12TonemapInputs inputs{};
+        inputs.pipeline = pipeline;
+        inputs.constantsMapped = tonemapConstants.mapped;
+        inputs.constantsAddr = tonemapConstants.gpuAddress;
+        inputs.tonemapUav = m_pathTraceResources.tonemapUav.gpuStart;
+        inputs.accumulationSrv = m_pathTraceResources.accumulationSrv.gpuStart;
+        inputs.tonemap = m_pathTraceResources.tonemap.resource.Get();
+        inputs.width = m_pathTraceResources.width;
+        inputs.height = m_pathTraceResources.height;
+        inputs.exposure = m_pathTraceResources.tonemapExposure;
 
-        ID3D12DescriptorHeap* heaps[] =
-        {
-            m_descriptorSystem.shaderResourceHeap()
-        };
-        cmd->SetDescriptorHeaps(1, heaps);
-        cmd->SetComputeRootSignature(pipeline->rootSignature.Get());
-        cmd->SetPipelineState(pipeline->pipelineState.Get());
-        cmd->SetComputeRootConstantBufferView(
-            0,
-            tonemapConstants.gpuAddress);
-        cmd->SetComputeRootDescriptorTable(
-            1,
-            m_pathTraceResources.tonemapUav.gpuStart);
-        cmd->SetComputeRootDescriptorTable(
-            2,
-            m_pathTraceResources.accumulationSrv.gpuStart);
-
-        const uint32_t groupCountX =
-            (m_pathTraceResources.width + 7u) / 8u;
-        const uint32_t groupCountY =
-            (m_pathTraceResources.height + 7u) / 8u;
-        cmd->Dispatch(groupCountX, groupCountY, 1);
-
-        D3D12_RESOURCE_BARRIER barrier{};
-        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-        barrier.UAV.pResource =
-            m_pathTraceResources.tonemap.resource.Get();
-        cmd->ResourceBarrier(1, &barrier);
+        DX12PassContext passCtx{};
+        passCtx.cmd = cmd;
+        passCtx.plan = &plan;
+        passCtx.node = &node;
+        passCtx.frame = &ctx;
+        passCtx.descriptors = &m_descriptorSystem;
+        recordTonemap(passCtx, inputs);
     }
 
     void DX12Backend::executeTransferNode(
@@ -1563,19 +1453,19 @@ namespace ic
             return m_graphResourceRegistry.nativeResource(resource.id);
         };
 
-        ID3D12Resource* source = resolve(sourceDesc);
-        ID3D12Resource* destination = resolve(destinationDesc);
-        if (!source || !destination)
-        {
-            spdlog::error("Transfer pass '{}' could not resolve its resources", pass->name);
-            return;
-        }
+        DX12TransferCopy copy{};
+        copy.source = resolve(sourceDesc);
+        copy.destination = resolve(destinationDesc);
+        copy.type = sourceDesc.type;
+        copy.passName = pass->name.c_str();
         if (sourceDesc.type != destinationDesc.type)
         {
             spdlog::error("Transfer pass '{}' cannot copy between resource types", pass->name);
             return;
         }
 
+        // Backend owns the state-tracked transition of its private path-trace
+        // target; the recorder validates and issues the copy.
         if (sourceDesc.semantic == GraphResourceSemantic::PathTraceTonemap)
         {
             if (m_pathTraceResources.tonemapState !=
@@ -1589,36 +1479,9 @@ namespace ic
                 m_pathTraceResources.tonemapState =
                     D3D12_RESOURCE_STATE_COPY_SOURCE;
             }
-
         }
 
-        const D3D12_RESOURCE_DESC sourceNativeDesc = source->GetDesc();
-        const D3D12_RESOURCE_DESC destinationNativeDesc = destination->GetDesc();
-        if (sourceDesc.type == GraphResourceType::Buffer)
-        {
-            cmd->CopyBufferRegion(
-                destination,
-                0,
-                source,
-                0,
-                std::min(sourceNativeDesc.Width, destinationNativeDesc.Width));
-            return;
-        }
-
-        if (sourceNativeDesc.Dimension != destinationNativeDesc.Dimension ||
-            sourceNativeDesc.Width != destinationNativeDesc.Width ||
-            sourceNativeDesc.Height != destinationNativeDesc.Height ||
-            sourceNativeDesc.DepthOrArraySize != destinationNativeDesc.DepthOrArraySize ||
-            sourceNativeDesc.MipLevels != destinationNativeDesc.MipLevels ||
-            sourceNativeDesc.Format != destinationNativeDesc.Format ||
-            sourceNativeDesc.SampleDesc.Count != destinationNativeDesc.SampleDesc.Count)
-        {
-            spdlog::error(
-                "Transfer pass '{}' requires matching texture descriptions",
-                pass->name);
-            return;
-        }
-        cmd->CopyResource(destination, source);
+        recordTransferCopy(cmd, copy);
     }
 
     GraphicsPipelineHandle DX12Backend::pipelineForNode(
@@ -2261,15 +2124,17 @@ namespace ic
                 std::floor(std::log2(std::max(width, height))));
         const uint32_t maxInstances = ClusteredForwardMaxGpuCullInstances;
 
-        if (m_clusteredForwardResources.clusterBounds &&
+        // The cluster bounds/light-grid/index/counter buffers AND the GPU-driven
+        // cull/indirect buffers are all frame-graph owned (materialized by the
+        // registry from the path declarations); this method now only derives
+        // cluster dimensions. clusterCount is the "initialized" marker (0 until
+        // first run) since there is no backend-owned cluster/cull buffer.
+        if (m_clusteredForwardResources.clusterCount != 0 &&
             m_clusteredForwardResources.width == width &&
             m_clusteredForwardResources.height == height)
         {
             return;
         }
-
-        destroyClusteredForwardResources();
-        m_gpuScene.destroyCullBuffers();
 
         m_clusteredForwardResources.width = width;
         m_clusteredForwardResources.height = height;
@@ -2278,50 +2143,6 @@ namespace ic
         m_clusteredForwardResources.clusterCountZ = clusterCountZ;
         m_clusteredForwardResources.clusterCount = clusterCount;
         m_clusteredForwardResources.hiZMipCount = hiZMipCount;
-
-        const uint64_t maxClusterLightRefs =
-            static_cast<uint64_t>(clusterCount) *
-            ClusteredForwardMaxLightsPerCluster;
-
-        m_clusteredForwardResources.clusterBounds =
-            m_resourceAllocator.createBuffer({
-                .size = clusterCount * sizeof(GpuClusterBounds),
-                .usage = BufferUsageFlags::Storage,
-                .memoryUsage = ResourceMemoryUsage::GpuOnly,
-                .debugName = "DX12 clustered cluster bounds"
-            });
-        m_clusteredForwardResources.clusterLightGrid =
-            m_resourceAllocator.createBuffer({
-                .size = clusterCount * sizeof(GpuClusterLightGrid),
-                .usage = BufferUsageFlags::Storage,
-                .memoryUsage = ResourceMemoryUsage::GpuOnly,
-                .debugName = "DX12 clustered light grid"
-            });
-        m_clusteredForwardResources.clusterLightIndices =
-            m_resourceAllocator.createBuffer({
-                .size = maxClusterLightRefs * sizeof(uint32_t),
-                .usage = BufferUsageFlags::Storage,
-                .memoryUsage = ResourceMemoryUsage::GpuOnly,
-                .debugName = "DX12 clustered light indices"
-            });
-        m_clusteredForwardResources.clusterLightCounter =
-            m_resourceAllocator.createBuffer({
-                .size = sizeof(uint32_t),
-                .usage = BufferUsageFlags::Storage,
-                .memoryUsage = ResourceMemoryUsage::GpuOnly,
-                .debugName = "DX12 clustered light counter"
-            });
-        m_gpuScene.ensureCullBuffers(
-            m_device.device(), maxInstances, MaxGpuDrivenBins);
-
-        m_clusteredForwardResources.boundsState =
-            m_clusteredForwardResources.clusterBounds.initialState;
-        m_clusteredForwardResources.gridState =
-            m_clusteredForwardResources.clusterLightGrid.initialState;
-        m_clusteredForwardResources.indicesState =
-            m_clusteredForwardResources.clusterLightIndices.initialState;
-        m_clusteredForwardResources.counterState =
-            m_clusteredForwardResources.clusterLightCounter.initialState;
 
         spdlog::info(
             "[DX12Backend] Clustered forward resources: {}x{}x{} clusters, Hi-Z {}x{} mips={}, maxCullInstances={}",
@@ -2334,52 +2155,57 @@ namespace ic
             maxInstances);
     }
 
-    void DX12Backend::readbackVisibleInstanceCount(
-        const FrameContext& ctx,
-        ID3D12GraphicsCommandList4* cmd)
+    DX12GraphResourceEntry* DX12Backend::gpuDrivenBufferEntry(
+        const CompiledGraphPlan& plan,
+        GraphResourceSemantic semantic)
     {
-        if (!m_gpuScene.visibleInstanceCount ||
-            !m_gpuScene.visibleInstanceCountReadback)
-        {
-            return;
-        }
-        if (!m_hiZDebugViewEnabled || (ctx.frameIndex % 30u) != 0u)
-        {
-            return;
-        }
+        const GraphResourceId id = findResourceBySemantic(plan, semantic);
+        return id != InvalidGraphResourceId
+            ? m_graphResourceRegistry.entry(id)
+            : nullptr;
+    }
 
-        transitionResource(
-            cmd,
-            m_gpuScene.visibleInstanceCount.resource.Get(),
-            m_gpuScene.visibleInstanceCountState,
-            D3D12_RESOURCE_STATE_COPY_SOURCE);
-        m_gpuScene.visibleInstanceCountState =
-            D3D12_RESOURCE_STATE_COPY_SOURCE;
-        cmd->CopyBufferRegion(
-            m_gpuScene.visibleInstanceCountReadback.resource.Get(),
-            0,
-            m_gpuScene.visibleInstanceCount.resource.Get(),
-            0,
-            sizeof(uint32_t));
-
-        if (m_gpuScene.visibleInstanceCountReadback.mapped)
-        {
-            const uint32_t visible =
-                *static_cast<const uint32_t*>(
-                    m_gpuScene.visibleInstanceCountReadback.mapped);
-            if (visible != m_gpuScene.lastVisibleInstanceCount)
+    void DX12Backend::uploadGpuDrivenInputs(
+        const CompiledGraphPlan& plan,
+        const FrameContext& ctx)
+    {
+        (void)ctx;
+        // Upload a prepared CPU span into a graph-owned mapped buffer, clamped
+        // to the buffer's fixed capacity.
+        auto upload =
+            [&](GraphResourceSemantic semantic, const void* data, size_t bytes)
             {
-                spdlog::info(
-                    "[DX12Backend] GPU frustum visible instances: {} -> {}",
-                    m_gpuScene.lastVisibleInstanceCount,
-                    visible);
-                m_gpuScene.lastVisibleInstanceCount = visible;
-            }
-        }
+                DX12GraphResourceEntry* entry =
+                    gpuDrivenBufferEntry(plan, semantic);
+                if (!entry || !entry->buffer.mapped)
+                {
+                    return;
+                }
+                const size_t clamped = std::min<size_t>(
+                    bytes, static_cast<size_t>(entry->buffer.size));
+                if (clamped > 0)
+                {
+                    std::memcpy(entry->buffer.mapped, data, clamped);
+                }
+            };
+
+        const std::span<const GpuInstanceBounds> bounds =
+            m_gpuScene.preparedInstanceBounds();
+        const std::span<const GpuDrawInput> inputs =
+            m_gpuScene.preparedDrawInputs();
+        const std::span<const GpuVisibleLight> lights =
+            m_gpuScene.preparedVisibleLights();
+        upload(GraphResourceSemantic::GpuDrivenInstanceBounds,
+            bounds.data(), bounds.size() * sizeof(GpuInstanceBounds));
+        upload(GraphResourceSemantic::GpuDrivenDrawInputs,
+            inputs.data(), inputs.size() * sizeof(GpuDrawInput));
+        upload(GraphResourceSemantic::VisibleLights,
+            lights.data(), lights.size() * sizeof(GpuVisibleLight));
     }
 
     bool DX12Backend::bindClusteredForwardCompute(
         const DX12ComputePipeline& pipeline,
+        const CompiledGraphPlan& plan,
         const FrameContext& ctx,
         const SceneRenderView& scene,
         ID3D12GraphicsCommandList4* cmd)
@@ -2395,141 +2221,20 @@ namespace ic
         DX12GpuSceneFrameResources& frameResources =
             m_gpuScene.frameResources(frameSlot);
 
-        ID3D12Resource* clusterResources[] = {
-            m_clusteredForwardResources.clusterBounds.resource.Get(),
-            m_clusteredForwardResources.clusterLightGrid.resource.Get(),
-            m_clusteredForwardResources.clusterLightIndices.resource.Get(),
-            m_clusteredForwardResources.clusterLightCounter.resource.Get() };
-        D3D12_RESOURCE_STATES* clusterStates[] = {
-            &m_clusteredForwardResources.boundsState,
-            &m_clusteredForwardResources.gridState,
-            &m_clusteredForwardResources.indicesState,
-            &m_clusteredForwardResources.counterState };
-        for (uint32_t i = 0; i < std::size(clusterResources); ++i)
-        {
-            transitionResource(
-                cmd, clusterResources[i], *clusterStates[i],
-                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-            *clusterStates[i] = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        }
-
-        ID3D12DescriptorHeap* heaps[] =
-        {
-            m_descriptorSystem.shaderResourceHeap(),
-            m_descriptorSystem.samplerHeap()
-        };
-        cmd->SetDescriptorHeaps(
-            static_cast<UINT>(std::size(heaps)),
-            heaps);
-        cmd->SetComputeRootSignature(pipeline.rootSignature.Get());
-        cmd->SetComputeRootConstantBufferView(
-            0,
-            frameResources.frameConstants.gpuAddress);
-
-        cmd->SetComputeRootUnorderedAccessView(
-            10,
-            m_clusteredForwardResources.clusterBounds.gpuAddress);
-
-        cmd->SetComputeRootUnorderedAccessView(
-            11,
-            m_clusteredForwardResources.clusterLightGrid.gpuAddress);
-
-        cmd->SetComputeRootUnorderedAccessView(
-            12,
-            m_clusteredForwardResources.clusterLightIndices.gpuAddress);
-
-        cmd->SetComputeRootShaderResourceView(
-            13,
-            frameResources.visibleLights.gpuAddress);
-
-        cmd->SetComputeRootUnorderedAccessView(
-            14,
-            m_clusteredForwardResources.clusterLightCounter.gpuAddress);
+        DX12PassContext passCtx{};
+        passCtx.cmd = cmd;
+        passCtx.plan = &plan;
+        passCtx.resources = &m_graphResourceRegistry;
+        passCtx.descriptors = &m_descriptorSystem;
+        recordClusteredForwardCompute(
+            passCtx, pipeline, frameResources.frameConstants.gpuAddress);
         return true;
-    }
-
-    void DX12Backend::bindClusteredForwardGraphics(
-        const DX12GraphicsPipeline& pipeline,
-        const FrameContext& ctx,
-        ID3D12GraphicsCommandList4* cmd)
-    {
-        ID3D12Resource* clusterResources[] = {
-            m_clusteredForwardResources.clusterBounds.resource.Get(),
-            m_clusteredForwardResources.clusterLightGrid.resource.Get(),
-            m_clusteredForwardResources.clusterLightIndices.resource.Get() };
-        D3D12_RESOURCE_STATES* clusterStates[] = {
-            &m_clusteredForwardResources.boundsState,
-            &m_clusteredForwardResources.gridState,
-            &m_clusteredForwardResources.indicesState };
-        constexpr D3D12_RESOURCE_STATES shaderReadState =
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
-            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        for (uint32_t i = 0; i < std::size(clusterResources); ++i)
-        {
-            transitionResource(
-                cmd, clusterResources[i], *clusterStates[i],
-                shaderReadState);
-            *clusterStates[i] = shaderReadState;
-        }
-
-        const uint32_t frameSlot =
-            static_cast<uint32_t>(ctx.frameIndex % m_gpuScene.frameSlotCount());
-        DX12GpuSceneFrameResources& frameResources =
-            m_gpuScene.frameResources(frameSlot);
-
-        cmd->SetGraphicsRootSignature(pipeline.rootSignature.Get());
-        cmd->SetGraphicsRootConstantBufferView(
-            0,
-            frameResources.frameConstants.gpuAddress);
-        cmd->SetGraphicsRootDescriptorTable(1, frameResources.objectSrv.gpuStart);
-        cmd->SetGraphicsRootDescriptorTable(2, frameResources.materialSrv.gpuStart);
-        cmd->SetGraphicsRootDescriptorTable(
-            4,
-            m_descriptorSystem.shaderResourceGpuStart());
-
-        cmd->SetGraphicsRootDescriptorTable(
-            5,
-            m_descriptorSystem.samplerGpuStart());
-
-        if (m_environmentResources.iblBaked)
-        {
-            cmd->SetGraphicsRootDescriptorTable(
-                6,
-                m_environmentResources.irradianceSrv.gpuStart);
-            cmd->SetGraphicsRootDescriptorTable(
-                7,
-                m_environmentResources.prefilteredSrv.gpuStart);
-            cmd->SetGraphicsRootDescriptorTable(
-                8,
-                m_environmentResources.brdfLutSrv.gpuStart);
-            cmd->SetGraphicsRootDescriptorTable(
-                9,
-                m_environmentResources.sampler.gpuStart);
-        }
-        cmd->SetGraphicsRootShaderResourceView(
-            13,
-            frameResources.visibleLights.gpuAddress);
-        cmd->SetGraphicsRootShaderResourceView(
-            15,
-            m_clusteredForwardResources.clusterBounds.gpuAddress);
-        cmd->SetGraphicsRootShaderResourceView(
-            16,
-            m_clusteredForwardResources.clusterLightGrid.gpuAddress);
-        cmd->SetGraphicsRootShaderResourceView(
-            17,
-            m_clusteredForwardResources.clusterLightIndices.gpuAddress);
     }
 
     void DX12Backend::destroyClusteredForwardResources()
     {
-        m_resourceAllocator.destroyBuffer(
-            m_clusteredForwardResources.clusterBounds);
-        m_resourceAllocator.destroyBuffer(
-            m_clusteredForwardResources.clusterLightGrid);
-        m_resourceAllocator.destroyBuffer(
-            m_clusteredForwardResources.clusterLightIndices);
-        m_resourceAllocator.destroyBuffer(
-            m_clusteredForwardResources.clusterLightCounter);
+        // Cluster bounds/light-grid/index/counter buffers are frame-graph owned
+        // (freed by the registry); nothing backend-managed to release here.
         m_clusteredForwardResources = {};
     }
 
@@ -2616,8 +2321,12 @@ namespace ic
 
         if (m_environmentResources.skyboxConstants.empty())
         {
-            const uint32_t frameCount =
-                std::max<uint32_t>(1u, m_workerSlots);
+            // One instance per frame-in-flight (indexed by frameIndex): with
+            // multi-frame GPU overlap now enabled, adjacent frames must write
+            // distinct skybox-constant buffers, and slot reuse is bounded by the
+            // same frame-slot fence as the other per-frame resources.
+            const uint32_t frameCount = std::max<uint32_t>(
+                1u, m_frameExecutor.framesInFlight());
             m_environmentResources.skyboxConstants.resize(frameCount);
             for (DX12Buffer& buffer :
                 m_environmentResources.skyboxConstants)
@@ -2700,39 +2409,20 @@ namespace ic
         DX12Buffer& constantsBuffer =
             m_environmentResources.skyboxConstants[frameSlot];
 
-        SkyboxConstants constants{};
-        fillSkyboxConstants(
-            scene.camera,
-            m_swapchain.width(),
-            m_swapchain.height(),
-            scene.environment.settings,
-            constants);
-        std::memcpy(
-            constantsBuffer.mapped,
-            &constants,
-            sizeof(constants));
+        DX12SkyboxInputs inputs{};
+        inputs.pipeline = &pipeline;
+        inputs.constantsMapped = constantsBuffer.mapped;
+        inputs.constantsAddr = constantsBuffer.gpuAddress;
+        inputs.cubemapSrv = m_environmentResources.cubemapSrv.gpuStart;
+        inputs.sampler = m_environmentResources.sampler.gpuStart;
 
-        ID3D12DescriptorHeap* heaps[] =
-        {
-            m_descriptorSystem.shaderResourceHeap(),
-            m_descriptorSystem.samplerHeap()
-        };
-        cmd->SetDescriptorHeaps(
-            static_cast<UINT>(std::size(heaps)),
-            heaps);
-        cmd->SetGraphicsRootSignature(pipeline.rootSignature.Get());
-        cmd->SetPipelineState(pipeline.pipelineState.Get());
-        cmd->SetGraphicsRootConstantBufferView(
-            0,
-            constantsBuffer.gpuAddress);
-        cmd->SetGraphicsRootDescriptorTable(
-            1,
-            m_environmentResources.cubemapSrv.gpuStart);
-        cmd->SetGraphicsRootDescriptorTable(
-            2,
-            m_environmentResources.sampler.gpuStart);
-        cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        cmd->DrawInstanced(3, 1, 0, 0);
+        DX12PassContext passCtx{};
+        passCtx.cmd = cmd;
+        passCtx.scene = &scene;
+        passCtx.descriptors = &m_descriptorSystem;
+        passCtx.surfaceWidth = m_swapchain.width();
+        passCtx.surfaceHeight = m_swapchain.height();
+        recordSkybox(passCtx, inputs);
     }
 
     void DX12Backend::destroyEnvironmentResources()
@@ -4136,6 +3826,9 @@ namespace ic
 
     void DX12Backend::recreateSwapchain()
     {
+        // Bump first so every path that recreates (reconcile, present failure)
+        // advances the generation the renderer watches.
+        ++m_swapchainGeneration;
         m_frameExecutor.waitForGpu();
         destroyDepthTarget();
         m_graphResourceRegistry.reset();

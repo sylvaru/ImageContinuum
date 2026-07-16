@@ -126,11 +126,14 @@ namespace ic
                 .debugName = "ClusteredForward.ClusterLightCounter"
                 });
 
+            // Visible lights are CPU-uploaded each frame; the registry hands out
+            // a per-frame-slot mapped instance the backend writes into directly
+            // (no separate backend upload buffer).
             visibleLightBuffer = builder.createBuffer({
                 .size = ClusteredForwardMaxVisibleLights * sizeof(GpuVisibleLight),
                 .usage = BufferUsageFlags::Storage,
-                .memoryUsage = ResourceMemoryUsage::GpuOnly,
-                .mappedAtCreation = false,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
                 .debugName = "ClusteredForward.VisibleLights"
                 });
             builder.setResourceSemantic(
@@ -170,6 +173,20 @@ namespace ic
                 });
 
 
+            // The cluster-light chain (BuildClusters -> ResetClusterLightCounter
+            // -> CullLightsToClusters) has no dependency on sceneDepth or the
+            // depth prepass: it reads/writes only the cluster buffers and reads
+            // visibleLightBuffer, joining graphics work solely at
+            // ClusteredForwardOpaque. That makes it safe to run on the async
+            // compute queue concurrently with the depth prepass + Hi-Z build.
+            // Hi-Z and the GPU-driven cull stay on graphics (they touch
+            // sceneDepth / feed the depth prepass), so sceneDepth never crosses
+            // the queue boundary. When async is disabled the whole chain falls
+            // back to the graphics queue for byte-identical serial behavior.
+            const QueueType clusterQueue = ctx.asyncComputeEnabled
+                ? QueueType::Compute
+                : QueueType::Graphics;
+
             gpuDriven = declareGpuDrivenResources(builder);
             addGpuDrivenCullPasses(builder, gpuDriven);
 
@@ -200,7 +217,7 @@ namespace ic
             // would leave stale clusters after an FOV/projection change.
 
             auto clusterBuildNode =
-                builder.addComputePass("BuildClusters")
+                builder.addComputePass("BuildClusters", clusterQueue)
                 .pipeline("cluster_build")
                 .dispatch(clusterDispatchGroups, 1, 1)
                 .write(clusterBoundsBuffer, ResourceUsage::StorageBuffer)
@@ -213,7 +230,7 @@ namespace ic
             // Reset global append counter before light culling.
 
             auto resetClusterCounterNode =
-                builder.addComputePass("ResetClusterLightCounter")
+                builder.addComputePass("ResetClusterLightCounter", clusterQueue)
                 .pipeline("reset_cluster_light_counter")
                 .dispatch(1, 1, 1)
                 .write(clusterLightCounterBuffer, ResourceUsage::StorageBuffer)
@@ -226,7 +243,7 @@ namespace ic
             // indices into clusterLightIndexBuffer using clusterLightCounterBuffer
 
             auto lightCullNode =
-                builder.addComputePass("CullLightsToClusters")
+                builder.addComputePass("CullLightsToClusters", clusterQueue)
                 .pipeline("cluster_light_cull")
                 .dispatch(clusterDispatchGroups, 1, 1)
                 .read(clusterBoundsBuffer, ResourceUsage::StorageBuffer)
@@ -248,6 +265,15 @@ namespace ic
                 .color(backBuffer)
                 .depth(sceneDepth);
             readGpuDrivenStream(builder, opaqueNode, gpuDriven);
+
+            // The opaque shader samples the cluster bounds (root SRV) to locate
+            // a fragment's cluster. Declare it so the dependency on the cluster
+            // build is explicit and the graph owns the (cross-queue) handoff,
+            // rather than relying on transitive ordering through the light grid.
+            builder.read(
+                opaqueNode,
+                clusterBoundsBuffer,
+                ResourceUsage::StorageBuffer);
 
             builder.read(
                 opaqueNode,

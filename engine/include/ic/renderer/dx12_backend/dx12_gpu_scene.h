@@ -35,24 +35,21 @@ namespace ic
         bool uploaded = false;
     };
 
-    // Persistent, growth-only per-frame-slot scene upload buffers.
+    // Persistent, growth-only per-frame-slot scene upload buffers. The GPU-driven
+    // cull inputs (instance bounds, draw inputs) are NOT here: they are owned by
+    // the frame-graph registry (per-frame-slot) and uploaded into directly by the
+    // backend, so there is no duplicate backend allocation.
     struct DX12GpuSceneFrameResources
     {
         DX12Buffer frameConstants;
         DX12Buffer objects;
         DX12Buffer materials;
-        DX12Buffer visibleLights;
-        DX12Buffer instanceBounds;
-        DX12Buffer drawInputs;
 
         DX12DescriptorAllocation objectSrv;
         DX12DescriptorAllocation materialSrv;
 
         uint32_t objectCapacity = 0;
         uint32_t materialCapacity = 0;
-        uint32_t visibleLightCapacity = 0;
-        uint32_t instanceBoundsCapacity = 0;
-        uint32_t drawInputCapacity = 0;
     };
 
     // Owns the persistent GPU-driven scene: CPU-side draw extraction/sorting/
@@ -124,6 +121,23 @@ namespace ic
         {
             return static_cast<uint32_t>(m_prepared.instanceBounds().size());
         }
+        // Prepared GPU-driven cull inputs, uploaded by the backend into the
+        // graph-owned per-frame-slot buffers.
+        [[nodiscard]] std::span<const GpuInstanceBounds>
+            preparedInstanceBounds() const noexcept
+        {
+            return m_prepared.instanceBounds();
+        }
+        [[nodiscard]] std::span<const GpuDrawInput>
+            preparedDrawInputs() const noexcept
+        {
+            return m_prepared.drawInputs();
+        }
+        [[nodiscard]] std::span<const GpuVisibleLight>
+            preparedVisibleLights() const noexcept
+        {
+            return m_prepared.visibleLights();
+        }
 
         [[nodiscard]] DX12GpuSceneFrameResources& frameResources(
             uint32_t frameSlot) noexcept
@@ -140,32 +154,12 @@ namespace ic
             return static_cast<uint32_t>(m_frames.size());
         }
 
-        // Ensures the GPU-driven cull/indirect buffers exist for the given
-        // capacity. Mirrors the caller's own recreate-on-resize guard timing;
-        // it does not decide when to recreate, only how.
-        void ensureCullBuffers(
-            ID3D12Device5* device,
-            uint32_t maxInstances,
-            uint32_t maxBins);
-        void destroyCullBuffers();
+        // The GPU-driven indirect command signature (draw args + root
+        // constants). The cull/indirect argument buffers themselves are owned by
+        // the frame-graph registry, not this class.
         ID3D12CommandSignature* indirectCommandSignature(
             ID3D12RootSignature* rootSignature);
 
-        // Public: consumed directly by the pass recorders and the graphics
-        // draw path, mirroring the style of DX12GraphResourceEntry.
-        DX12Buffer visibleInstances;
-        DX12Buffer visibleInstanceCount;
-        DX12Buffer visibleInstanceCountReadback;
-        DX12Buffer indirectArguments;
-        DX12Buffer binCounts;
-        D3D12_RESOURCE_STATES visibleInstancesState = D3D12_RESOURCE_STATE_COMMON;
-        D3D12_RESOURCE_STATES visibleInstanceCountState =
-            D3D12_RESOURCE_STATE_COMMON;
-        D3D12_RESOURCE_STATES indirectArgumentsState =
-            D3D12_RESOURCE_STATE_COMMON;
-        D3D12_RESOURCE_STATES binCountsState = D3D12_RESOURCE_STATE_COMMON;
-        uint32_t maxInstances = 0;
-        uint32_t lastVisibleInstanceCount = 0;
         bool loggedGpuCull = false;
 
     private:

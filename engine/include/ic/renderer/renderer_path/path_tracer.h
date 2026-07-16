@@ -44,7 +44,15 @@ namespace ic
             // Environment conversion is submitted only when the source or bake
             // settings change by Renderer::IBLBaker, outside the recurrent graph.
 
-            accumulationTexture = builder.createTexture({
+            // The accumulation buffer is a single physical texture read-modify-
+            // written across frames (progressive accumulation), and the backend
+            // binds one physical instance. Declare it persistent (Single) so the
+            // compiler emits the cross-frame WAR/WAW edge that keeps consecutive
+            // frames' path-trace dispatches from racing on it instead of
+            // relying on the old whole-frame barrier. The tonemap target is
+            // likewise a single backend texture written every frame then read by
+            // the copy-to-backbuffer, so it needs the same explicit ordering.
+            accumulationTexture = builder.createPersistentTexture({
                 .width = 1,
                 .height = 1,
                 .format = TextureFormat::RGBA32_Float,
@@ -54,7 +62,7 @@ namespace ic
                 .debugName = "PathTracer.AccumulationHDR"
                 });
 
-            tonemapTexture = builder.createTexture({
+            tonemapTexture = builder.createPersistentTexture({
                 .width = 1,
                 .height = 1,
                 .format = TextureFormat::RGBA8_UNorm,

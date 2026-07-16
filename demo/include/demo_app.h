@@ -7,7 +7,7 @@
 
 using namespace ic;
 
-class DemoApp : public AppBase
+class DemoApp final : public AppBase
 {
 public:
     DemoApp(int argc, char** argv)
@@ -22,14 +22,21 @@ public:
 	GameLayer* getGameLayer() { return m_gameLayer; }
 
 private:
+
+    explicit DemoApp(AppConfig config)
+        : AppBase(config.app)
+        , m_config(std::move(config))
+    {
+    }
+
     static AppConfigLoadDesc createConfigLoadDesc()
     {
         AppConfigLoadDesc desc{};
         desc.defaultConfigPath =
             //"demo/res/configs/forward.toml";
             //"demo/res/configs/forward_dx12.toml";
-            "demo/res/configs/clustered_forward.toml";
-            //"demo/res/configs/clustered_forward_dx12.toml";
+            //"demo/res/configs/clustered_forward.toml";
+            "demo/res/configs/clustered_forward_dx12.toml";
             //"demo/res/configs/path_traced.toml";
             //"demo/res/configs/path_traced_dx12.toml";
         desc.fallbackApp = createFallbackSpecification();
@@ -55,11 +62,6 @@ private:
         spec.window.height = 1080;
         return spec;
     }
-
-    explicit DemoApp(AppConfig config)
-        : AppBase(config.app)
-        , m_config(std::move(config))
-    {}
 
     AppConfig m_config;
 	GameLayer* m_gameLayer = nullptr;

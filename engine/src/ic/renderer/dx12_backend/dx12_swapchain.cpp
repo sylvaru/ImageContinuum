@@ -122,7 +122,9 @@ namespace ic
                     m_width,
                     m_height,
                     m_format,
-                    0),
+                    m_allowTearing
+                        ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+                        : 0u),
                 "Failed to resize DX12 swapchain buffers.");
         }
 
@@ -143,8 +145,13 @@ namespace ic
             return false;
         }
 
+        // VSync on: sync to vblank (syncInterval 1). VSync off: present
+        // immediately with the ALLOW_TEARING flag so the display is not locked to
+        // the refresh rate. The tearing flag is only legal with syncInterval 0
+        // and in windowed mode (we never take exclusive fullscreen).
         const UINT syncInterval = m_vsync ? 1u : 0u;
-        const UINT flags = 0u;
+        const UINT flags =
+            (!m_vsync && m_allowTearing) ? DXGI_PRESENT_ALLOW_TEARING : 0u;
 
         HRESULT hr = m_swapchain->Present(syncInterval, flags);
         if (hr == DXGI_ERROR_DEVICE_REMOVED ||
@@ -216,7 +223,13 @@ namespace ic
         desc.Scaling = DXGI_SCALING_STRETCH;
         desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-        desc.Flags = 0;
+        // Enable tearing on the swapchain when the adapter/OS supports it, so a
+        // non-vsynced present can run uncapped (see present()). The same flag
+        // must be carried through ResizeBuffers.
+        m_allowTearing = m_factory->allowTearing();
+        desc.Flags = m_allowTearing
+            ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+            : 0u;
 
         Microsoft::WRL::ComPtr<IDXGISwapChain1> swapchain1;
         throwIfFailed(
@@ -240,6 +253,27 @@ namespace ic
             "Failed to query IDXGISwapChain4.");
 
         m_currentBackBufferIndex = m_swapchain->GetCurrentBackBufferIndex();
+
+        // Report the refresh rate of the monitor the window is on. With VSync
+        // enabled the frame rate is capped to exactly this value (windowed
+        // present syncs to the compositor at the display's current mode), so it
+        // is the first thing to check when "VSync fps" looks lower than the
+        // monitor's advertised maximum. The mode may not be set to that maximum.
+        HMONITOR monitor = MonitorFromWindow(
+            hwndFromWindow(*m_window), MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXW monitorInfo{};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        DEVMODEW mode{};
+        mode.dmSize = sizeof(mode);
+        if (GetMonitorInfoW(monitor, &monitorInfo) &&
+            EnumDisplaySettingsW(
+                monitorInfo.szDevice, ENUM_CURRENT_SETTINGS, &mode))
+        {
+            spdlog::info(
+                "[DX12Swapchain] Output mode {}x{} @ {} Hz "
+                "(VSync caps FPS to this refresh rate)",
+                mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency);
+        }
     }
 
     void DX12Swapchain::createRenderTargets()

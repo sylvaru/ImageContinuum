@@ -61,6 +61,7 @@ namespace ic
             const CompiledGraphPlan& plan,
             const std::vector<ID3D12CommandList*>& commandLists,
             uint32_t frameSlot,
+            const GraphExecutionContext& execution,
             const DX12UploadDependency& uploadDependency = {});
 
     private:
@@ -69,6 +70,18 @@ namespace ic
             uint64_t fenceValue = 0;
         };
 
+        // The queue + fence value each of the PREVIOUS frame's submissions
+        // signaled, indexed by submission index. Cross-frame ordering edges make
+        // this frame's consuming submission wait on the producing submission's
+        // prior-frame value. This is the minimal replacement for the old blanket
+        // previous-frame barrier. Reset on a full GPU drain or a plan change.
+        struct CrossFrameSignal
+        {
+            QueueType queue = QueueType::Graphics;
+            uint64_t value = 0;
+        };
+        std::vector<CrossFrameSignal> m_prevSubmissionSignals;
+
         const DX12Device* m_device = nullptr;
         DX12Swapchain* m_swapchain = nullptr;
         Microsoft::WRL::ComPtr<ID3D12Fence> m_fence;
@@ -76,7 +89,6 @@ namespace ic
         HANDLE m_fenceEvent = nullptr;
         uint64_t m_nextFenceValue = 1;
         std::array<uint64_t, 3> m_nextQueueFenceValues{ 1, 1, 1 };
-        uint64_t m_lastGraphCompletionValue = 0;
         std::vector<FrameSync> m_frameSync;
     };
 }

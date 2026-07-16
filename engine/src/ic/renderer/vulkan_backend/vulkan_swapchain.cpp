@@ -355,6 +355,13 @@ namespace ic
         return VK_PRESENT_MODE_FIFO_KHR;
     }
 
+    void VulkanSwapchain::windowFramebufferSize(
+        uint32_t& width, uint32_t& height) const
+    {
+        width = m_window ? m_window->getWidth() : 0u;
+        height = m_window ? m_window->getHeight() : 0u;
+    }
+
     VkExtent2D VulkanSwapchain::chooseExtent(
         const VkSurfaceCapabilitiesKHR& capabilities,
         [[maybe_unused]] Window& window) const

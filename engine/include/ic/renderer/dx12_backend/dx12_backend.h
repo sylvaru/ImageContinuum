@@ -11,6 +11,7 @@
 #include "ic/renderer/dx12_backend/dx12_pipeline_manager.h"
 #include "ic/renderer/dx12_backend/dx12_resource_allocator.h"
 #include "ic/renderer/dx12_backend/dx12_graph_resource_registry.h"
+#include "ic/renderer/dx12_backend/dx12_pass_recorders.h"
 #include "ic/renderer/dx12_backend/dx12_frame_executor.h"
 #include "ic/renderer/dx12_backend/dx12_gpu_scene.h"
 #include "ic/renderer/dx12_backend/dx12_retirement_queue.h"
@@ -41,6 +42,8 @@ namespace ic
 
         void shutdown() override;
 
+        [[nodiscard]] RenderSurfaceState reconcileRenderSurface() override;
+
         [[nodiscard]] bool execute(
             const CompiledGraphPlan& plan,
             const GraphExecutionContext& execution,
@@ -61,6 +64,29 @@ namespace ic
         void setHiZDebugViewEnabled(bool enabled) override;
         uint32_t hiZDebugMip() const override;
         void setHiZDebugMip(uint32_t mip) override;
+        // D3D12 exposes a dedicated compute engine and the frame executor
+        // submits per-queue batches to m_device.computeQueue() with per-queue
+        // fence waits, so the clustered-forward light chain runs truly async
+        // (validated: overlaps the depth prepass on separate queues, stable over
+        // repeated frame-0 and sustained runs, zero device removals).
+        //
+        // Cross-queue correctness for the frame-graph-owned cluster buffers
+        // (bound through root descriptors) relies on D3D12 implicit buffer
+        // promotion/decay rather than explicit transition barriers: buffers
+        // promote COMMON -> UAV/SRV on access and decay back to COMMON after
+        // every ExecuteCommandLists, so they are always COMMON at a queue
+        // boundary and no before-state is ever asserted across queues (see
+        // recordBarrier's buffer policy). UAV barriers order same-queue writes;
+        // the queue fence orders the compute -> graphics handoff. The per-frame
+        // GpuScene constants/lights shared read-only across queues are upload-heap
+        // (permanently GENERIC_READ) and need no transition.
+        //
+        // The one operation that DID cause device removal was a spurious wait,
+        // not a barrier: the executor made the compute queue wait on the
+        // graphics-queue upload fence even though no compute pass consumes
+        // uploaded data. That wait is now correctly scoped to the graphics
+        // (consumer) queue only. See DX12FrameExecutor::submitAndPresent.
+        bool supportsAsyncCompute() const override { return true; }
 
         DX12ResourceAllocator& resourceAllocator()
         {
@@ -155,19 +181,13 @@ namespace ic
             bool iblBaked = false;
         };
 
-        // Clustered-light-grid resources. The GPU-driven cull/indirect-draw
-        // buffers live in DX12GpuScene (m_gpuScene) instead, since they are a
-        // separate concern (draw submission, not light clustering).
+        // Clustered-forward derived state. The cluster bounds/light-grid/index/
+        // counter buffers are frame-graph owned (materialized by the registry
+        // from clustered_forward.h and bound via clusterBufferAddress). There is no
+        // duplicate backend copy or hand-rolled state lives here. The GPU-driven
+        // cull/indirect-draw buffers live in DX12GpuScene (m_gpuScene).
         struct ClusteredForwardResources
         {
-            DX12Buffer clusterBounds;
-            DX12Buffer clusterLightGrid;
-            DX12Buffer clusterLightIndices;
-            DX12Buffer clusterLightCounter;
-            D3D12_RESOURCE_STATES boundsState = D3D12_RESOURCE_STATE_COMMON;
-            D3D12_RESOURCE_STATES gridState = D3D12_RESOURCE_STATE_COMMON;
-            D3D12_RESOURCE_STATES indicesState = D3D12_RESOURCE_STATE_COMMON;
-            D3D12_RESOURCE_STATES counterState = D3D12_RESOURCE_STATE_COMMON;
             uint32_t width = 0;
             uint32_t height = 0;
             uint32_t hiZMipCount = 0;
@@ -217,6 +237,91 @@ namespace ic
             const SceneRenderView& scene,
             ID3D12GraphicsCommandList4* cmd,
             ID3D12Resource* swapchainImage);
+
+        // Constructs the lightweight per-pass context handed to the recorders:
+        // command list, plan/node, frame + scene views, and narrow references to
+        // the shared subsystems plus the swapchain surface. Backend-private
+        // per-technique resources are NOT exposed here. Each wrapper resolves
+        // those into a pass-specific *Inputs struct.
+        DX12PassContext makePassContext(
+            const CompiledGraphPlan& plan,
+            const ExecutionNode& node,
+            const FrameContext& ctx,
+            const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd,
+            ID3D12Resource* swapchainImage);
+
+        // Per-payload recorder entry points. dispatchNode std::visits the node's
+        // PassPayload variant onto this overload set, so the dispatch is
+        // exhaustive by construction: adding a new PassPayload alternative
+        // without a matching overload fails to compile, rather than silently
+        // no-oping the way the previous get_if chain did. Each overload takes the
+        // uniform (plan, node, ctx, scene, cmd, swapchainImage) tuple even when a
+        // given pass ignores part of it, so the visit lambda stays a single
+        // generic call. The recorders own their own resource lookup, pipeline
+        // state, native binding and draw/dispatch; the payload-typed overload is
+        // the one place that names each pass, replacing the old node.type switch
+        // plus the centralized compute-node get_if cascade.
+        void recordPassPayload(
+            const GraphicsPassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd, ID3D12Resource* swapchainImage);
+        void recordPassPayload(
+            const ComputePassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd, ID3D12Resource* swapchainImage);
+        void recordPassPayload(
+            const PathTracePassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd, ID3D12Resource* swapchainImage);
+        void recordPassPayload(
+            const TonemapPassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd, ID3D12Resource* swapchainImage);
+        void recordPassPayload(
+            const EnvironmentConvertPassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd, ID3D12Resource* swapchainImage);
+        void recordPassPayload(
+            const TransferPassData& payload,
+            const CompiledGraphPlan& plan, const ExecutionNode& node,
+            const FrameContext& ctx, const SceneRenderView& scene,
+            ID3D12GraphicsCommandList4* cmd, ID3D12Resource* swapchainImage);
+        // Declared-but-unused PassPayload alternatives. They keep the visit
+        // exhaustive and record nothing (the graph still emits their barriers and
+        // queue ordering); collapse them into real recorders when a pass adopts
+        // one. GeometryPassData/LightingPassData/ShadowPassData/PostProcessPassData
+        // are forward-declared feature payloads; ClearPassData and PresentPassData
+        // are handled entirely by graph barriers / the frame executor.
+        void recordPassPayload(
+            const GeometryPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            ID3D12GraphicsCommandList4*, ID3D12Resource*) {}
+        void recordPassPayload(
+            const LightingPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            ID3D12GraphicsCommandList4*, ID3D12Resource*) {}
+        void recordPassPayload(
+            const ShadowPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            ID3D12GraphicsCommandList4*, ID3D12Resource*) {}
+        void recordPassPayload(
+            const PostProcessPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            ID3D12GraphicsCommandList4*, ID3D12Resource*) {}
+        void recordPassPayload(
+            const ClearPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            ID3D12GraphicsCommandList4*, ID3D12Resource*) {}
+        void recordPassPayload(
+            const PresentPassData&, const CompiledGraphPlan&,
+            const ExecutionNode&, const FrameContext&, const SceneRenderView&,
+            ID3D12GraphicsCommandList4*, ID3D12Resource*) {}
 
         void executeGraphicsNode(
             const CompiledGraphPlan& plan,
@@ -293,16 +398,21 @@ namespace ic
         void ensureClusteredForwardResources();
         bool bindClusteredForwardCompute(
             const DX12ComputePipeline& pipeline,
+            const CompiledGraphPlan& plan,
             const FrameContext& ctx,
             const SceneRenderView& scene,
             ID3D12GraphicsCommandList4* cmd);
-        void bindClusteredForwardGraphics(
-            const DX12GraphicsPipeline& pipeline,
-            const FrameContext& ctx,
-            ID3D12GraphicsCommandList4* cmd);
-        void readbackVisibleInstanceCount(
-            const FrameContext& ctx,
-            ID3D12GraphicsCommandList4* cmd);
+        // Resolves the graph-registry entry for a GPU-driven buffer by its
+        // semantic (current frame slot). Returns nullptr if the graph does not
+        // declare it or it is not materialized.
+        DX12GraphResourceEntry* gpuDrivenBufferEntry(
+            const CompiledGraphPlan& plan,
+            GraphResourceSemantic semantic);
+        // Uploads this frame's prepared cull inputs (instance bounds, draw
+        // inputs) straight into the graph-owned per-frame-slot buffers.
+        void uploadGpuDrivenInputs(
+            const CompiledGraphPlan& plan,
+            const FrameContext& ctx);
         void destroyClusteredForwardResources();
 
         DX12UploadedModel* requestModel(
@@ -368,6 +478,11 @@ namespace ic
         DX12RetirementQueue m_retirementQueue;
 
         DX12FrameExecutor m_frameExecutor;
+        // Authoritative render-surface generation, bumped on every swapchain
+        // (re)creation. The renderer rebuilds the graph whenever this changes.
+        uint64_t m_swapchainGeneration = 1;
+        uint32_t m_lastFramebufferWidth = 0;
+        uint32_t m_lastFramebufferHeight = 0;
         uint32_t m_workerSlots = 1;
         bool m_imguiEnabled = false;
         bool m_imguiFrameActive = false;

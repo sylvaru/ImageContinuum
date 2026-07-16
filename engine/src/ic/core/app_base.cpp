@@ -20,12 +20,60 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <thread>
 
 #include <spdlog/spdlog.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 namespace ic
 {
+    namespace
+    {
+        // Blocks the calling thread for `seconds` accurately and without
+        // busy-waiting. On Windows this uses a high-resolution waitable timer
+        // (Win10 1803+) so the wait is precise to well under a millisecond
+        // WITHOUT globally raising the system timer resolution (which would hurt
+        // power use); it falls back to std::this_thread::sleep_for otherwise.
+        void preciseSleepSeconds(double seconds)
+        {
+            if (seconds <= 0.0)
+            {
+                return;
+            }
+#ifdef _WIN32
+#ifdef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+            static HANDLE timer = CreateWaitableTimerExW(
+                nullptr, nullptr,
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS);
+            if (timer)
+            {
+                LARGE_INTEGER due{};
+                // Negative == relative, in 100 ns units.
+                due.QuadPart = -static_cast<LONGLONG>(seconds * 1.0e7);
+                if (SetWaitableTimerEx(
+                        timer, &due, 0, nullptr, nullptr, nullptr, 0))
+                {
+                    WaitForSingleObject(timer, INFINITE);
+                    return;
+                }
+            }
+#endif
+#endif
+            std::this_thread::sleep_for(
+                std::chrono::duration<double>(seconds));
+        }
+    }
+
     struct AppBase::PlatformState
     {
         GLFWContext glfw;
@@ -222,19 +270,23 @@ namespace ic
 
     void AppBase::sleep(const auto& frameStart)
     {
-        auto frameEnd = std::chrono::steady_clock::now();
-        std::chrono::duration<float> frameTime = frameEnd - frameStart;
-        const float targetFps =
-            m_spec.rendererSpec.settings.targetFps > 0.0f
-                ? m_spec.rendererSpec.settings.targetFps
-                : kFallbackTargetFPS;
-        float sleepTime = (1.0f / targetFps) - frameTime.count();
-        if (sleepTime > 0.0f)
+        // targetFps <= 0 means "no cap": present pacing (vsync) and/or the GPU
+        // are the only limits, so we never sleep. Otherwise cap the frame rate
+        // to targetFps by sleeping off only the remaining time. When the frame
+        // already took at least the target period (GPU/present-bound) the sleep
+        // is skipped, so this never adds a stall to a frame that is already at
+        // or below the target rate.
+        const float targetFps = m_spec.rendererSpec.settings.targetFps;
+        if (targetFps <= 0.0f)
         {
-            std::this_thread::sleep_for(
-                std::chrono::duration<float>(sleepTime)
-            );
+            return;
         }
+
+        const auto frameEnd = std::chrono::steady_clock::now();
+        const std::chrono::duration<double> frameTime = frameEnd - frameStart;
+        const double sleepTime =
+            (1.0 / static_cast<double>(targetFps)) - frameTime.count();
+        preciseSleepSeconds(sleepTime);
     }
 
     void AppBase::createPlatform()

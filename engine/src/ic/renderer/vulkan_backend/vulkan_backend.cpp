@@ -4,6 +4,8 @@
 #include "ic/renderer/pipeline_library.h"
 #include "ic/renderer/gpu_driven_submission.h"
 #include "ic/renderer/vulkan_backend/vulkan_pass_recorders.h"
+#include "ic/renderer/vulkan_backend/vulkan_offscreen_pass_recorder.h"
+#include "ic/renderer/vulkan_backend/vulkan_scene_pass_recorder.h"
 #include "ic/renderer/renderer_specification.h"
 #include "ic/renderer/path_tracing/path_trace_scene_builder.h"
 #include "ic/renderer/renderer_common/renderer_util.h"
@@ -112,6 +114,10 @@ namespace ic
 			m_device,
 			m_platform.surface(),
 			window);
+        // Seed the authoritative framebuffer size so the first reconcile does
+        // not spuriously recreate a just-created swapchain.
+        m_swapchain.windowFramebufferSize(
+            m_lastFramebufferWidth, m_lastFramebufferHeight);
 
         const uint32_t framesInFlight =
             spec.framesInFlight == 0 ? 1 : spec.framesInFlight;
@@ -136,6 +142,10 @@ namespace ic
             m_device,
             m_resourceAllocator,
             framesInFlight);
+        // The graph-owned GPU-driven indirect-argument buffer is sized in native
+        // Vulkan command units (VkDrawIndexedIndirectCommand).
+        m_graphResourceRegistry.setNativeIndirectCommandStride(
+            sizeof(VkDrawIndexedIndirectCommand));
 
         m_retirementQueue.init(
             m_device.device(), m_resourceAllocator, framesInFlight);
@@ -183,6 +193,49 @@ namespace ic
         m_instance.shutdown();
 
         spdlog::info("[VulkanBackend] Shutdown");
+    }
+
+    RenderSurfaceState VulkanBackend::reconcileRenderSurface()
+    {
+        RenderSurfaceState surface{};
+
+        uint32_t framebufferWidth = 0;
+        uint32_t framebufferHeight = 0;
+        m_swapchain.windowFramebufferSize(framebufferWidth, framebufferHeight);
+
+        // Minimized / zero drawable area: leave the swapchain untouched and
+        // report the frame as non-renderable so the renderer skips it entirely.
+        if (framebufferWidth == 0 || framebufferHeight == 0)
+        {
+            return surface;
+        }
+
+        // Recreate when the framebuffer changed or the swapchain is no longer
+        // valid (e.g. a prior out-of-date acquire/present). onSwapchainRecreated
+        // bumps the generation so the renderer rebuilds the graph to the new
+        // extent and re-materializes every resource before this frame records.
+        if (framebufferWidth != m_lastFramebufferWidth ||
+            framebufferHeight != m_lastFramebufferHeight ||
+            !m_swapchain.validForRendering())
+        {
+            onSwapchainRecreated();
+            m_lastFramebufferWidth = framebufferWidth;
+            m_lastFramebufferHeight = framebufferHeight;
+        }
+
+        if (!m_swapchain.validForRendering())
+        {
+            return surface;
+        }
+
+        // Report the swapchain's actual (surface-clamped) extent, which is what
+        // the images physically are and therefore what the graph must match.
+        const VkExtent2D extent = m_swapchain.extent();
+        surface.width = extent.width;
+        surface.height = extent.height;
+        surface.generation = m_swapchainGeneration;
+        surface.renderable = true;
+        return surface;
     }
 
     bool VulkanBackend::execute(
@@ -268,7 +321,7 @@ namespace ic
         const VulkanUploadDependency uploadDependency =
             m_uploadScheduler.flush();
         const bool presented = m_frameExecutor.submitAndPresent(
-            plan, commandBuffers, frameSlot, uploadDependency);
+            plan, commandBuffers, frameSlot, execution, uploadDependency);
 
         if (!presented)
         {
@@ -290,8 +343,11 @@ namespace ic
         // Resolve lazy pipeline/resource state before worker threads begin.
         // Recording jobs may only read this shared renderer state.
         ensureDepthTarget();
-        ensureGpuDrivenResources();
         ensureClusteredForwardResources();
+        // Resolve the graph-owned GPU-driven + cluster buffer handles before any
+        // pass (prepareSceneResources -> updateFrameDescriptors binds them).
+        resolveGpuDrivenBuffers(plan);
+        resolveClusterBuffers(plan);
         for (const ExecutionNode& node : plan.nodes)
         {
             if (node.type == GraphNodeType::Graphics)
@@ -313,6 +369,10 @@ namespace ic
                 (void)computePipelineForNode(plan, node);
             }
         }
+
+        // Prepared scene data now exists; push the cull inputs into the
+        // graph-owned per-frame-slot buffers before any worker records the cull.
+        uploadGpuDrivenInputs();
 
         auto recordNode =
             [&](GraphNodeId nodeId, uint32_t workerIndex)
@@ -506,8 +566,11 @@ namespace ic
 
         if (resource.type == GraphResourceType::Buffer)
         {
+            // A previous-version barrier targets the previous frame's instance.
             const VulkanGraphResourceEntry* entry =
-                m_graphResourceRegistry.entry(barrier.resource);
+                barrier.previousVersion
+                    ? m_graphResourceRegistry.previousEntry(barrier.resource)
+                    : m_graphResourceRegistry.entry(barrier.resource);
             if (!entry || !entry->buffer)
             {
                 spdlog::error(
@@ -576,7 +639,9 @@ namespace ic
         else
         {
             VulkanGraphResourceEntry* entry =
-                m_graphResourceRegistry.entry(barrier.resource);
+                barrier.previousVersion
+                    ? m_graphResourceRegistry.previousEntry(barrier.resource)
+                    : m_graphResourceRegistry.entry(barrier.resource);
             if (!entry || entry->type != GraphResourceType::Texture ||
                 !entry->texture)
             {
@@ -591,7 +656,9 @@ namespace ic
 
         VulkanGraphResourceEntry* trackedEntry =
             resource.ownership != ResourceOwnership::Imported
-                ? m_graphResourceRegistry.entry(barrier.resource)
+                ? (barrier.previousVersion
+                    ? m_graphResourceRegistry.previousEntry(barrier.resource)
+                    : m_graphResourceRegistry.entry(barrier.resource))
                 : nullptr;
         const bool isExternalFirstUse =
             barrier.firstUse && !trackedEntry;
@@ -694,31 +761,107 @@ namespace ic
 
     }
 
+    VulkanPassContext VulkanBackend::makePassContext(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        const FrameContext& ctx,
+        const SceneRenderView& scene,
+        VkCommandBuffer cmd)
+    {
+        VulkanPassContext passCtx{};
+        passCtx.cmd = cmd;
+        passCtx.plan = &plan;
+        passCtx.node = &node;
+        passCtx.frame = &ctx;
+        passCtx.scene = &scene;
+        passCtx.resources = &m_graphResourceRegistry;
+        passCtx.device = m_device.device();
+        passCtx.allocator = &m_resourceAllocator;
+        passCtx.pipelines = &m_pipelineManager;
+        passCtx.gpuScene = &m_gpuScene;
+        passCtx.surfaceExtent = m_swapchain.extent();
+        return passCtx;
+    }
+
     void VulkanBackend::dispatchNode(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
         const FrameContext& ctx,
         const SceneRenderView& scene,
         VkCommandBuffer cmd,
-        [[maybe_unused]] VkImage swapchainImage)
+        VkImage swapchainImage)
     {
-        switch (node.type)
+        if (node.payloadIndex >= plan.payloads.size())
         {
-        case GraphNodeType::Graphics:
-            executeGraphicsNode(plan, node, ctx, scene, cmd, swapchainImage);
-            break;
-
-        case GraphNodeType::Compute:
-            executeComputeNode(plan, node, ctx, scene, cmd);
-            break;
-
-        case GraphNodeType::Transfer:
-            executeTransferNode(plan, node, ctx, cmd, swapchainImage);
-            break;
-
-        case GraphNodeType::Present:
-            break;
+            return;
         }
+
+        // Exhaustive payload dispatch: the visit binds the node's variant to the
+        // matching recordPassPayload overload. Overload resolution replaces the
+        // former node.type switch and the compute-node get_if cascade in one
+        // place, and a new PassPayload alternative without an overload is a
+        // compile error instead of a silently skipped pass.
+        std::visit(
+            [&](const auto& payload)
+            {
+                recordPassPayload(
+                    payload, plan, node, ctx, scene, cmd, swapchainImage);
+            },
+            plan.payloads[node.payloadIndex]);
+    }
+
+    void VulkanBackend::recordPassPayload(
+        const GraphicsPassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView& scene,
+        VkCommandBuffer cmd, VkImage swapchainImage)
+    {
+        executeGraphicsNode(plan, node, ctx, scene, cmd, swapchainImage);
+    }
+
+    void VulkanBackend::recordPassPayload(
+        const ComputePassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView& scene,
+        VkCommandBuffer cmd, VkImage)
+    {
+        executeComputeNode(plan, node, ctx, scene, cmd);
+    }
+
+    void VulkanBackend::recordPassPayload(
+        const PathTracePassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView& scene,
+        VkCommandBuffer cmd, VkImage)
+    {
+        executePathTraceNode(plan, node, ctx, scene, cmd);
+    }
+
+    void VulkanBackend::recordPassPayload(
+        const TonemapPassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView&,
+        VkCommandBuffer cmd, VkImage)
+    {
+        executeTonemapNode(plan, node, ctx, cmd);
+    }
+
+    void VulkanBackend::recordPassPayload(
+        const EnvironmentConvertPassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView& scene,
+        VkCommandBuffer cmd, VkImage)
+    {
+        executeEnvironmentConvertNode(plan, node, ctx, scene, cmd);
+    }
+
+    void VulkanBackend::recordPassPayload(
+        const TransferPassData&,
+        const CompiledGraphPlan& plan, const ExecutionNode& node,
+        const FrameContext& ctx, const SceneRenderView&,
+        VkCommandBuffer cmd, VkImage swapchainImage)
+    {
+        executeTransferNode(plan, node, ctx, cmd, swapchainImage);
     }
 
     void VulkanBackend::executeGraphicsNode(
@@ -877,72 +1020,33 @@ namespace ic
             prepareSceneResources(ctx, scene, pipelineHandle) &&
             !m_gpuScene.draws().empty())
         {
-            const std::span<const VulkanGpuScene::DrawItem> draws =
-                m_gpuScene.draws();
-            const VkExtent2D extent = m_swapchain.extent();
-
-            VkViewport viewport{};
-            viewport.x = 0.0f;
-            viewport.y = 0.0f;
-            viewport.width = static_cast<float>(extent.width);
-            viewport.height = static_cast<float>(extent.height);
-            viewport.minDepth = 0.0f;
-            viewport.maxDepth = 1.0f;
-
-            VkRect2D scissor{};
-            scissor.offset = { 0, 0 };
-            scissor.extent = extent;
-
-            vkCmdSetViewport(cmd, 0, 1, &viewport);
-            vkCmdSetScissor(cmd, 0, 1, &scissor);
-
             const uint32_t frameSlot =
                 static_cast<uint32_t>(
                     ctx.frameIndex % m_gpuScene.frameSlotCount());
             VulkanGpuSceneFrameResources& frameResources =
                 m_gpuScene.frameResources(frameSlot);
 
-            vkCmdBindPipeline(
-                cmd,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipeline->pipeline);
-
-            vkCmdBindDescriptorSets(
-                cmd,
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipeline->pipelineLayout,
-                0,
-                1,
-                &frameResources.descriptorSet,
-                0,
-                nullptr);
-
-            const bool useGpuDriven =
-                m_gpuScene.indirectArguments &&
-                m_gpuScene.binCounts &&
+            VulkanForwardSceneInputs sceneInputs{};
+            sceneInputs.pipeline = pipeline;
+            sceneInputs.descriptorSet = frameResources.descriptorSet;
+            sceneInputs.useGpuDriven =
+                m_gpuDrivenBuffers.valid() &&
                 !m_gpuScene.geometryBins().empty();
-
-            VulkanIndirectDrawStream indirectStream{};
-            indirectStream.indirectArguments =
-                m_gpuScene.indirectArguments.buffer;
-            indirectStream.binCounts = m_gpuScene.binCounts.buffer;
-
-            // Shared by the depth prepass and the forward pass: both
-            // pipelines route scene geometry through this same recorder (see
-            // vulkan_pass_recorders.h for why there is no separate depth-only
-            // path).
-            recordSceneGeometryDraws(
-                cmd,
-                pipeline->pipelineLayout,
-                draws,
-                m_gpuScene.geometryBins(),
-                useGpuDriven,
-                indirectStream,
+            sceneInputs.indirectStream.indirectArguments =
+                m_gpuDrivenBuffers.indirectArguments;
+            sceneInputs.indirectStream.binCounts = m_gpuDrivenBuffers.binCounts;
+            sceneInputs.draws = m_gpuScene.draws();
+            sceneInputs.geometryBins = m_gpuScene.geometryBins();
+            sceneInputs.resolveNativeModel =
                 [this](AssetHandle handle) -> VulkanUploadedModel*
                 {
                     auto it = m_uploadedModels.find(handle);
                     return it != m_uploadedModels.end() ? &it->second : nullptr;
-                });
+                };
+
+            VulkanPassContext passCtx =
+                makePassContext(plan, node, ctx, scene, cmd);
+            recordForwardScene(passCtx, sceneInputs);
         }
         else if (pass && pass->drawList == DrawListKind::Skybox)
         {
@@ -960,30 +1064,9 @@ namespace ic
         [[maybe_unused]] const SceneRenderView& scene,
         [[maybe_unused]] VkCommandBuffer cmd)
     {
-        if (node.payloadIndex >= plan.payloads.size())
-        {
-            return;
-        }
-
-        if (std::get_if<PathTracePassData>(&plan.payloads[node.payloadIndex]))
-        {
-            executePathTraceNode(plan, node, ctx, scene, cmd);
-            return;
-        }
-
-        if (std::get_if<EnvironmentConvertPassData>(
-                &plan.payloads[node.payloadIndex]))
-        {
-            executeEnvironmentConvertNode(plan, node, ctx, scene, cmd);
-            return;
-        }
-
-        if (std::get_if<TonemapPassData>(&plan.payloads[node.payloadIndex]))
-        {
-            executeTonemapNode(plan, node, ctx, cmd);
-            return;
-        }
-
+        // dispatchNode's std::visit routes PathTrace/Tonemap/EnvironmentConvert
+        // payloads to their own recorders, so this node is now only reached for a
+        // generic ComputePassData; the per-layout decision below is owned here.
         const ComputePassData* pass =
             std::get_if<ComputePassData>(&plan.payloads[node.payloadIndex]);
         if (!pass || !pass->pipeline)
@@ -1008,15 +1091,19 @@ namespace ic
             PipelineBindingLayoutKind::ComputeStorageBuffer)
         {
             ensureComputeTestResources(*pipeline);
-            vkCmdBindDescriptorSets(
-                cmd,
-                VK_PIPELINE_BIND_POINT_COMPUTE,
-                pipeline->pipelineLayout,
-                0,
-                1,
-                &m_computeTestDescriptorSet,
-                0,
-                nullptr);
+
+            VulkanPassContext passCtx{};
+            passCtx.cmd = cmd;
+            VulkanComputeStorageBufferTest test{};
+            test.pipelineLayout = pipeline->pipelineLayout;
+            test.descriptorSet = m_computeTestDescriptorSet;
+            test.buffer = m_computeTestBuffer.buffer;
+            test.bufferSize = m_computeTestBuffer.size;
+            test.groupCountX = pass->groupCountX;
+            test.groupCountY = pass->groupCountY;
+            test.groupCountZ = pass->groupCountZ;
+            recordComputeStorageBufferTest(passCtx, test);
+            return;
         }
         else if (pipeline->desc.bindingLayout ==
             PipelineBindingLayoutKind::HiZDepthPyramid)
@@ -1084,23 +1171,29 @@ namespace ic
             passCtx.resources = &m_graphResourceRegistry;
             passCtx.device = m_device.device();
 
+            // All cull buffers are graph-registry owned (resolved this frame in
+            // resolveGpuDrivenBuffers); frameConstants is the backend per-frame CB.
+            if (!m_gpuDrivenBuffers.valid())
+            {
+                return;
+            }
             VulkanCullBuffers cull{};
             cull.gpuCullPool = &frameResources.gpuCullDescriptorPool;
             cull.frameConstants = frameResources.frameConstants.buffer;
-            cull.instanceBounds = frameResources.instanceBounds.buffer;
-            cull.instanceBoundsSize = frameResources.instanceBounds.size;
-            cull.visibleInstances = g.visibleInstances.buffer;
-            cull.visibleInstancesSize = g.visibleInstances.size;
-            cull.visibleInstanceCount = g.visibleInstanceCount.buffer;
-            cull.visibleInstanceCountSize = g.visibleInstanceCount.size;
-            cull.drawInputs = frameResources.drawInputs.buffer;
-            cull.drawInputsSize = frameResources.drawInputs.size;
-            cull.indirectArguments = g.indirectArguments.buffer;
-            cull.indirectArgumentsSize = g.indirectArguments.size;
-            cull.drawMetadata = g.drawMetadata.buffer;
-            cull.drawMetadataSize = g.drawMetadata.size;
-            cull.binCounts = g.binCounts.buffer;
-            cull.binCountsSize = g.binCounts.size;
+            cull.instanceBounds = m_gpuDrivenBuffers.instanceBounds;
+            cull.instanceBoundsSize = m_gpuDrivenBuffers.instanceBoundsSize;
+            cull.visibleInstances = m_gpuDrivenBuffers.visibleInstances;
+            cull.visibleInstancesSize = m_gpuDrivenBuffers.visibleInstancesSize;
+            cull.visibleInstanceCount = m_gpuDrivenBuffers.visibleCount;
+            cull.visibleInstanceCountSize = m_gpuDrivenBuffers.visibleCountSize;
+            cull.drawInputs = m_gpuDrivenBuffers.drawInputs;
+            cull.drawInputsSize = m_gpuDrivenBuffers.drawInputsSize;
+            cull.indirectArguments = m_gpuDrivenBuffers.indirectArguments;
+            cull.indirectArgumentsSize = m_gpuDrivenBuffers.indirectArgumentsSize;
+            cull.drawMetadata = m_gpuDrivenBuffers.drawMetadata;
+            cull.drawMetadataSize = m_gpuDrivenBuffers.drawMetadataSize;
+            cull.binCounts = m_gpuDrivenBuffers.binCounts;
+            cull.binCountsSize = m_gpuDrivenBuffers.binCountsSize;
 
             if (!recordGpuFrustumCull(passCtx, *pipeline, cull))
             {
@@ -1146,114 +1239,11 @@ namespace ic
                 pass->groupCountZ);
         }
 
-        if (pipeline->desc.bindingLayout ==
-            PipelineBindingLayoutKind::ComputeStorageBuffer)
-        {
-            VkBufferMemoryBarrier barrier{};
-            barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-            barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            barrier.dstAccessMask =
-                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.buffer = m_computeTestBuffer.buffer;
-            barrier.offset = 0;
-            barrier.size = m_computeTestBuffer.size;
-
-            vkCmdPipelineBarrier(
-                cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0,
-                0, nullptr,
-                1, &barrier,
-                0, nullptr);
-        }
-        else if (pipeline->desc.bindingLayout ==
-            PipelineBindingLayoutKind::ClusteredForward)
-        {
-            VkBufferMemoryBarrier barriers[4]{};
-            VkBuffer buffers[] =
-            {
-                m_clusteredForwardResources.clusterBounds.buffer,
-                m_clusteredForwardResources.clusterLightGrid.buffer,
-                m_clusteredForwardResources.clusterLightIndices.buffer,
-                m_clusteredForwardResources.clusterLightCounter.buffer
-            };
-            VkDeviceSize sizes[] =
-            {
-                m_clusteredForwardResources.clusterBounds.size,
-                m_clusteredForwardResources.clusterLightGrid.size,
-                m_clusteredForwardResources.clusterLightIndices.size,
-                m_clusteredForwardResources.clusterLightCounter.size
-            };
-            for (uint32_t i = 0; i < static_cast<uint32_t>(std::size(barriers)); ++i)
-            {
-                barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-                barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                barriers[i].dstAccessMask =
-                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                barriers[i].buffer = buffers[i];
-                barriers[i].offset = 0;
-                barriers[i].size = sizes[i];
-            }
-
-            vkCmdPipelineBarrier(
-                cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0,
-                0, nullptr,
-                static_cast<uint32_t>(std::size(barriers)), barriers,
-                0, nullptr);
-        }
-        else if (pipeline->desc.bindingLayout ==
-            PipelineBindingLayoutKind::GpuFrustumCull)
-        {
-            VkBufferMemoryBarrier barriers[5]{};
-            VkBuffer buffers[] =
-            {
-                m_gpuScene.visibleInstances.buffer,
-                m_gpuScene.visibleInstanceCount.buffer,
-                m_gpuScene.indirectArguments.buffer,
-                m_gpuScene.drawMetadata.buffer,
-                m_gpuScene.binCounts.buffer
-            };
-            VkDeviceSize sizes[] =
-            {
-                m_gpuScene.visibleInstances.size,
-                m_gpuScene.visibleInstanceCount.size,
-                m_gpuScene.indirectArguments.size,
-                m_gpuScene.drawMetadata.size,
-                m_gpuScene.binCounts.size
-            };
-            for (uint32_t i = 0; i < 5u; ++i)
-            {
-                barriers[i].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-                barriers[i].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-                barriers[i].dstAccessMask =
-                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
-                    VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
-                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                barriers[i].buffer = buffers[i];
-                barriers[i].offset = 0;
-                barriers[i].size = sizes[i];
-            }
-            vkCmdPipelineBarrier(
-                cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                    VK_PIPELINE_STAGE_TRANSFER_BIT |
-                    VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
-                0,
-                0, nullptr,
-                5, barriers,
-                0, nullptr);
-            readbackVisibleInstanceCount(ctx, cmd);
-        }
+        // The clustered cluster buffers and the GPU-driven cull buffers are all
+        // frame-graph owned: the graph emits the write->read buffer barriers
+        // (including the cross-queue cluster-compute -> graphics handoff and the
+        // DRAW_INDIRECT / INDIRECT_COMMAND_READ scope) from the declared
+        // dependencies, so no manual post-dispatch barrier is recorded here.
     }
 
     void VulkanBackend::executeEnvironmentConvertNode(
@@ -1433,24 +1423,13 @@ namespace ic
             m_environmentResources.cubemapLayout = VK_IMAGE_LAYOUT_GENERAL;
         }
 
-        vkCmdBindPipeline(
-            cmd,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline.pipeline);
-        vkCmdBindDescriptorSets(
-            cmd,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline.pipelineLayout,
-            0,
-            1,
-            &m_environmentResources.convertDescriptorSet,
-            0,
-            nullptr);
-        vkCmdDispatch(
-            cmd,
-            (m_environmentResources.cubemapSize + 7u) / 8u,
-            (m_environmentResources.cubemapSize + 7u) / 8u,
-            6u);
+        VulkanPassContext convertCtx{};
+        convertCtx.cmd = cmd;
+        recordEnvironmentConvert(
+            convertCtx,
+            pipeline,
+            m_environmentResources.convertDescriptorSet,
+            m_environmentResources.cubemapSize);
 
         VkImageMemoryBarrier barrier{};
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -1831,54 +1810,17 @@ namespace ic
             return;
         }
 
-        const VkExtent2D extent = m_swapchain.extent();
-        SkyboxConstants constants{};
-        fillSkyboxConstants(
-            scene.camera,
-            extent.width,
-            extent.height,
-            scene.environment.settings,
-            constants);
+        VulkanSkyboxInputs inputs{};
+        inputs.pipeline = &pipeline;
+        inputs.descriptorSet = descriptorSet;
+        inputs.constants = &m_environmentResources.skyboxConstants[frameSlot];
 
-        VulkanBuffer& constantsBuffer =
-            m_environmentResources.skyboxConstants[frameSlot];
-        std::memcpy(
-            constantsBuffer.mapped,
-            &constants,
-            sizeof(constants));
-        m_resourceAllocator.flush(
-            constantsBuffer,
-            0,
-            sizeof(constants));
-
-        VkViewport viewport{};
-        viewport.x = 0.0f;
-        viewport.y = 0.0f;
-        viewport.width = static_cast<float>(extent.width);
-        viewport.height = static_cast<float>(extent.height);
-        viewport.minDepth = 0.0f;
-        viewport.maxDepth = 1.0f;
-
-        VkRect2D scissor{};
-        scissor.offset = { 0, 0 };
-        scissor.extent = extent;
-
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-        vkCmdBindPipeline(
-            cmd,
-            VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline.pipeline);
-        vkCmdBindDescriptorSets(
-            cmd,
-            VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline.pipelineLayout,
-            0,
-            1,
-            &descriptorSet,
-            0,
-            nullptr);
-        vkCmdDraw(cmd, 3, 1, 0, 0);
+        VulkanPassContext passCtx{};
+        passCtx.cmd = cmd;
+        passCtx.scene = &scene;
+        passCtx.allocator = &m_resourceAllocator;
+        passCtx.surfaceExtent = m_swapchain.extent();
+        recordSkybox(passCtx, inputs);
     }
 
     void VulkanBackend::destroyEnvironmentResources()
@@ -2034,87 +1976,31 @@ namespace ic
                 VK_IMAGE_LAYOUT_GENERAL;
         }
 
-        PathTraceConstants constants{};
-        constants.renderWidth = m_pathTraceResources.width;
-        constants.renderHeight = m_pathTraceResources.height;
-        constants.frameIndex = static_cast<uint32_t>(ctx.frameIndex);
-        constants.accumulatedSampleCount =
+        VulkanPathTraceInputs inputs{};
+        inputs.pipeline = pipeline;
+        inputs.descriptorSet = descriptorSet;
+        inputs.constants = &m_pathTraceResources.pathTraceConstants[frameSlot];
+        inputs.width = m_pathTraceResources.width;
+        inputs.height = m_pathTraceResources.height;
+        inputs.frameIndex = static_cast<uint32_t>(ctx.frameIndex);
+        inputs.accumulatedSampleCount =
             m_pathTraceResources.accumulatedSampleCount;
-        constants.exposure = m_pathTraceResources.tonemapExposure;
-        constants.resetAccumulation =
-            m_pathTraceResources.resetAccumulation ? 1u : 0u;
-        constants.maxBounces = DefaultPathTraceMaxBounces;
-        constants.samplesPerPixel = DefaultPathTraceSamplesPerPixel;
-        constants.sceneVertexCount =
-            m_pathTraceResources.sceneVertexCount;
-        constants.sceneMaterialCount =
-            m_pathTraceResources.sceneMaterialCount;
-        constants.sceneTriangleCount =
-            m_pathTraceResources.sceneTriangleCount;
-        constants.sceneBvhNodeCount =
-            m_pathTraceResources.sceneBvhNodeCount;
-        constants.sceneEmissiveTriangleIndex =
+        inputs.exposure = m_pathTraceResources.tonemapExposure;
+        inputs.resetAccumulation = m_pathTraceResources.resetAccumulation;
+        inputs.sceneVertexCount = m_pathTraceResources.sceneVertexCount;
+        inputs.sceneMaterialCount = m_pathTraceResources.sceneMaterialCount;
+        inputs.sceneTriangleCount = m_pathTraceResources.sceneTriangleCount;
+        inputs.sceneBvhNodeCount = m_pathTraceResources.sceneBvhNodeCount;
+        inputs.firstEmissiveTriangleIndex =
             m_pathTraceResources.firstEmissiveTriangleIndex;
-        constants.useSceneGeometry =
-            m_pathTraceResources.sceneTriangleCount != 0u &&
-            m_pathTraceResources.sceneBvhNodeCount != 0u
-                ? 1u
-                : 0u;
-        constants.environmentEnabled = environmentReady ? 1u : 0u;
-        constants.environmentIntensity = scene.environment.settings.intensity;
-        constants.environmentExposure =
+        inputs.environmentReady = environmentReady;
+        inputs.environmentIntensity = scene.environment.settings.intensity;
+        inputs.environmentExposure =
             scene.environment.settings.pathTraceExposure;
-        fillPathTraceCameraConstants(
-            scene.camera,
-            m_pathTraceResources.width,
-            m_pathTraceResources.height,
-            constants);
-        for (const SceneLightRenderItem& light : scene.lights)
-        {
-            if (light.type != LightType::Point ||
-                constants.pointLightCount >= MaxPathTracePointLights)
-            {
-                continue;
-            }
 
-            const uint32_t lightIndex = constants.pointLightCount++;
-            constants.pointLightPositionRange[lightIndex] =
-                glm::vec4(light.position, light.range);
-            constants.pointLightColorIntensity[lightIndex] =
-                glm::vec4(light.color, light.intensity);
-        }
-
-        VulkanBuffer& pathTraceConstants =
-            m_pathTraceResources.pathTraceConstants[frameSlot];
-
-        std::memcpy(
-            pathTraceConstants.mapped,
-            &constants,
-            sizeof(constants));
-        m_resourceAllocator.flush(
-            pathTraceConstants,
-            0,
-            sizeof(constants));
-
-        vkCmdBindPipeline(
-            cmd,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline->pipeline);
-        vkCmdBindDescriptorSets(
-            cmd,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline->pipelineLayout,
-            0,
-            1,
-            &descriptorSet,
-            0,
-            nullptr);
-
-        const uint32_t groupCountX =
-            (m_pathTraceResources.width + 7u) / 8u;
-        const uint32_t groupCountY =
-            (m_pathTraceResources.height + 7u) / 8u;
-        vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
+        VulkanPassContext passCtx =
+            makePassContext(plan, node, ctx, scene, cmd);
+        recordPathTrace(passCtx, inputs);
 
         ++m_pathTraceResources.accumulatedSampleCount;
         m_pathTraceResources.resetAccumulation = false;
@@ -2202,42 +2088,18 @@ namespace ic
                 VK_IMAGE_LAYOUT_GENERAL;
         }
 
-        TonemapConstants constants{};
-        constants.renderWidth = m_pathTraceResources.width;
-        constants.renderHeight = m_pathTraceResources.height;
-        constants.exposure = m_pathTraceResources.tonemapExposure;
+        VulkanTonemapInputs inputs{};
+        inputs.pipeline = pipeline;
+        inputs.descriptorSet = descriptorSet;
+        inputs.constants = &m_pathTraceResources.tonemapConstants[frameSlot];
+        inputs.width = m_pathTraceResources.width;
+        inputs.height = m_pathTraceResources.height;
+        inputs.exposure = m_pathTraceResources.tonemapExposure;
 
-        VulkanBuffer& tonemapConstants =
-            m_pathTraceResources.tonemapConstants[frameSlot];
-
-        std::memcpy(
-            tonemapConstants.mapped,
-            &constants,
-            sizeof(constants));
-        m_resourceAllocator.flush(
-            tonemapConstants,
-            0,
-            sizeof(constants));
-
-        vkCmdBindPipeline(
-            cmd,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline->pipeline);
-        vkCmdBindDescriptorSets(
-            cmd,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline->pipelineLayout,
-            0,
-            1,
-            &descriptorSet,
-            0,
-            nullptr);
-
-        const uint32_t groupCountX =
-            (m_pathTraceResources.width + 7u) / 8u;
-        const uint32_t groupCountY =
-            (m_pathTraceResources.height + 7u) / 8u;
-        vkCmdDispatch(cmd, groupCountX, groupCountY, 1);
+        VulkanPassContext passCtx{};
+        passCtx.cmd = cmd;
+        passCtx.allocator = &m_resourceAllocator;
+        recordTonemap(passCtx, inputs);
     }
 
     void VulkanBackend::executeTransferNode(
@@ -2287,14 +2149,13 @@ namespace ic
                 spdlog::error("Transfer pass '{}' could not resolve its buffers", pass->name);
                 return;
             }
-            VkBufferCopy copy{};
-            copy.size = std::min(sourceEntry->buffer.size, destinationEntry->buffer.size);
-            vkCmdCopyBuffer(
-                cmd,
-                sourceEntry->buffer.buffer,
-                destinationEntry->buffer.buffer,
-                1,
-                &copy);
+            VulkanTransferCopy copy{};
+            copy.isBuffer = true;
+            copy.sourceBuffer = sourceEntry->buffer.buffer;
+            copy.destinationBuffer = destinationEntry->buffer.buffer;
+            copy.bufferSize = std::min(
+                sourceEntry->buffer.size, destinationEntry->buffer.size);
+            recordTransferCopy(cmd, copy);
             return;
         }
 
@@ -2345,20 +2206,13 @@ namespace ic
             return;
         }
 
-        VkImageCopy copy{};
-        copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copy.srcSubresource.layerCount = 1;
-        copy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        copy.dstSubresource.layerCount = 1;
-        copy.extent = { width, height, 1 };
-        vkCmdCopyImage(
-            cmd,
-            sourceImage,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            destinationImage,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1,
-            &copy);
+        VulkanTransferCopy copy{};
+        copy.isBuffer = false;
+        copy.sourceImage = sourceImage;
+        copy.destinationImage = destinationImage;
+        copy.width = width;
+        copy.height = height;
+        recordTransferCopy(cmd, copy);
     }
 
     GraphicsPipelineHandle VulkanBackend::pipelineForNode(
@@ -3446,15 +3300,6 @@ namespace ic
             nullptr);
     }
 
-    void VulkanBackend::ensureGpuDrivenResources()
-    {
-        if (m_gpuScene.visibleInstances)
-        {
-            return;
-        }
-        const uint32_t maxInstances = ClusteredForwardMaxGpuCullInstances;
-        m_gpuScene.ensureCullBuffers(maxInstances, MaxGpuDrivenBins);
-    }
 
     void VulkanBackend::ensureClusteredForwardResources()
     {
@@ -3478,7 +3323,9 @@ namespace ic
                 std::floor(std::log2(std::max(extent.width, extent.height))));
         const uint32_t maxInstances = ClusteredForwardMaxGpuCullInstances;
 
-        if (m_clusteredForwardResources.clusterBounds &&
+        // clusterCount is the "initialized" marker (there is no backend-owned
+            // cluster buffer any more because they are graph-registry owned).
+        if (m_clusteredForwardResources.clusterCount != 0 &&
             m_clusteredForwardResources.width == extent.width &&
             m_clusteredForwardResources.height == extent.height)
         {
@@ -3486,7 +3333,6 @@ namespace ic
         }
 
         destroyClusteredForwardResources();
-        m_gpuScene.destroyCullBuffers();
 
         m_clusteredForwardResources.width = extent.width;
         m_clusteredForwardResources.height = extent.height;
@@ -3495,40 +3341,6 @@ namespace ic
         m_clusteredForwardResources.clusterCountZ = clusterCountZ;
         m_clusteredForwardResources.clusterCount = clusterCount;
         m_clusteredForwardResources.hiZMipCount = hiZMipCount;
-
-        const uint64_t maxClusterLightRefs =
-            static_cast<uint64_t>(clusterCount) *
-            ClusteredForwardMaxLightsPerCluster;
-
-        m_clusteredForwardResources.clusterBounds =
-            m_resourceAllocator.createBuffer({
-                .size = clusterCount * sizeof(GpuClusterBounds),
-                .usage = BufferUsageFlags::Storage,
-                .memoryUsage = ResourceMemoryUsage::GpuOnly,
-                .debugName = "Vulkan clustered cluster bounds"
-            });
-        m_clusteredForwardResources.clusterLightGrid =
-            m_resourceAllocator.createBuffer({
-                .size = clusterCount * sizeof(GpuClusterLightGrid),
-                .usage = BufferUsageFlags::Storage,
-                .memoryUsage = ResourceMemoryUsage::GpuOnly,
-                .debugName = "Vulkan clustered light grid"
-            });
-        m_clusteredForwardResources.clusterLightIndices =
-            m_resourceAllocator.createBuffer({
-                .size = maxClusterLightRefs * sizeof(uint32_t),
-                .usage = BufferUsageFlags::Storage,
-                .memoryUsage = ResourceMemoryUsage::GpuOnly,
-                .debugName = "Vulkan clustered light indices"
-            });
-        m_clusteredForwardResources.clusterLightCounter =
-            m_resourceAllocator.createBuffer({
-                .size = sizeof(uint32_t),
-                .usage = BufferUsageFlags::Storage,
-                .memoryUsage = ResourceMemoryUsage::GpuOnly,
-                .debugName = "Vulkan clustered light counter"
-            });
-        m_gpuScene.ensureCullBuffers(maxInstances, MaxGpuDrivenBins);
 
         spdlog::info(
             "[VulkanBackend] Clustered forward resources: {}x{}x{} clusters, Hi-Z {}x{} mips={}, maxCullInstances={}",
@@ -3541,41 +3353,145 @@ namespace ic
             maxInstances);
     }
 
-    void VulkanBackend::readbackVisibleInstanceCount(
-        const FrameContext& ctx,
-        VkCommandBuffer cmd)
+    void VulkanBackend::resolveGpuDrivenBuffers(const CompiledGraphPlan& plan)
     {
-        if (!m_gpuScene.visibleInstanceCount ||
-            !m_gpuScene.visibleInstanceCountReadback)
-        {
-            return;
-        }
-        if (!m_hiZDebugViewEnabled || (ctx.frameIndex % 30u) != 0u)
-        {
-            return;
-        }
+        m_gpuDrivenBuffers = GpuDrivenBuffers{};
 
-        VkBufferCopy copy{};
-        copy.size = sizeof(uint32_t);
-        vkCmdCopyBuffer(
-            cmd,
-            m_gpuScene.visibleInstanceCount.buffer,
-            m_gpuScene.visibleInstanceCountReadback.buffer,
-            1,
-            &copy);
-
-        if (m_gpuScene.visibleInstanceCountReadback.mapped)
-        {
-            const uint32_t visible =
-                *static_cast<const uint32_t*>(
-                    m_gpuScene.visibleInstanceCountReadback.mapped);
-            if (visible != m_gpuScene.lastVisibleInstanceCount)
+        auto entryFor =
+            [&](GraphResourceSemantic semantic) -> VulkanGraphResourceEntry*
             {
-                spdlog::info(
-                    "[VulkanBackend] GPU frustum visible instances: {} -> {}",
-                    m_gpuScene.lastVisibleInstanceCount,
-                    visible);
-                m_gpuScene.lastVisibleInstanceCount = visible;
+                const GraphResourceId id =
+                    findResourceBySemantic(plan, semantic);
+                return id != InvalidGraphResourceId
+                    ? m_graphResourceRegistry.entry(id)
+                    : nullptr;
+            };
+        auto bind =
+            [&](VkBuffer& buffer, VkDeviceSize& size,
+                GraphResourceSemantic semantic) -> VulkanGraphResourceEntry*
+            {
+                VulkanGraphResourceEntry* entry = entryFor(semantic);
+                if (entry && entry->buffer)
+                {
+                    buffer = entry->buffer.buffer;
+                    size = entry->buffer.size;
+                }
+                return entry;
+            };
+
+        m_gpuDrivenBuffers.instanceBoundsEntry = bind(
+            m_gpuDrivenBuffers.instanceBounds,
+            m_gpuDrivenBuffers.instanceBoundsSize,
+            GraphResourceSemantic::GpuDrivenInstanceBounds);
+        m_gpuDrivenBuffers.drawInputsEntry = bind(
+            m_gpuDrivenBuffers.drawInputs,
+            m_gpuDrivenBuffers.drawInputsSize,
+            GraphResourceSemantic::GpuDrivenDrawInputs);
+        bind(
+            m_gpuDrivenBuffers.visibleInstances,
+            m_gpuDrivenBuffers.visibleInstancesSize,
+            GraphResourceSemantic::GpuDrivenVisibleInstances);
+        bind(
+            m_gpuDrivenBuffers.visibleCount,
+            m_gpuDrivenBuffers.visibleCountSize,
+            GraphResourceSemantic::GpuDrivenVisibleCount);
+        bind(
+            m_gpuDrivenBuffers.indirectArguments,
+            m_gpuDrivenBuffers.indirectArgumentsSize,
+            GraphResourceSemantic::GpuDrivenIndirectArguments);
+        bind(
+            m_gpuDrivenBuffers.drawMetadata,
+            m_gpuDrivenBuffers.drawMetadataSize,
+            GraphResourceSemantic::GpuDrivenDrawMetadata);
+        bind(
+            m_gpuDrivenBuffers.binCounts,
+            m_gpuDrivenBuffers.binCountsSize,
+            GraphResourceSemantic::GpuDrivenBinCounts);
+    }
+
+    void VulkanBackend::resolveClusterBuffers(const CompiledGraphPlan& plan)
+    {
+        m_clusterBuffers = ClusterBuffers{};
+
+        auto bind =
+            [&](VkBuffer& buffer, VkDeviceSize& size,
+                GraphResourceSemantic semantic) -> VulkanGraphResourceEntry*
+            {
+                const GraphResourceId id =
+                    findResourceBySemantic(plan, semantic);
+                VulkanGraphResourceEntry* entry =
+                    id != InvalidGraphResourceId
+                        ? m_graphResourceRegistry.entry(id)
+                        : nullptr;
+                if (entry && entry->buffer)
+                {
+                    buffer = entry->buffer.buffer;
+                    size = entry->buffer.size;
+                }
+                return entry;
+            };
+
+        bind(m_clusterBuffers.bounds, m_clusterBuffers.boundsSize,
+            GraphResourceSemantic::ClusterBounds);
+        bind(m_clusterBuffers.lightGrid, m_clusterBuffers.lightGridSize,
+            GraphResourceSemantic::ClusterLightGrid);
+        bind(m_clusterBuffers.lightIndices, m_clusterBuffers.lightIndicesSize,
+            GraphResourceSemantic::ClusterLightIndices);
+        bind(m_clusterBuffers.lightCounter, m_clusterBuffers.lightCounterSize,
+            GraphResourceSemantic::ClusterLightCounter);
+        m_clusterBuffers.visibleLightsEntry = bind(
+            m_clusterBuffers.visibleLights, m_clusterBuffers.visibleLightsSize,
+            GraphResourceSemantic::VisibleLights);
+    }
+
+    void VulkanBackend::uploadGpuDrivenInputs()
+    {
+        // Upload this frame's cull inputs straight into the graph-owned mapped
+        // buffers, then flush (host-visible memory may be non-coherent).
+        VulkanGraphResourceEntry* boundsEntry =
+            m_gpuDrivenBuffers.instanceBoundsEntry;
+        VulkanGraphResourceEntry* inputsEntry =
+            m_gpuDrivenBuffers.drawInputsEntry;
+        if (boundsEntry && boundsEntry->buffer.mapped)
+        {
+            const std::span<const GpuInstanceBounds> bounds =
+                m_gpuScene.preparedInstanceBounds();
+            const size_t bytes = std::min<size_t>(
+                bounds.size() * sizeof(GpuInstanceBounds),
+                static_cast<size_t>(boundsEntry->buffer.size));
+            if (bytes > 0)
+            {
+                std::memcpy(boundsEntry->buffer.mapped, bounds.data(), bytes);
+                m_resourceAllocator.flush(boundsEntry->buffer, 0, bytes);
+            }
+        }
+        if (inputsEntry && inputsEntry->buffer.mapped)
+        {
+            const std::span<const GpuDrawInput> inputs =
+                m_gpuScene.preparedDrawInputs();
+            const size_t bytes = std::min<size_t>(
+                inputs.size() * sizeof(GpuDrawInput),
+                static_cast<size_t>(inputsEntry->buffer.size));
+            if (bytes > 0)
+            {
+                std::memcpy(inputsEntry->buffer.mapped, inputs.data(), bytes);
+                m_resourceAllocator.flush(inputsEntry->buffer, 0, bytes);
+            }
+        }
+
+        VulkanGraphResourceEntry* lightsEntry =
+            m_clusterBuffers.visibleLightsEntry;
+        if (lightsEntry && lightsEntry->buffer.mapped)
+        {
+            const std::span<const GpuVisibleLight> lights =
+                m_gpuScene.preparedVisibleLights();
+            const size_t bytes = std::min<size_t>(
+                lights.size() * sizeof(GpuVisibleLight),
+                static_cast<size_t>(lightsEntry->buffer.size));
+            if (bytes > 0)
+            {
+                std::memcpy(lightsEntry->buffer.mapped, lights.data(), bytes);
+                m_resourceAllocator.flush(lightsEntry->buffer, 0, bytes);
             }
         }
     }
@@ -3611,59 +3527,15 @@ namespace ic
             return false;
         }
 
-        vkCmdBindDescriptorSets(
-            cmd,
-            VK_PIPELINE_BIND_POINT_COMPUTE,
-            pipeline.pipelineLayout,
-            0,
-            1,
-            &descriptorSet,
-            0,
-            nullptr);
+        VulkanPassContext passCtx{};
+        passCtx.cmd = cmd;
+        recordClusteredForwardCompute(passCtx, pipeline, descriptorSet);
         return true;
-    }
-
-    void VulkanBackend::bindClusteredForwardGraphics(
-        const VulkanGraphicsPipeline& pipeline,
-        const FrameContext& ctx,
-        VkCommandBuffer cmd)
-    {
-        if (m_gpuScene.frameSlotCount() == 0)
-        {
-            return;
-        }
-
-        const uint32_t frameSlot =
-            static_cast<uint32_t>(
-                ctx.frameIndex % m_gpuScene.frameSlotCount());
-        VkDescriptorSet descriptorSet =
-            m_gpuScene.frameResources(frameSlot).descriptorSet;
-        if (descriptorSet == VK_NULL_HANDLE)
-        {
-            return;
-        }
-
-        vkCmdBindDescriptorSets(
-            cmd,
-            VK_PIPELINE_BIND_POINT_GRAPHICS,
-            pipeline.pipelineLayout,
-            0,
-            1,
-            &descriptorSet,
-            0,
-            nullptr);
     }
 
     void VulkanBackend::destroyClusteredForwardResources()
     {
-        m_resourceAllocator.destroyBuffer(
-            m_clusteredForwardResources.clusterBounds);
-        m_resourceAllocator.destroyBuffer(
-            m_clusteredForwardResources.clusterLightGrid);
-        m_resourceAllocator.destroyBuffer(
-            m_clusteredForwardResources.clusterLightIndices);
-        m_resourceAllocator.destroyBuffer(
-            m_clusteredForwardResources.clusterLightCounter);
+        // Cluster buffers are graph-registry owned; nothing to free here.
         destroyHiZDebugDescriptors();
         if (m_clusteredForwardResources.hiZDebugSampler != VK_NULL_HANDLE)
         {
@@ -5087,8 +4959,8 @@ namespace ic
         writes[2].pBufferInfo = &materialInfo;
 
         VkDescriptorBufferInfo drawMetadataInfo{};
-        drawMetadataInfo.buffer = m_gpuScene.drawMetadata.buffer;
-        drawMetadataInfo.range = m_gpuScene.drawMetadata.size;
+        drawMetadataInfo.buffer = m_gpuDrivenBuffers.drawMetadata;
+        drawMetadataInfo.range = m_gpuDrivenBuffers.drawMetadataSize;
         VkWriteDescriptorSet drawMetadataWrite{};
         drawMetadataWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         drawMetadataWrite.dstSet = resources.descriptorSet;
@@ -5105,24 +4977,16 @@ namespace ic
         VkDescriptorBufferInfo clusterCounterInfo{};
         if (clusteredLayout)
         {
-            clusterBoundsInfo.buffer =
-                m_clusteredForwardResources.clusterBounds.buffer;
-            clusterBoundsInfo.range =
-                m_clusteredForwardResources.clusterBounds.size;
-            clusterGridInfo.buffer =
-                m_clusteredForwardResources.clusterLightGrid.buffer;
-            clusterGridInfo.range =
-                m_clusteredForwardResources.clusterLightGrid.size;
-            clusterIndicesInfo.buffer =
-                m_clusteredForwardResources.clusterLightIndices.buffer;
-            clusterIndicesInfo.range =
-                m_clusteredForwardResources.clusterLightIndices.size;
-            visibleLightsInfo.buffer = resources.visibleLights.buffer;
-            visibleLightsInfo.range = resources.visibleLights.size;
-            clusterCounterInfo.buffer =
-                m_clusteredForwardResources.clusterLightCounter.buffer;
-            clusterCounterInfo.range =
-                m_clusteredForwardResources.clusterLightCounter.size;
+            clusterBoundsInfo.buffer = m_clusterBuffers.bounds;
+            clusterBoundsInfo.range = m_clusterBuffers.boundsSize;
+            clusterGridInfo.buffer = m_clusterBuffers.lightGrid;
+            clusterGridInfo.range = m_clusterBuffers.lightGridSize;
+            clusterIndicesInfo.buffer = m_clusterBuffers.lightIndices;
+            clusterIndicesInfo.range = m_clusterBuffers.lightIndicesSize;
+            visibleLightsInfo.buffer = m_clusterBuffers.visibleLights;
+            visibleLightsInfo.range = m_clusterBuffers.visibleLightsSize;
+            clusterCounterInfo.buffer = m_clusterBuffers.lightCounter;
+            clusterCounterInfo.range = m_clusterBuffers.lightCounterSize;
 
             const VkDescriptorBufferInfo* infos[] =
             {
@@ -5679,6 +5543,15 @@ namespace ic
         m_hiZDebugMip = mip;
     }
 
+    bool VulkanBackend::supportsAsyncCompute() const
+    {
+        // A distinct compute queue handle is required to overlap graphics work.
+        // When the physical device only offered one queue, computeQueue aliases
+        // the graphics queue and there is nothing to overlap, so report false.
+        return m_device.computeQueue() != VK_NULL_HANDLE &&
+            m_device.computeQueue() != m_device.graphicsQueue();
+    }
+
 
     VkImageLayout VulkanBackend::usageToLayout(ResourceUsage usage) const
     {
@@ -5850,6 +5723,9 @@ namespace ic
 
     void VulkanBackend::onSwapchainRecreated()
     {
+        // Bump first so every recreate path (reconcile, out-of-date acquire or
+        // present) advances the generation the renderer watches.
+        ++m_swapchainGeneration;
         // VulkanSwapchain::recreate performs the single teardown idle wait.
         // Recreate first so all queues are drained before immediate destruction
         // of swapchain-dependent scene and pipeline objects.

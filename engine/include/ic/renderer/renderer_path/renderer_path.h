@@ -26,6 +26,14 @@ namespace ic
 		RenderExtent renderExtent;
 		FrameGraphBuildReason rebuildReason =
             FrameGraphBuildReason::Explicit;
+
+        // When true, a path may place compute passes with no dependency on
+        // graphics work onto QueueType::Compute so they overlap on a dedicated
+        // GPU async queue. The renderer only sets this once the backend reports
+        // supportsAsyncCompute() and the runtime toggle is enabled, so a path
+        // can honor it unconditionally. When false, every compute pass stays on
+        // the graphics queue and behavior matches the serial baseline.
+        bool asyncComputeEnabled = false;
 	};
 
 	class RendererPath

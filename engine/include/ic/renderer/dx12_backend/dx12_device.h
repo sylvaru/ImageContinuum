@@ -58,6 +58,10 @@ namespace ic
         }
 
         void logValidationMessages();
+        // On device removal, dumps DRED page-fault VA + straddling resources and
+        // the last auto-breadcrumb per command list, to localize the faulting
+        // GPU op/resource. No-op if the device is not removed.
+        void logDeviceRemovedDred();
 
     private:
         void queryFeatureSupport();

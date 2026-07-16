@@ -83,6 +83,10 @@ namespace ic
         VkFormat format() const { return m_format; }
         VkExtent2D extent() const { return m_extent; }
 
+        // Current OS window framebuffer size (authoritative surface extent).
+        // Zero on either axis means the window is minimized this frame.
+        void windowFramebufferSize(uint32_t& width, uint32_t& height) const;
+
     private:
 
         bool createSwapchain();
