@@ -625,7 +625,7 @@ namespace ic
 
         if (layout == PipelineBindingLayoutKind::GpuFrustumCull)
         {
-            VkDescriptorSetLayoutBinding bindings[8]{};
+            VkDescriptorSetLayoutBinding bindings[11]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[1] = { 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -641,6 +641,12 @@ namespace ic
             bindings[6] = { 27, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[7] = { 28, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[8] = { 29, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[9] = { 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[10] = { 31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{};
@@ -659,6 +665,35 @@ namespace ic
                     &setLayout),
                 "Failed to create Vulkan GPU frustum cull descriptor set layout.");
 
+            return setLayout;
+        }
+
+        if (layout == PipelineBindingLayoutKind::GpuOcclusionValidation)
+        {
+            VkDescriptorSetLayoutBinding bindings[5]{};
+            bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[1] = { 22, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[2] = { 29, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[3] = { 30, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[4] = { 31, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+
+            VkDescriptorSetLayoutCreateInfo layoutInfo{};
+            layoutInfo.sType =
+                VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            layoutInfo.bindingCount =
+                static_cast<uint32_t>(std::size(bindings));
+            layoutInfo.pBindings = bindings;
+
+            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            throwIfFailed(
+                vkCreateDescriptorSetLayout(
+                    m_device, &layoutInfo, nullptr, &setLayout),
+                "Failed to create Vulkan GPU occlusion validation descriptor set layout.");
             return setLayout;
         }
 

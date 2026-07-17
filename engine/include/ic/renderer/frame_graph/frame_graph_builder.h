@@ -68,6 +68,10 @@ namespace ic
             ComputePassBuilder& cadence(PassCadence cadence);
             ComputePassBuilder& onInvalidation(PassInvalidation reasons);
             ComputePassBuilder& once();
+            // Marks this pass as safe to run on the async compute queue. See
+            // ExecutionNode::asyncEligible: this asserts correctness only; the
+            // scheduler decides whether async is actually worth it.
+            ComputePassBuilder& asyncEligible(bool eligible = true);
 
             operator GraphNodeId() const
             {
@@ -271,6 +275,7 @@ namespace ic
             GraphResourceId source,
             GraphResourceId destination);
         void setNodeQueue(GraphNodeId node, QueueType queue);
+        void setNodeAsyncEligible(GraphNodeId node, bool eligible);
 
         void setPassCadence(
             GraphNodeId node,

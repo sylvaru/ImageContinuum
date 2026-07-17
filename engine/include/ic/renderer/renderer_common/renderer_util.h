@@ -13,6 +13,7 @@
 #include "ic/core/asset_manager.h"
 #include "ic/renderer/frame_graph/compiled_graph_plan.h"
 #include "ic/renderer/frame_graph/frame_graph_pass.h"
+#include "ic/renderer/renderer_gpu_assets.h"
 #include "ic/scene/scene_render_view.h"
 
 namespace ic
@@ -146,6 +147,74 @@ namespace ic
         }
 
         return false;
+    }
+
+    inline bool updateGpuOcclusionHistory(
+        GpuOcclusionHistoryState& history,
+        const SceneRenderView& scene,
+        uint32_t width,
+        uint32_t height,
+        const glm::mat4& currentView,
+        const glm::mat4& currentProjection,
+        GpuFrameData& frameData)
+    {
+        const glm::mat4 currentViewProjection =
+            currentProjection * currentView;
+        const glm::mat4 inverseCurrentView = glm::inverse(currentView);
+        const glm::mat4 inversePreviousView = glm::inverse(history.view);
+        const glm::vec3 currentForward =
+            glm::normalize(-glm::vec3(inverseCurrentView[2]));
+        const glm::vec3 previousForward =
+            glm::normalize(-glm::vec3(inversePreviousView[2]));
+
+        constexpr float kProjectionEpsilon = 1.0e-5f;
+        constexpr float kMaxCameraTranslation = 0.5f;
+        constexpr float kMinForwardDot = 0.9902681f; // cos(8 degrees)
+
+        const bool projectionStable =
+            std::fabs(history.nearPlane - scene.camera.nearPlane) <=
+                kProjectionEpsilon &&
+            std::fabs(history.farPlane - scene.camera.farPlane) <=
+                kProjectionEpsilon &&
+            std::fabs(
+                history.verticalFovRadians -
+                scene.camera.verticalFovRadians) <= kProjectionEpsilon &&
+            std::fabs(history.aspectRatio - scene.camera.aspectRatio) <=
+                kProjectionEpsilon;
+        const bool cameraContinuous =
+            glm::distance(history.cameraPosition, scene.camera.position) <=
+                kMaxCameraTranslation &&
+            glm::dot(previousForward, currentForward) >= kMinForwardDot;
+        const bool reliable =
+            history.valid &&
+            history.width == width &&
+            history.height == height &&
+            history.sceneVersion == scene.sceneVersion &&
+            projectionStable &&
+            cameraContinuous;
+
+        frameData.previousView =
+            history.valid ? history.view : currentView;
+        frameData.previousViewProjection =
+            history.valid ? history.viewProjection : currentViewProjection;
+        frameData.occlusionConfig = glm::vec4(
+            history.valid ? history.nearPlane : scene.camera.nearPlane,
+            1.15f,
+            4.0f,
+            0.002f);
+
+        history.view = currentView;
+        history.viewProjection = currentViewProjection;
+        history.cameraPosition = scene.camera.position;
+        history.nearPlane = scene.camera.nearPlane;
+        history.farPlane = scene.camera.farPlane;
+        history.verticalFovRadians = scene.camera.verticalFovRadians;
+        history.aspectRatio = scene.camera.aspectRatio;
+        history.width = width;
+        history.height = height;
+        history.sceneVersion = scene.sceneVersion;
+        history.valid = true;
+        return reliable;
     }
 
     inline void fillPathTraceCameraConstants(

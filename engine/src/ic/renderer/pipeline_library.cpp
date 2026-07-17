@@ -386,6 +386,8 @@ namespace ic
             return PipelineBindingLayoutKind::HiZDepthPyramid;
         if (value == "GpuFrustumCull")
             return PipelineBindingLayoutKind::GpuFrustumCull;
+        if (value == "GpuOcclusionValidation")
+            return PipelineBindingLayoutKind::GpuOcclusionValidation;
         if (value == "PathTrace")
             return PipelineBindingLayoutKind::PathTrace;
         if (value == "PathTraceTonemap")

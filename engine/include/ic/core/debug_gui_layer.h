@@ -6,9 +6,10 @@
 namespace ic
 {
     struct FrameContext;
-    class Renderer;
     class SceneManager;
 
+    // Scene authoring controls. Renderer telemetry and controls live in the
+    // Renderer's own consolidated "Renderer Diagnostics" window.
     class DebugGuiLayer final : public Layer
     {
     public:
@@ -18,11 +19,6 @@ namespace ic
         void onRender(float alpha) override;
 
     private:
-        float m_displayFrameTimeMs = 0.0f;
-        float m_displayFps = 0.0f;
-        float m_sampleElapsed = 0.0f;
-        uint32_t m_sampleFrames = 0;
-        Renderer* m_renderer = nullptr;
         SceneManager* m_sceneManager = nullptr;
     };
 }

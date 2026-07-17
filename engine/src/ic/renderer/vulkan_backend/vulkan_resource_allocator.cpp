@@ -408,6 +408,25 @@ namespace ic
             "Failed to flush Vulkan buffer allocation.");
     }
 
+    void VulkanResourceAllocator::invalidate(
+        VulkanBuffer& buffer,
+        VkDeviceSize offset,
+        VkDeviceSize size)
+    {
+        if (!buffer)
+        {
+            return;
+        }
+        std::scoped_lock lock(m_mutex);
+        throwIfFailed(
+            vmaInvalidateAllocation(
+                m_allocator,
+                buffer.allocation,
+                offset,
+                size),
+            "Failed to invalidate Vulkan buffer allocation.");
+    }
+
     VkBufferUsageFlags VulkanResourceAllocator::toVkBufferUsage(
         BufferUsageFlags usage) const
     {

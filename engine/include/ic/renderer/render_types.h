@@ -16,6 +16,46 @@ namespace ic
     constexpr uint32_t ClusteredForwardMaxVisibleLights = 256;
     constexpr uint32_t ClusteredForwardMaxGpuCullInstances = 65536;
 
+    enum class GpuCullDebugMode : uint32_t
+    {
+        Off = 0,
+        Statistics,
+        Classification
+    };
+
+    enum class GpuCullClassification : uint32_t
+    {
+        Visible = 0,
+        FrustumCulled,
+        OcclusionCulled,
+        ConservativeRetained
+    };
+
+    struct GpuCullStats
+    {
+        uint32_t inputCount = 0;
+        uint32_t frustumCulled = 0;
+        uint32_t occlusionCulled = 0;
+        uint32_t conservativeRetained = 0;
+
+        uint32_t visible = 0;
+        uint32_t overflow = 0;
+        uint32_t falseOccluded = 0;
+        uint32_t falseVisible = 0;
+
+        uint32_t historyValid = 0;
+        uint32_t occlusionEnabled = 0;
+        uint32_t padding0 = 0;
+        uint32_t padding1 = 0;
+    };
+    static_assert(sizeof(GpuCullStats) == 48);
+
+    struct GpuCullPerformance
+    {
+        double gpuMilliseconds = 0.0;
+        double cpuRecordMilliseconds = 0.0;
+    };
+
     enum class ResourceMemoryUsage : uint8_t
     {
         GpuOnly,
@@ -226,7 +266,13 @@ namespace ic
         uint32_t pipelineBinIndex = 0;
         uint32_t materialBinIndex = 0;
         uint32_t geometryBinIndex = 0;
+
+        uint32_t cullState = 0;
+        uint32_t padding0 = 0;
+        uint32_t padding1 = 0;
+        uint32_t padding2 = 0;
     };
+    static_assert(sizeof(GpuDrawMetadata) == 48);
 
     struct GpuDrawInput
     {
@@ -235,7 +281,12 @@ namespace ic
         uint32_t firstIndex = 0;
         int32_t vertexOffset = 0;
         uint32_t commandBinOffset = 0;
+        uint32_t commandBinCapacity = 0;
+        uint32_t commandBinLocalIndex = 0;
+        uint32_t padding1 = 0;
+        uint32_t padding2 = 0;
     };
+    static_assert(sizeof(GpuDrawInput) == 80);
 
     // GPU Ring buffer
 }

@@ -110,6 +110,13 @@ namespace ic
         VkDeviceSize drawMetadataSize = 0;
         VkBuffer binCounts = VK_NULL_HANDLE;
         VkDeviceSize binCountsSize = 0;
+        VkBuffer cullClassification = VK_NULL_HANDLE;
+        VkDeviceSize cullClassificationSize = 0;
+        VkBuffer cullStats = VK_NULL_HANDLE;
+        VkDeviceSize cullStatsSize = 0;
+        VkImageView previousHiZ = VK_NULL_HANDLE;
+        VkImageLayout previousHiZLayout =
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     };
 
     // Records the Hi-Z depth-pyramid mip chain. Returns true when it recorded.
@@ -124,6 +131,26 @@ namespace ic
         const VulkanPassContext& ctx,
         const VulkanComputePipeline& pipeline,
         const VulkanCullBuffers& buffers);
+
+    struct VulkanOcclusionValidationInputs
+    {
+        VkDescriptorPool* descriptorPool = nullptr;
+        VkBuffer frameConstants = VK_NULL_HANDLE;
+        VkBuffer instanceBounds = VK_NULL_HANDLE;
+        VkDeviceSize instanceBoundsSize = 0;
+        VkBuffer cullClassification = VK_NULL_HANDLE;
+        VkDeviceSize cullClassificationSize = 0;
+        VkBuffer cullStats = VK_NULL_HANDLE;
+        VkDeviceSize cullStatsSize = 0;
+        VkImageView currentHiZ = VK_NULL_HANDLE;
+        VkImageLayout currentHiZLayout =
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    };
+
+    bool recordGpuOcclusionValidation(
+        const VulkanPassContext& ctx,
+        const VulkanComputePipeline& pipeline,
+        const VulkanOcclusionValidationInputs& inputs);
 
     // Native indirect-draw stream consumed when useGpuDriven is set.
     struct VulkanIndirectDrawStream

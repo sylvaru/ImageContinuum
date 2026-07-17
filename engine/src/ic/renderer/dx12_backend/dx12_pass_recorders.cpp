@@ -288,6 +288,12 @@ namespace ic
     {
         ID3D12GraphicsCommandList4* cmd = ctx.cmd;
 
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            ctx.descriptors->shaderResourceHeap(),
+            ctx.descriptors->samplerHeap()
+        };
+        cmd->SetDescriptorHeaps(static_cast<UINT>(std::size(heaps)), heaps);
         cmd->SetComputeRootConstantBufferView(0, buffers.frameConstantsAddr);
         cmd->SetComputeRootShaderResourceView(1, buffers.instanceBoundsAddr);
         cmd->SetComputeRootUnorderedAccessView(2, buffers.visibleInstancesAddr);
@@ -297,5 +303,36 @@ namespace ic
         cmd->SetComputeRootUnorderedAccessView(
             5, buffers.indirectArgumentsAddr);
         cmd->SetComputeRootUnorderedAccessView(6, buffers.binCountsAddr);
+        if (buffers.previousHiZSrv.ptr != 0)
+        {
+            cmd->SetComputeRootDescriptorTable(7, buffers.previousHiZSrv);
+        }
+        cmd->SetComputeRootUnorderedAccessView(
+            8, buffers.cullStatsAddr);
+        cmd->SetComputeRootUnorderedAccessView(
+            9, buffers.cullClassificationAddr);
+    }
+
+    void recordGpuOcclusionValidation(
+        const DX12PassContext& ctx,
+        const DX12OcclusionValidationInputs& inputs)
+    {
+        ID3D12DescriptorHeap* heaps[] =
+        {
+            ctx.descriptors->shaderResourceHeap(),
+            ctx.descriptors->samplerHeap()
+        };
+        ctx.cmd->SetDescriptorHeaps(
+            static_cast<UINT>(std::size(heaps)), heaps);
+        ctx.cmd->SetComputeRootConstantBufferView(
+            0, inputs.frameConstantsAddr);
+        ctx.cmd->SetComputeRootShaderResourceView(
+            1, inputs.instanceBoundsAddr);
+        ctx.cmd->SetComputeRootDescriptorTable(
+            2, inputs.currentHiZSrv);
+        ctx.cmd->SetComputeRootUnorderedAccessView(
+            3, inputs.cullStatsAddr);
+        ctx.cmd->SetComputeRootShaderResourceView(
+            4, inputs.cullClassificationAddr);
     }
 }

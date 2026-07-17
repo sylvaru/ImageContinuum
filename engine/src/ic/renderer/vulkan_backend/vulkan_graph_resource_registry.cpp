@@ -153,6 +153,50 @@ namespace ic
                 instances.slots.resize(desiredCount);
             }
 
+            // Previous-frame consumers still need a valid image/view on frame
+            // zero even though history validity disables sampling. Materialize
+            // the whole history ring up front; ordinary per-frame-slot
+            // resources retain their lazy allocation behavior.
+            if (resource.multiplicity == ResourceMultiplicity::History &&
+                resource.ownership != ResourceOwnership::Imported)
+            {
+                for (VulkanGraphResourceEntry& historyEntry : instances.slots)
+                {
+                    if (entryMatches(
+                            historyEntry,
+                            resource,
+                            resolvedWidth,
+                            resolvedHeight))
+                    {
+                        historyEntry.id = resource.id;
+                        historyEntry.type = resource.type;
+                        historyEntry.ownership = resource.ownership;
+                        historyEntry.imported = resource.imported;
+                        continue;
+                    }
+                    retireEntry(
+                        std::exchange(
+                            historyEntry, VulkanGraphResourceEntry{}),
+                        frameSlot);
+                    historyEntry.id = resource.id;
+                    historyEntry.type = resource.type;
+                    historyEntry.ownership = resource.ownership;
+                    historyEntry.imported = resource.imported;
+                    if (resource.type == GraphResourceType::Texture)
+                    {
+                        materializeTexture(
+                            historyEntry,
+                            resource,
+                            resolvedWidth,
+                            resolvedHeight);
+                    }
+                    else
+                    {
+                        materializeBuffer(historyEntry, resource);
+                    }
+                }
+            }
+
             // Only the current frame slot's instance is (re)materialized here;
             // the other slots are materialized when their own frame comes round.
             const uint32_t index = currentInstanceIndex(instances);

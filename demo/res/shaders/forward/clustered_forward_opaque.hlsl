@@ -44,6 +44,7 @@ struct VertexOutput
     float4 color : TEXCOORD3;
     nointerpolation uint materialIndex : TEXCOORD4;
     float4 tangent : TEXCOORD5;
+    nointerpolation uint cullState : TEXCOORD6;
 };
 
 VertexOutput VSMain(VertexInput input, uint instanceId : SV_InstanceID)
@@ -61,7 +62,9 @@ VertexOutput VSMain(VertexInput input, uint instanceId : SV_InstanceID)
         mul((float3x3) objectData.world, input.tangent.xyz);
 
     VertexOutput output;
-    output.position = mul(gFrame.viewProjection, worldPosition);
+    output.position = cullDebugPosition(
+        mul(gFrame.viewProjection, worldPosition),
+        draw.cullState);
     output.worldPosition = worldPosition.xyz;
     output.normal = safeNormalize(worldNormal, float3(0.0f, 1.0f, 0.0f));
     output.uv0 = input.uv0;
@@ -70,6 +73,7 @@ VertexOutput VSMain(VertexInput input, uint instanceId : SV_InstanceID)
     output.tangent = float4(
         safeNormalize(worldTangent, float3(1.0f, 0.0f, 0.0f)),
         input.tangent.w);
+    output.cullState = draw.cullState;
 
     return output;
 }
@@ -158,6 +162,10 @@ float3 evaluateIblAmbient(
 
 float4 PSMain(VertexOutput input) : SV_Target0
 {
+    if (gFrame.occlusionDebugConfig.x == 2u)
+    {
+        return cullDebugColor(input.cullState);
+    }
     const MaterialData material = gMaterials[input.materialIndex];
 
     const float4 sampledBaseColor =

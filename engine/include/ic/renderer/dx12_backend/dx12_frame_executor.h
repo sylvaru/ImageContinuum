@@ -81,6 +81,10 @@ namespace ic
             uint64_t value = 0;
         };
         std::vector<CrossFrameSignal> m_prevSubmissionSignals;
+        std::vector<std::vector<CrossFrameSignal>> m_crossFrameWaits;
+        std::vector<uint32_t> m_commandIndexByNode;
+        std::vector<CrossFrameSignal> m_submissionSignals;
+        std::vector<ID3D12CommandList*> m_batchLists;
 
         const DX12Device* m_device = nullptr;
         DX12Swapchain* m_swapchain = nullptr;

@@ -28,7 +28,10 @@ namespace ic
     struct RendererSettings
     {
         bool vsync = true;
-        float targetFps = 500.0f;
+        // Uncapped by default. Vsync remains a separate presentation control.
+        float targetFps = 0.0f;
+        bool gpuOcclusion = true;
+        GpuCullDebugMode gpuCullDebugMode = GpuCullDebugMode::Off;
         EnvironmentSettings environment;
     };
 

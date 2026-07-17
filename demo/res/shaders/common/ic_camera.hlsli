@@ -8,6 +8,8 @@ struct FrameConstants
     float4x4 view;
     float4x4 projection;
     float4x4 viewProjection;
+    float4x4 previousView;
+    float4x4 previousViewProjection;
 
     float3 cameraPosition;
     float time;
@@ -32,8 +34,10 @@ struct FrameConstants
     uint4 clusterDimensions;
     uint4 clusterConfig;
     uint4 renderExtentAndHiZ; // x width, y height, z hi-z mip count, w reversed-Z flag.
-    uint4 cullingConfig;      // x object count, y visible count/debug, z/w reserved.
+    uint4 cullingConfig;      // x object count, y backend flag, z bin count, w valid previous Hi-Z.
     float4 cameraNearFar;     // x near, y far, z/w reserved.
+    float4 occlusionConfig;   // x previous near, y radius scale, z pixel expansion, w depth bias.
+    uint4 occlusionDebugConfig; // x mode, y stats enabled, z occlusion enabled, w reserved.
 };
 
 ConstantBuffer<FrameConstants> gFrame : register(b0, space0);

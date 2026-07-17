@@ -101,6 +101,9 @@ namespace ic
         D3D12_GPU_VIRTUAL_ADDRESS frameConstantsAddr = 0;
         D3D12_GPU_VIRTUAL_ADDRESS instanceBoundsAddr = 0;
         D3D12_GPU_VIRTUAL_ADDRESS drawInputsAddr = 0;
+        D3D12_GPU_DESCRIPTOR_HANDLE previousHiZSrv = {};
+        D3D12_GPU_VIRTUAL_ADDRESS cullClassificationAddr = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS cullStatsAddr = 0;
     };
 
     // Native depth + Hi-Z inputs for the Hi-Z pyramid recorder.
@@ -130,6 +133,19 @@ namespace ic
     void recordGpuFrustumCull(
         const DX12PassContext& ctx,
         const DX12CullBuffers& buffers);
+
+    struct DX12OcclusionValidationInputs
+    {
+        D3D12_GPU_VIRTUAL_ADDRESS frameConstantsAddr = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS instanceBoundsAddr = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS cullClassificationAddr = 0;
+        D3D12_GPU_VIRTUAL_ADDRESS cullStatsAddr = 0;
+        D3D12_GPU_DESCRIPTOR_HANDLE currentHiZSrv = {};
+    };
+
+    void recordGpuOcclusionValidation(
+        const DX12PassContext& ctx,
+        const DX12OcclusionValidationInputs& inputs);
 
     // Native indirect-draw stream consumed by GPU-driven ExecuteIndirect.
     struct DX12IndirectDrawStream

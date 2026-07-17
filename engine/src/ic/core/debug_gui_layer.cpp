@@ -18,119 +18,52 @@ namespace ic
 
     void DebugGuiLayer::onUpdate(FrameContext& ctx)
     {
-        m_sampleElapsed += ctx.deltaTime;
-        ++m_sampleFrames;
-
-        constexpr float kSampleInterval = 0.25f;
-        if (m_sampleElapsed >= kSampleInterval)
-        {
-            m_displayFps =
-                static_cast<float>(m_sampleFrames) / m_sampleElapsed;
-            m_displayFrameTimeMs =
-                (m_sampleElapsed / static_cast<float>(m_sampleFrames)) *
-                1000.0f;
-
-            m_sampleElapsed = 0.0f;
-            m_sampleFrames = 0;
-        }
-
-        m_renderer = ctx.services ? ctx.services->renderer : nullptr;
         m_sceneManager = ctx.services ? ctx.services->sceneManager : nullptr;
     }
 
+    // Scene authoring controls only.
+    //
+    // Everything that describes the renderer -- frame/GPU timing, async
+    // compute, queues, the frame graph, pass timings, resources, culling and
+    // the Hi-Z pyramid -- now lives in the single "Renderer Diagnostics" window
+    // owned by the Renderer, which is where the data already is. What is left
+    // here changes the scene rather than reporting on it, so it stays separate.
     void DebugGuiLayer::onRender([[maybe_unused]] float alpha)
     {
-        constexpr ImGuiWindowFlags flags =
-            ImGuiWindowFlags_NoSavedSettings |
-            ImGuiWindowFlags_NoCollapse;
-
-        ImGui::SetNextWindowPos(ImVec2(12.0f, 12.0f), ImGuiCond_FirstUseEver);
-        ImGui::SetNextWindowSize(ImVec2(220.0f, 100.0f), ImGuiCond_FirstUseEver);
-
-        if (ImGui::Begin("Debug", nullptr, flags))
+        if (!m_sceneManager)
         {
-            ImGui::Text("FPS: %.1f", m_displayFps);
-            ImGui::Text("Frame: %.3f ms", m_displayFrameTimeMs);
+            return;
+        }
 
-            if (m_renderer)
+        Scene* scene = m_sceneManager->activeScene();
+        if (!scene)
+        {
+            return;
+        }
+
+        constexpr ImGuiWindowFlags flags = ImGuiWindowFlags_NoSavedSettings;
+
+        ImGui::SetNextWindowPos(ImVec2(12.0f, 644.0f), ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSize(ImVec2(300.0f, 180.0f), ImGuiCond_FirstUseEver);
+
+        if (ImGui::Begin("Scene", nullptr, flags))
+        {
+            EnvironmentSettings settings = scene->environmentSettings();
+            bool changed = false;
+
+            changed |= ImGui::Checkbox("Environment", &settings.enabled);
+            changed |= ImGui::SliderFloat(
+                "Env Intensity", &settings.intensity, 0.0f, 8.0f);
+            changed |= ImGui::SliderFloat(
+                "Skybox Exposure", &settings.skyboxExposure, 0.0f, 4.0f);
+            changed |= ImGui::SliderFloat(
+                "Path Env Exposure", &settings.pathTraceExposure, 0.0f, 4.0f);
+            changed |= ImGui::SliderFloat(
+                "Tonemap Exposure", &settings.tonemapExposure, 0.0f, 4.0f);
+
+            if (changed)
             {
-                bool vsync = m_renderer->vsyncEnabled();
-                if (ImGui::Checkbox("VSync", &vsync))
-                {
-                    m_renderer->setVsyncEnabled(vsync);
-                }
-
-                if (m_renderer->renderPathType() ==
-                    RenderPathType::ClusteredForward)
-                {
-                    bool heatmap =
-                        m_renderer->clusteredForwardHeatmapEnabled();
-                    ImGui::Separator();
-                    if (ImGui::Checkbox("Cluster Heatmap", &heatmap))
-                    {
-                        m_renderer->setClusteredForwardHeatmapEnabled(
-                            heatmap);
-                    }
-
-                    bool hiZDebug = m_renderer->hiZDebugViewEnabled();
-                    if (ImGui::Checkbox("Hi-Z Debug View", &hiZDebug))
-                    {
-                        m_renderer->setHiZDebugViewEnabled(hiZDebug);
-                    }
-
-                    int hiZMip =
-                        static_cast<int>(m_renderer->hiZDebugMip());
-                    if (ImGui::SliderInt("Hi-Z Mip", &hiZMip, 0, 15))
-                    {
-                        m_renderer->setHiZDebugMip(
-                            static_cast<uint32_t>(std::max(0, hiZMip)));
-                    }
-                }
-            }
-
-            if (m_sceneManager)
-            {
-                if (Scene* scene = m_sceneManager->activeScene())
-                {
-                    EnvironmentSettings settings =
-                        scene->environmentSettings();
-                    bool changed = false;
-
-                    ImGui::Separator();
-                    changed |=
-                        ImGui::Checkbox(
-                            "Environment",
-                            &settings.enabled);
-                    changed |=
-                        ImGui::SliderFloat(
-                            "Env Intensity",
-                            &settings.intensity,
-                            0.0f,
-                            8.0f);
-                    changed |=
-                        ImGui::SliderFloat(
-                            "Skybox Exposure",
-                            &settings.skyboxExposure,
-                            0.0f,
-                            4.0f);
-                    changed |=
-                        ImGui::SliderFloat(
-                            "Path Env Exposure",
-                            &settings.pathTraceExposure,
-                            0.0f,
-                            4.0f);
-                    changed |=
-                        ImGui::SliderFloat(
-                            "Tonemap Exposure",
-                            &settings.tonemapExposure,
-                            0.0f,
-                            4.0f);
-
-                    if (changed)
-                    {
-                        scene->setEnvironmentSettings(settings);
-                    }
-                }
+                scene->setEnvironmentSettings(settings);
             }
         }
 

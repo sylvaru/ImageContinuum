@@ -12,6 +12,7 @@
 #include "ic/renderer/vulkan_backend/vulkan_resource_allocator.h"
 #include "ic/renderer/vulkan_backend/vulkan_graph_resource_registry.h"
 #include "ic/renderer/vulkan_backend/vulkan_frame_executor.h"
+#include "ic/renderer/vulkan_backend/vulkan_gpu_profiler.h"
 #include "ic/renderer/vulkan_backend/vulkan_upload_scheduler.h"
 #include "ic/renderer/vulkan_backend/vulkan_retirement_queue.h"
 #include "ic/renderer/vulkan_backend/vulkan_gpu_scene.h"
@@ -65,10 +66,40 @@ namespace ic
         void setHiZDebugViewEnabled(bool enabled) override;
         uint32_t hiZDebugMip() const override;
         void setHiZDebugMip(uint32_t mip) override;
+        bool hiZDebugPrevious() const override;
+        void setHiZDebugPrevious(bool previous) override;
+        bool gpuOcclusionEnabled() const override;
+        void setGpuOcclusionEnabled(bool enabled) override;
+        GpuCullDebugMode gpuCullDebugMode() const override;
+        void setGpuCullDebugMode(GpuCullDebugMode mode) override;
+        GpuCullStats gpuCullStats() const override;
+        GpuCullPerformance gpuCullPerformance() const override;
         // A dedicated compute queue is selected at device creation and buffers
         // use VK_SHARING_MODE_CONCURRENT across queue families, so async batches
         // need only the timeline-semaphore sync the frame executor already emits.
         bool supportsAsyncCompute() const override;
+        void drainForSchedulingTransition() override;
+
+        std::span<const GpuPassSample> gpuPassSamples() const override
+        {
+            return m_gpuProfiler.lastFrameSamples();
+        }
+        void setGpuProfilingEnabled(bool enabled) override
+        {
+            m_gpuProfiler.setEnabled(enabled);
+            buildBackendDiagnostics();
+        }
+        bool gpuProfilingEnabled() const override
+        {
+            return m_gpuProfiler.enabled();
+        }
+
+        HiZDebugImage hiZDebugImage(bool previous, uint32_t mip) override;
+        BackendDiagnosticInfo backendDiagnostics() const override;
+        RendererPerformanceCounters performanceCounters() const override
+        {
+            return m_performanceCounters;
+        }
 
         VulkanResourceAllocator& resourceAllocator()
         {
@@ -401,7 +432,9 @@ namespace ic
             VkCommandBuffer cmd);
         void ensureDepthTarget();
         void destroyDepthTarget();
-        void drawHiZDebugWindow();
+        // Fills the diagnostic feature/limit tables once at init so
+        // backendDiagnostics() is a free span read per frame.
+        void buildBackendDiagnostics();
         void ensureHiZDebugDescriptors(VulkanGraphResourceEntry& hiZ);
         void destroyHiZDebugDescriptors();
         void ensureComputeTestResources(
@@ -427,6 +460,10 @@ namespace ic
             VkDeviceSize drawMetadataSize = 0;
             VkBuffer binCounts = VK_NULL_HANDLE;
             VkDeviceSize binCountsSize = 0;
+            VkBuffer cullClassification = VK_NULL_HANDLE;
+            VkDeviceSize cullClassificationSize = 0;
+            VkBuffer cullStats = VK_NULL_HANDLE;
+            VkDeviceSize cullStatsSize = 0;
             // Registry entries for the CPU-uploaded inputs (mapped pointer +
             // flush target); valid for the frame after resolveGpuDrivenBuffers.
             VulkanGraphResourceEntry* instanceBoundsEntry = nullptr;
@@ -550,6 +587,7 @@ namespace ic
         VkDescriptorPool m_computeTestDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorSet m_computeTestDescriptorSet = VK_NULL_HANDLE;
         ClusteredForwardResources m_clusteredForwardResources;
+        GpuOcclusionHistoryState m_gpuOcclusionHistory;
         PathTraceResources m_pathTraceResources;
         EnvironmentResources m_environmentResources;
 
@@ -565,6 +603,23 @@ namespace ic
         bool m_imguiFrameActive = false;
         bool m_clusteredForwardHeatmapEnabled = false;
         bool m_hiZDebugViewEnabled = false;
+        bool m_hiZDebugPrevious = false;
+        bool m_gpuOcclusionEnabled = true;
+        GpuCullDebugMode m_gpuCullDebugMode = GpuCullDebugMode::Off;
+        GpuCullStats m_gpuCullStats = {};
+        GpuCullPerformance m_gpuCullPerformance = {};
+        uint64_t m_gpuCullDiagnosticFrames = 0;
+        VkQueryPool m_gpuCullTimestampPool = VK_NULL_HANDLE;
+        std::vector<double> m_gpuCullCpuRecordMilliseconds;
+        std::vector<uint8_t> m_gpuCullTimestampValid;
+        double m_gpuCullTimestampPeriodNanoseconds = 0.0;
+        VulkanGpuProfiler m_gpuProfiler;
+        std::vector<VkCommandBuffer> m_frameCommandBuffers;
+        RendererPerformanceCounters m_performanceCounters{};
+        // Built once at init; backendDiagnostics() returns spans into these.
+        std::string m_diagnosticAdapterName;
+        std::vector<BackendFeature> m_diagnosticFeatures;
+        std::vector<BackendLimit> m_diagnosticLimits;
         uint32_t m_hiZDebugMip = 0;
         std::string m_imguiIniPath;
     };

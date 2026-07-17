@@ -131,7 +131,10 @@ namespace ic
         GpuDrivenVisibleCount,
         GpuDrivenIndirectArguments,
         GpuDrivenDrawMetadata,
-        GpuDrivenBinCounts
+        GpuDrivenBinCounts,
+        GpuDrivenCullClassification,
+        GpuDrivenCullStats,
+        GpuDrivenCullStatsReadback
     };
 
     enum class ImportedResource : uint8_t
@@ -226,6 +229,12 @@ namespace ic
         QueueType queue;
         GraphNodeType type;
 
+        // Author-declared: this pass is SAFE on the async compute queue. The
+        // compiler copies it to ExecutionNode::asyncEligible, where the
+        // scheduler decides whether to use it. See that field for why safety
+        // and profitability are kept separate.
+        bool asyncEligible = false;
+
         uint32_t payloadIndex;
     };
 
@@ -287,6 +296,19 @@ namespace ic
         // output and must never be used to rediscover pass inputs/outputs.
         uint32_t firstResourceAccess = 0;
         uint32_t resourceAccessCount = 0;
+
+        // Declares that this pass MAY run on the async compute queue: the path
+        // has established that it carries no dependency on concurrent graphics
+        // work and that its resources are safe to touch across a queue
+        // boundary. It is a statement of correctness, not of profitability.
+        //
+        // Whether an eligible pass actually lands on the compute queue is the
+        // scheduler's deterministic async-compute setting, because support can
+        // only be decided from measurements the pass itself cannot see: async
+        // costs an extra submission, fence signal and cross-queue wait per
+        // batch, and it repays that only when the frame is GPU-bound and the
+        // work genuinely overlaps. Eligible passes stay on graphics by default.
+        bool asyncEligible = false;
     };
 
     // A cross-frame GPU ordering edge derived from a genuine shared-resource
@@ -337,6 +359,6 @@ namespace ic
     static_assert(sizeof(ExecutionLevel) == 8);
     static_assert(sizeof(QueueSubmissionWait) == 4);
     static_assert(sizeof(QueueSubmissionBatch) == 24);
-    static_assert(sizeof(ExecutionNode) == 36);
+    static_assert(sizeof(ExecutionNode) == 40);
     static_assert(sizeof(CrossFrameDependency) == 16);
 }

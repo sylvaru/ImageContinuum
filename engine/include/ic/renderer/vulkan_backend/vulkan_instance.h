@@ -7,7 +7,7 @@ namespace ic
 	class VulkanInstance
 	{
 	public:
-		void init();
+		void init(bool enableValidation);
 		void shutdown();
 
 		VkInstance instance() const
@@ -15,10 +15,13 @@ namespace ic
 			return m_instance;
 		}
 
+        bool validationEnabled() const { return m_validationEnabled; }
+
 	private:
 		VkInstance m_instance = VK_NULL_HANDLE;
 		VkDebugUtilsMessengerEXT m_debugMessenger =
 			VK_NULL_HANDLE;
+        bool m_validationEnabled = false;
 
 		void createInstance();
 		void setupValidationLayers();

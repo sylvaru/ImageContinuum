@@ -658,7 +658,7 @@ namespace ic
 
         if (layout == PipelineBindingLayoutKind::GpuFrustumCull)
         {
-            D3D12_ROOT_PARAMETER rootParameters[7]{};
+            D3D12_ROOT_PARAMETER rootParameters[10]{};
             rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
             rootParameters[0].Descriptor.ShaderRegister = 0;
             rootParameters[0].Descriptor.RegisterSpace = 0;
@@ -692,6 +692,28 @@ namespace ic
                 rootParameters[4u + i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
             }
 
+            D3D12_DESCRIPTOR_RANGE hiZRange{};
+            hiZRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            hiZRange.NumDescriptors = 1;
+            hiZRange.BaseShaderRegister = 29;
+            hiZRange.RegisterSpace = 0;
+            hiZRange.OffsetInDescriptorsFromTableStart = 0;
+            rootParameters[7].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[7].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[7].DescriptorTable.pDescriptorRanges = &hiZRange;
+            rootParameters[7].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParameters[8].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameters[8].Descriptor.ShaderRegister = 30;
+            rootParameters[8].Descriptor.RegisterSpace = 0;
+            rootParameters[8].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParameters[9].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameters[9].Descriptor.ShaderRegister = 31;
+            rootParameters[9].Descriptor.RegisterSpace = 0;
+            rootParameters[9].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
             D3D12_ROOT_SIGNATURE_DESC rootDesc{};
             rootDesc.NumParameters =
                 static_cast<UINT>(std::size(rootParameters));
@@ -720,6 +742,66 @@ namespace ic
                     signature->GetBufferSize(),
                     IID_PPV_ARGS(&rootSignature)),
                 "Failed to create DX12 GPU frustum cull root signature.");
+            return rootSignature;
+        }
+
+        if (layout == PipelineBindingLayoutKind::GpuOcclusionValidation)
+        {
+            D3D12_ROOT_PARAMETER rootParameters[5]{};
+            rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            rootParameters[0].Descriptor.ShaderRegister = 0;
+            rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParameters[1].Descriptor.ShaderRegister = 22;
+            rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_DESCRIPTOR_RANGE hiZRange{};
+            hiZRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            hiZRange.NumDescriptors = 1;
+            hiZRange.BaseShaderRegister = 29;
+            rootParameters[2].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[2].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[2].DescriptorTable.pDescriptorRanges = &hiZRange;
+            rootParameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParameters[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+            rootParameters[3].Descriptor.ShaderRegister = 30;
+            rootParameters[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            rootParameters[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            rootParameters[4].Descriptor.ShaderRegister = 31;
+            rootParameters[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+            rootDesc.NumParameters =
+                static_cast<UINT>(std::size(rootParameters));
+            rootDesc.pParameters = rootParameters;
+
+            Microsoft::WRL::ComPtr<ID3DBlob> signature;
+            Microsoft::WRL::ComPtr<ID3DBlob> error;
+            HRESULT hr = D3D12SerializeRootSignature(
+                &rootDesc,
+                D3D_ROOT_SIGNATURE_VERSION_1,
+                &signature,
+                &error);
+            if (FAILED(hr))
+            {
+                const char* message = error
+                    ? static_cast<const char*>(error->GetBufferPointer())
+                    : "Failed to serialize DX12 GPU occlusion validation root signature.";
+                throw std::runtime_error(message);
+            }
+
+            Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+            throwIfFailed(
+                m_device->CreateRootSignature(
+                    0,
+                    signature->GetBufferPointer(),
+                    signature->GetBufferSize(),
+                    IID_PPV_ARGS(&rootSignature)),
+                "Failed to create DX12 GPU occlusion validation root signature.");
             return rootSignature;
         }
 

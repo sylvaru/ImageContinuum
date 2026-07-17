@@ -16,6 +16,7 @@
 #include "ic/renderer/dx12_backend/dx12_gpu_scene.h"
 #include "ic/renderer/dx12_backend/dx12_retirement_queue.h"
 #include "ic/renderer/dx12_backend/dx12_upload_scheduler.h"
+#include "ic/renderer/dx12_backend/dx12_gpu_profiler.h"
 #include "ic/renderer/renderer_gpu_assets.h"
 #include "ic/renderer/path_tracing/path_tracer_types.h"
 
@@ -64,6 +65,14 @@ namespace ic
         void setHiZDebugViewEnabled(bool enabled) override;
         uint32_t hiZDebugMip() const override;
         void setHiZDebugMip(uint32_t mip) override;
+        bool hiZDebugPrevious() const override;
+        void setHiZDebugPrevious(bool previous) override;
+        bool gpuOcclusionEnabled() const override;
+        void setGpuOcclusionEnabled(bool enabled) override;
+        GpuCullDebugMode gpuCullDebugMode() const override;
+        void setGpuCullDebugMode(GpuCullDebugMode mode) override;
+        GpuCullStats gpuCullStats() const override;
+        GpuCullPerformance gpuCullPerformance() const override;
         // D3D12 exposes a dedicated compute engine and the frame executor
         // submits per-queue batches to m_device.computeQueue() with per-queue
         // fence waits, so the clustered-forward light chain runs truly async
@@ -87,6 +96,28 @@ namespace ic
         // uploaded data. That wait is now correctly scoped to the graphics
         // (consumer) queue only. See DX12FrameExecutor::submitAndPresent.
         bool supportsAsyncCompute() const override { return true; }
+        void drainForSchedulingTransition() override;
+
+        std::span<const GpuPassSample> gpuPassSamples() const override
+        {
+            return m_gpuProfiler.lastFrameSamples();
+        }
+        void setGpuProfilingEnabled(bool enabled) override
+        {
+            m_gpuProfiler.setEnabled(enabled);
+            buildBackendDiagnostics();
+        }
+        bool gpuProfilingEnabled() const override
+        {
+            return m_gpuProfiler.enabled();
+        }
+
+        HiZDebugImage hiZDebugImage(bool previous, uint32_t mip) override;
+        BackendDiagnosticInfo backendDiagnostics() const override;
+        RendererPerformanceCounters performanceCounters() const override
+        {
+            return m_performanceCounters;
+        }
 
         DX12ResourceAllocator& resourceAllocator()
         {
@@ -393,7 +424,9 @@ namespace ic
             ID3D12GraphicsCommandList4* cmd);
         void ensureDepthTarget();
         void destroyDepthTarget();
-        void drawHiZDebugWindow();
+        // Fills the diagnostic feature/limit tables once at init so
+        // backendDiagnostics() is a free span read per frame.
+        void buildBackendDiagnostics();
         void ensureComputeTestBuffer();
         void ensureClusteredForwardResources();
         bool bindClusteredForwardCompute(
@@ -465,6 +498,7 @@ namespace ic
             D3D12_RESOURCE_STATE_COMMON;
         ClusteredForwardResources m_clusteredForwardResources;
         std::mutex m_clusteredForwardResourcesMutex;
+        GpuOcclusionHistoryState m_gpuOcclusionHistory;
         PathTraceResources m_pathTraceResources;
         EnvironmentResources m_environmentResources;
 
@@ -488,6 +522,24 @@ namespace ic
         bool m_imguiFrameActive = false;
         bool m_clusteredForwardHeatmapEnabled = false;
         bool m_hiZDebugViewEnabled = false;
+        bool m_hiZDebugPrevious = false;
+        bool m_gpuOcclusionEnabled = true;
+        GpuCullDebugMode m_gpuCullDebugMode = GpuCullDebugMode::Off;
+        GpuCullStats m_gpuCullStats = {};
+        GpuCullPerformance m_gpuCullPerformance = {};
+        uint64_t m_gpuCullDiagnosticFrames = 0;
+        Microsoft::WRL::ComPtr<ID3D12QueryHeap> m_gpuCullTimestampHeap;
+        DX12Buffer m_gpuCullTimestampReadback;
+        std::vector<double> m_gpuCullCpuRecordMilliseconds;
+        std::vector<uint8_t> m_gpuCullTimestampValid;
+        uint64_t m_gpuCullTimestampFrequency = 0;
+        DX12GpuProfiler m_gpuProfiler;
+        std::vector<ID3D12CommandList*> m_frameCommandLists;
+        RendererPerformanceCounters m_performanceCounters{};
+        // Built once at init; backendDiagnostics() returns spans into these.
+        std::string m_diagnosticAdapterName;
+        std::vector<BackendFeature> m_diagnosticFeatures;
+        std::vector<BackendLimit> m_diagnosticLimits;
         uint32_t m_hiZDebugMip = 0;
         std::string m_imguiIniPath;
 	};

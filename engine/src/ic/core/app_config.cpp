@@ -256,6 +256,26 @@ namespace
 
         throw std::runtime_error("Unknown render path: " + value);
     }
+
+    ic::GpuCullDebugMode parseGpuCullDebugMode(std::string value)
+    {
+        value = lower(std::move(value));
+        if (value == "off")
+        {
+            return ic::GpuCullDebugMode::Off;
+        }
+        if (value == "statistics" || value == "stats")
+        {
+            return ic::GpuCullDebugMode::Statistics;
+        }
+        if (value == "classification" ||
+            value == "classification_view")
+        {
+            return ic::GpuCullDebugMode::Classification;
+        }
+        throw std::runtime_error(
+            "Unknown GPU cull debug mode: " + value);
+    }
 }
 
 namespace ic
@@ -394,6 +414,17 @@ namespace ic
                     *renderer,
                     "target_fps",
                     config.app.rendererSpec.settings.targetFps);
+            config.app.rendererSpec.settings.gpuOcclusion =
+                boolOr(
+                    *renderer,
+                    "gpu_occlusion",
+                    config.app.rendererSpec.settings.gpuOcclusion);
+            if (const std::optional<std::string> debugMode =
+                (*renderer)["gpu_cull_debug"].value<std::string>())
+            {
+                config.app.rendererSpec.settings.gpuCullDebugMode =
+                    parseGpuCullDebugMode(*debugMode);
+            }
             if (const toml::table* environment =
                     renderer->get_as<toml::table>("environment"))
             {

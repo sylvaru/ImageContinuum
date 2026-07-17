@@ -4,6 +4,7 @@
 #include <span>
 #include <vector>
 
+#include "gpu_queue_profiler.h"
 #include "ibl_baker.h"
 #include "render_handles.h"
 
@@ -18,6 +19,54 @@ namespace ic
 
     class PipelineLibrary;
     class Window;
+
+    // A Hi-Z pyramid mip, addressed as an ImGui-drawable handle. Kept
+    // API-neutral so the diagnostics window can show the pyramid without
+    // knowing which backend produced it.
+    struct HiZDebugImage
+    {
+        uint64_t textureId = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t mipLevels = 0;
+        bool valid = false;
+    };
+
+    // One backend feature and whether it is actually in use, as opposed to
+    // merely advertised by the device -- the distinction that matters when
+    // explaining why a path behaves differently on two machines.
+    struct BackendFeature
+    {
+        const char* name = "";
+        bool enabled = false;
+        // Optional note, e.g. why an advertised feature is disabled.
+        const char* detail = "";
+    };
+
+    struct BackendLimit
+    {
+        const char* name = "";
+        uint64_t value = 0;
+    };
+
+    struct BackendDiagnosticInfo
+    {
+        const char* backendName = "";
+        const char* adapterName = "";
+        std::span<const BackendFeature> features;
+        std::span<const BackendLimit> limits;
+    };
+
+    struct RendererPerformanceCounters
+    {
+        double backendCpuMs = 0.0;
+        double frameSlotWaitMs = 0.0;
+        double profilerReadbackMs = 0.0;
+        double graphRecordMs = 0.0;
+        double uiRecordMs = 0.0;
+        double validationMs = 0.0;
+        double submitPresentMs = 0.0;
+    };
 
     // The authoritative render surface for a frame: the backend's swapchain
     // framebuffer extent plus a generation that increments on every swapchain
@@ -126,6 +175,42 @@ namespace ic
         {
         }
 
+        virtual bool hiZDebugPrevious() const
+        {
+            return false;
+        }
+
+        virtual void setHiZDebugPrevious(bool)
+        {
+        }
+
+        virtual bool gpuOcclusionEnabled() const
+        {
+            return true;
+        }
+
+        virtual void setGpuOcclusionEnabled(bool)
+        {
+        }
+
+        virtual GpuCullDebugMode gpuCullDebugMode() const
+        {
+            return GpuCullDebugMode::Off;
+        }
+
+        virtual void setGpuCullDebugMode(GpuCullDebugMode)
+        {
+        }
+
+        virtual GpuCullStats gpuCullStats() const
+        {
+            return {};
+        }
+        virtual GpuCullPerformance gpuCullPerformance() const
+        {
+            return {};
+        }
+
         // Reports whether this backend can dispatch frame-graph compute passes on
         // a dedicated async queue that overlaps graphics work. When false, the
         // renderer keeps every compute pass on the graphics queue regardless of
@@ -134,6 +219,63 @@ namespace ic
         virtual bool supportsAsyncCompute() const
         {
             return false;
+        }
+
+        // Queue assignment is part of the compiled schedule. Before replacing
+        // that schedule, the renderer calls this once so submissions made with
+        // the old assignment can no longer reference its resources or sync
+        // topology. This is deliberately not part of the per-frame path.
+        virtual void drainForSchedulingTransition()
+        {
+        }
+
+        // Per-pass GPU timestamps for the most recently completed frame, in a
+        // single CPU-millisecond domain shared by every queue. Empty when the
+        // backend has no timestamp support or profiling is off.
+        //
+        // This is the measured ground truth behind the async-compute decision:
+        // whether a compute pass overlapped graphics can only be answered by
+        // timestamps, never by the graph's structure (a pass scheduled on the
+        // compute queue may still run entirely serialized against graphics).
+        virtual std::span<const GpuPassSample> gpuPassSamples() const
+        {
+            return {};
+        }
+
+        virtual void setGpuProfilingEnabled(bool)
+        {
+        }
+
+        [[nodiscard]] virtual bool gpuProfilingEnabled() const
+        {
+            return false;
+        }
+
+        // The Hi-Z pyramid mip as something ImGui can draw. Returning a handle
+        // rather than drawing a window keeps the visualization inside the
+        // consolidated diagnostics window instead of a backend-owned popup,
+        // while the backend keeps ownership of the descriptor it hands out.
+        // `textureId` is whatever the backend's ImGui binding expects
+        // (D3D12 GPU descriptor handle / VkDescriptorSet).
+        virtual HiZDebugImage hiZDebugImage(
+            [[maybe_unused]] bool previous,
+            [[maybe_unused]] uint32_t mip)
+        {
+            return {};
+        }
+
+        // Static description of the device: name, and the features/limits that
+        // actually change how this renderer behaves. Backends build the storage
+        // once at init and return spans into it, so reading this per frame is
+        // free.
+        virtual BackendDiagnosticInfo backendDiagnostics() const
+        {
+            return {};
+        }
+
+        virtual RendererPerformanceCounters performanceCounters() const
+        {
+            return {};
         }
     };
 }

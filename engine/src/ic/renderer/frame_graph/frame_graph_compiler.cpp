@@ -57,6 +57,7 @@ namespace ic
             compiledNode.queue = node.graphNode.queue;
             compiledNode.type = node.graphNode.type;
             compiledNode.payloadIndex = node.graphNode.payloadIndex;
+            compiledNode.asyncEligible = node.graphNode.asyncEligible;
 
             compiledNode.firstResourceAccess = firstAccess;
             compiledNode.resourceAccessCount = accessCounts[compiledNode.nodeId];

@@ -164,6 +164,10 @@ namespace ic
         void* map(VulkanBuffer& buffer);
         void unmap(VulkanBuffer& buffer);
         void flush(VulkanBuffer& buffer, VkDeviceSize offset, VkDeviceSize size);
+        void invalidate(
+            VulkanBuffer& buffer,
+            VkDeviceSize offset,
+            VkDeviceSize size);
 
         VmaAllocator allocator() const
         {

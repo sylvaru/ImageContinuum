@@ -84,6 +84,30 @@ namespace ic
         return InvalidGraphResourceId;
     }
 
+    [[nodiscard]] inline GraphResourceId findPreviousNodeResource(
+        const CompiledGraphPlan& plan,
+        const ExecutionNode& node,
+        ResourceUsage usage) noexcept
+    {
+        const std::size_t first = node.firstResourceAccess;
+        const std::size_t count = node.resourceAccessCount;
+        if (first > plan.resourceAccesses.size() ||
+            count > plan.resourceAccesses.size() - first)
+        {
+            return InvalidGraphResourceId;
+        }
+
+        for (const ResourceAccess& access :
+             plan.resourceAccesses.subspan(first, count))
+        {
+            if (access.previousVersion && access.usage == usage)
+            {
+                return access.resource;
+            }
+        }
+        return InvalidGraphResourceId;
+    }
+
     // Resolves the single graph resource carrying the given semantic. Backends
     // use this to bind the frame-graph-owned (registry) resource instead of a
     // duplicate backend-managed buffer, so the graph's barrier/queue machinery

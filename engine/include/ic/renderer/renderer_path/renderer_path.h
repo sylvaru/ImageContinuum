@@ -34,6 +34,7 @@ namespace ic
         // can honor it unconditionally. When false, every compute pass stays on
         // the graphics queue and behavior matches the serial baseline.
         bool asyncComputeEnabled = false;
+        bool occlusionDiagnosticsEnabled = false;
 	};
 
 	class RendererPath

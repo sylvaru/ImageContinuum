@@ -16,7 +16,7 @@ path = "ClusteredForward"
 validation = true
 debug_gui = true
 vsync = true
-target_fps = 500.0
+target_fps = 0.0
 frames_in_flight = 2
 pipeline_library = "demo/res/pipelines/clustered_forward.toml"
 

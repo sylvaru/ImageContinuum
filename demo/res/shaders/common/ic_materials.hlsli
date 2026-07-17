@@ -53,6 +53,10 @@ struct DrawMetadata
     uint pipelineBinIndex;
     uint materialBinIndex;
     uint geometryBinIndex;
+    uint cullState;
+    uint padding0;
+    uint padding1;
+    uint padding2;
 };
 
 StructuredBuffer<ObjectData> gObjects : register(t0, space0);
@@ -82,7 +86,40 @@ DrawMetadata resolveDrawMetadata(uint instanceId)
     result.materialIndex = gDraw.materialIndex;
     result.transformIndex = gDraw.objectIndex;
     result.instanceIndex = gDraw.objectIndex;
+    result.cullState = gDraw.flags;
     return result;
+}
+
+float4 cullDebugColor(uint cullState)
+{
+    if (cullState == 1u)
+    {
+        return float4(0.15f, 0.35f, 1.0f, 1.0f);
+    }
+    if (cullState == 2u)
+    {
+        return float4(1.0f, 0.12f, 0.08f, 1.0f);
+    }
+    if (cullState == 3u)
+    {
+        return float4(1.0f, 0.78f, 0.05f, 1.0f);
+    }
+    return float4(0.1f, 0.95f, 0.25f, 1.0f);
+}
+
+float4 cullDebugPosition(float4 clipPosition, uint cullState)
+{
+    // Reveal rejected silhouettes through their occluders in the debug-only
+    // classification view. Normal rendering keeps the original depth.
+    if (gFrame.occlusionDebugConfig.x == 2u &&
+        (cullState == 1u || cullState == 2u))
+    {
+        clipPosition.z =
+            gFrame.renderExtentAndHiZ.w != 0u
+                ? clipPosition.w
+                : 0.0f;
+    }
+    return clipPosition;
 }
 
 #endif

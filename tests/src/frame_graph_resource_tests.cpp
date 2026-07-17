@@ -5,6 +5,7 @@
 #include "ic/renderer/frame_graph/frame_graph_builder.h"
 #include "ic/renderer/frame_graph/frame_graph_compiler.h"
 #include "ic/renderer/gpu_driven_submission.h"
+#include "ic/renderer/renderer_common/renderer_util.h"
 
 #include <spdlog/spdlog.h>
 
@@ -226,6 +227,9 @@ namespace
         return n;
     }
 
+    const CrossFrameDependency* findCrossFrame(
+        const CompiledGraphPlan& plan, GraphResourceId resource);
+
     void testGpuDrivenBuffersAreGraphOwned()
     {
         std::pmr::monotonic_buffer_resource mem;
@@ -289,6 +293,189 @@ namespace
         // serialization: consecutive frames use distinct ring instances.
         check(plan.crossFrameDependencies.empty(),
             "per-frame-slot GPU-driven graph creates no cross-frame dependency");
+    }
+
+    void testGpuCullReadsPreviousHiZ()
+    {
+        std::pmr::monotonic_buffer_resource mem;
+        FrameGraphBuilder builder(&mem);
+
+        const GraphResourceId hiZ = builder.createHistoryTexture({
+            .width = 128,
+            .height = 64,
+            .mipLevels = 8,
+            .format = TextureFormat::R32_Float,
+            .usage =
+                TextureUsageFlags::Sampled |
+                TextureUsageFlags::Storage,
+            .debugName = "Test.GpuCullHiZ" });
+        const GpuDrivenGraphResources resources =
+            declareGpuDrivenResources(builder);
+        const GraphNodeId cull =
+            addGpuDrivenCullPasses(builder, resources, hiZ);
+        const GraphNodeId build = builder.addComputePass("BuildCurrentHiZ");
+        builder.write(build, hiZ, ResourceUsage::StorageTexture);
+
+        FrameGraphCompiler compiler(&mem);
+        const CompiledGraphPlan plan = compiler.compile(builder);
+
+        check(plan.resources[hiZ].multiplicity ==
+                  ResourceMultiplicity::History,
+            "GPU occlusion pyramid is a history resource");
+        check(findPreviousNodeResource(
+                  plan, plan.nodes[cull], ResourceUsage::SampledTexture) ==
+                  hiZ,
+            "GPU cull explicitly reads the previous Hi-Z instance");
+        check(!hasDependencyEdge(plan, build, cull),
+            "previous Hi-Z read does not depend on the current-frame build");
+
+        const CrossFrameDependency* dep = findCrossFrame(plan, hiZ);
+        check(dep != nullptr,
+            "previous Hi-Z cull emits a precise cross-frame edge");
+        if (dep)
+        {
+            check(dep->consumerNode == cull,
+                "previous Hi-Z cross-frame consumer is the cull pass");
+        }
+    }
+
+    void testGpuCullDiagnosticsAreExplicitAndOptional()
+    {
+        {
+            std::pmr::monotonic_buffer_resource mem;
+            FrameGraphBuilder builder(&mem);
+            const GpuDrivenGraphResources resources =
+                declareGpuDrivenResources(builder, false);
+
+            check(resources.cullStatsReadback == InvalidGraphResourceId,
+                "disabled diagnostics allocate no readback buffer");
+            check(builder.resources()[resources.cullClassification]
+                      .bufferDesc.size == sizeof(uint32_t),
+                "disabled diagnostics keep only a bound classification placeholder");
+        }
+
+        std::pmr::monotonic_buffer_resource mem;
+        FrameGraphBuilder builder(&mem);
+        const GraphResourceId hiZ = builder.createHistoryTexture({
+            .width = 128,
+            .height = 64,
+            .mipLevels = 8,
+            .format = TextureFormat::R32_Float,
+            .usage =
+                TextureUsageFlags::Sampled |
+                TextureUsageFlags::Storage,
+            .debugName = "Test.DiagnosticsHiZ" });
+        const GpuDrivenGraphResources resources =
+            declareGpuDrivenResources(builder, true);
+        addGpuDrivenCullPasses(builder, resources, hiZ);
+        builder.addComputePass("BuildCurrentHiZ")
+            .write(hiZ, ResourceUsage::StorageTexture);
+        addGpuDrivenOcclusionValidationPasses(
+            builder, resources, hiZ, QueueType::Compute);
+
+        FrameGraphCompiler compiler(&mem);
+        const CompiledGraphPlan plan = compiler.compile(builder);
+        const GraphResourceId readback = findResourceBySemantic(
+            plan, GraphResourceSemantic::GpuDrivenCullStatsReadback);
+        check(readback != InvalidGraphResourceId,
+            "enabled diagnostics declare a graph-owned stats readback");
+        if (readback != InvalidGraphResourceId)
+        {
+            check(plan.resources[readback].bufferDesc.memoryUsage ==
+                      ResourceMemoryUsage::GpuToCpu,
+                "diagnostic readback uses GPU-to-CPU memory");
+            check(plan.resources[readback].multiplicity ==
+                      ResourceMultiplicity::PerFrameSlot,
+                "diagnostic readback follows frame-slot lifetime rules");
+        }
+
+        bool foundValidation = false;
+        bool foundReadback = false;
+        for (const ExecutionNode& node : plan.nodes)
+        {
+            const auto& payload = plan.payloads[node.payloadIndex];
+            if (const auto* compute = std::get_if<ComputePassData>(&payload))
+            {
+                foundValidation |=
+                    compute->name == "ValidateGpuOcclusion";
+            }
+            else if (const auto* transfer =
+                         std::get_if<TransferPassData>(&payload))
+            {
+                foundReadback |=
+                    transfer->name == "ReadbackGpuCullStats";
+            }
+        }
+        check(foundValidation,
+            "enabled diagnostics add the focused validation pass");
+        check(foundReadback,
+            "enabled diagnostics add the focused readback pass");
+    }
+
+    void testOcclusionHistoryReliabilityFallbacks()
+    {
+        GpuOcclusionHistoryState history{};
+        SceneRenderView scene{};
+        scene.sceneVersion = 7;
+        scene.camera.valid = 1;
+        scene.camera.position = glm::vec3(0.0f, 1.0f, 5.0f);
+        scene.camera.nearPlane = 0.1f;
+        scene.camera.farPlane = 1000.0f;
+        scene.camera.verticalFovRadians = glm::radians(70.0f);
+        scene.camera.aspectRatio = 16.0f / 9.0f;
+        scene.camera.view = glm::lookAtRH(
+            scene.camera.position,
+            glm::vec3(0.0f, 1.0f, 0.0f),
+            glm::vec3(0.0f, 1.0f, 0.0f));
+
+        auto projection = [&]()
+        {
+            return glm::perspectiveRH_ZO(
+                scene.camera.verticalFovRadians,
+                scene.camera.aspectRatio,
+                scene.camera.nearPlane,
+                scene.camera.farPlane);
+        };
+        GpuFrameData frame{};
+
+        check(!updateGpuOcclusionHistory(
+                  history, scene, 1920, 1080,
+                  scene.camera.view, projection(), frame),
+            "first frame falls back to frustum-only culling");
+        check(updateGpuOcclusionHistory(
+                  history, scene, 1920, 1080,
+                  scene.camera.view, projection(), frame),
+            "stable history enables previous-Hi-Z occlusion");
+
+        scene.camera.verticalFovRadians = glm::radians(75.0f);
+        check(!updateGpuOcclusionHistory(
+                  history, scene, 1920, 1080,
+                  scene.camera.view, projection(), frame),
+            "projection change invalidates occlusion history");
+        check(updateGpuOcclusionHistory(
+                  history, scene, 1920, 1080,
+                  scene.camera.view, projection(), frame),
+            "history recovers after one frame at the new projection");
+
+        scene.camera.position.x += 2.0f;
+        scene.camera.view = glm::lookAtRH(
+            scene.camera.position,
+            glm::vec3(0.0f, 1.0f, 0.0f),
+            glm::vec3(0.0f, 1.0f, 0.0f));
+        check(!updateGpuOcclusionHistory(
+                  history, scene, 1920, 1080,
+                  scene.camera.view, projection(), frame),
+            "camera cut invalidates occlusion history");
+        check(!updateGpuOcclusionHistory(
+                  history, scene, 1280, 720,
+                  scene.camera.view, projection(), frame),
+            "extent change invalidates occlusion history");
+
+        ++scene.sceneVersion;
+        check(!updateGpuOcclusionHistory(
+                  history, scene, 1280, 720,
+                  scene.camera.view, projection(), frame),
+            "scene change invalidates occlusion history");
     }
 
     // ---- Cross-frame dependency generation (multi-frame pipelining) --------
@@ -437,6 +624,9 @@ int runFrameGraphResourceTests()
     testCurrentReadCreatesDependency();
     testMixedVersionGraphIsAcyclic();
     testGpuDrivenBuffersAreGraphOwned();
+    testGpuCullReadsPreviousHiZ();
+    testGpuCullDiagnosticsAreExplicitAndOptional();
+    testOcclusionHistoryReliabilityFallbacks();
     testPerFrameSlotHasNoCrossFrameDependency();
     testPersistentWriteEmitsCrossFrameEdge();
     testReadOnlyPersistentHasNoCrossFrameEdge();

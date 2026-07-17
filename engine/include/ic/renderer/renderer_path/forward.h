@@ -13,7 +13,7 @@ namespace ic
 
         GraphResourceId backBuffer;
         GraphResourceId sceneDepth;
-        //GraphResourceId visibilityBuffer;
+        GraphResourceId depthPyramid;
         GraphResourceId environmentCubemap;
         GpuDrivenGraphResources gpuDriven;
 
@@ -23,6 +23,10 @@ namespace ic
         {
             uint32_t renderWidth = ctx.renderExtent.width;
             uint32_t renderHeight = ctx.renderExtent.height;
+            const uint32_t hiZMipCount =
+                1 + static_cast<uint32_t>(
+                    std::floor(std::log2(
+                        std::max(renderWidth, renderHeight))));
 
             // Resources
             backBuffer = builder.importTexture({
@@ -41,6 +45,18 @@ namespace ic
                     TextureUsageFlags::Sampled,
                     .debugName = "Forward.SceneDepth"
                 });
+            depthPyramid = builder.createHistoryTexture({
+                .width = renderWidth,
+                .height = renderHeight,
+                .depth = 1,
+                .mipLevels = hiZMipCount,
+                .arrayLayers = 1,
+                .format = TextureFormat::R32_Float,
+                .usage =
+                    TextureUsageFlags::Sampled |
+                    TextureUsageFlags::Storage,
+                .debugName = "Forward.DepthPyramid"
+                });
 
             environmentCubemap = builder.createTexture({
                 .width = 512,
@@ -56,14 +72,28 @@ namespace ic
                 .debugName = "Environment.SkyboxCubemap"
                 });
 
-            gpuDriven = declareGpuDrivenResources(builder);
-            addGpuDrivenCullPasses(builder, gpuDriven);
+            gpuDriven = declareGpuDrivenResources(
+                builder, ctx.occlusionDiagnosticsEnabled);
+            addGpuDrivenCullPasses(builder, gpuDriven, depthPyramid);
 
             auto depthNode = builder.addGraphicsPass("DepthPrepass")
                 .pipeline("depth_prepass")
                 .drawList(DrawListKind::SceneGeometry)
                 .depth(sceneDepth);
             readGpuDrivenStream(builder, depthNode, gpuDriven);
+
+            builder.addComputePass("BuildHiZ")
+                .pipeline("build_hiz")
+                .dispatch((renderWidth + 7) / 8, (renderHeight + 7) / 8, 1)
+                .read(sceneDepth, ResourceUsage::SampledTexture)
+                .write(depthPyramid, ResourceUsage::StorageTexture);
+            addGpuDrivenOcclusionValidationPasses(
+                builder,
+                gpuDriven,
+                depthPyramid,
+                ctx.asyncComputeEnabled
+                    ? QueueType::Compute
+                    : QueueType::Graphics);
 
             auto forwardNode = builder.addGraphicsPass("ForwardOpaque")
                 .pipeline("forward_bindless")

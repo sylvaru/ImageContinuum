@@ -159,6 +159,44 @@ namespace ic
                 instances.slots.resize(desiredCount);
             }
 
+            // A previous-version read must always have a bindable physical
+            // image, including frame zero. Eagerly materialize the history ring;
+            // validity remains a separate frame-constant decision, so the
+            // undefined contents are never sampled until a prior write exists.
+            if (resource.multiplicity == ResourceMultiplicity::History &&
+                resource.ownership != ResourceOwnership::Imported)
+            {
+                const TextureDesc resolvedHistoryTexture =
+                    resource.type == GraphResourceType::Texture
+                        ? resolvedTextureDesc(
+                            resource.textureDesc,
+                            defaultWidth,
+                            defaultHeight)
+                        : TextureDesc{};
+                for (DX12GraphResourceEntry& historyEntry : instances.slots)
+                {
+                    if (entryMatches(
+                            historyEntry, resource, resolvedHistoryTexture))
+                    {
+                        historyEntry.id = resource.id;
+                        historyEntry.type = resource.type;
+                        historyEntry.ownership = resource.ownership;
+                        historyEntry.imported = resource.imported;
+                        continue;
+                    }
+                    retireEntry(
+                        std::exchange(
+                            historyEntry, DX12GraphResourceEntry{}),
+                        frameSlot);
+                    historyEntry.id = resource.id;
+                    historyEntry.type = resource.type;
+                    historyEntry.ownership = resource.ownership;
+                    historyEntry.imported = resource.imported;
+                    materializeTransient(
+                        historyEntry, resource, resolvedHistoryTexture);
+                }
+            }
+
             // Only the current frame slot's instance is (re)materialized here;
             // the other slots are materialized when their own frame comes round.
             const uint32_t index = currentInstanceIndex(instances);
@@ -394,6 +432,24 @@ namespace ic
         }
         if (hasFlag(desc.usage, TextureUsageFlags::Sampled))
         {
+            if (desc.mipLevels > 1)
+            {
+                entry.fullSrv =
+                    m_descriptorSystem->allocateResourceDescriptors(1);
+                D3D12_SHADER_RESOURCE_VIEW_DESC fullSrv{};
+                fullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                fullSrv.Format = desc.format == TextureFormat::D32_Float
+                    ? DXGI_FORMAT_R32_FLOAT
+                    : entry.texture.desc.Format;
+                fullSrv.Shader4ComponentMapping =
+                    D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                fullSrv.Texture2D.MostDetailedMip = 0;
+                fullSrv.Texture2D.MipLevels = desc.mipLevels;
+                m_device->CreateShaderResourceView(
+                    entry.texture.resource.Get(),
+                    &fullSrv,
+                    entry.fullSrv.cpuStart);
+            }
             entry.mipSrvs.resize(desc.mipLevels);
             for (uint32_t mip = 0; mip < desc.mipLevels; ++mip)
             {
@@ -474,7 +530,8 @@ namespace ic
     {
         // Nothing owned means nothing to defer.
         if (!entry.texture && !entry.buffer && !entry.rtv.valid() &&
-            !entry.dsv.valid() && entry.mipSrvs.empty() &&
+            !entry.dsv.valid() && !entry.fullSrv.valid() &&
+            entry.mipSrvs.empty() &&
             entry.mipUavs.empty())
         {
             return;
@@ -505,6 +562,7 @@ namespace ic
         {
             m_descriptorSystem->releaseRTV(entry.rtv);
             m_descriptorSystem->releaseDSV(entry.dsv);
+            m_descriptorSystem->releaseResourceDescriptors(entry.fullSrv);
             for (DX12DescriptorAllocation& allocation : entry.mipSrvs)
             {
                 m_descriptorSystem->releaseResourceDescriptors(allocation);
@@ -516,6 +574,7 @@ namespace ic
         }
         entry.rtv = {};
         entry.dsv = {};
+        entry.fullSrv = {};
         entry.mipSrvs.clear();
         entry.mipUavs.clear();
     }

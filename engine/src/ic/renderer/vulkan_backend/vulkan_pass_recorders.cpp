@@ -297,12 +297,14 @@ namespace ic
         const VulkanComputePipeline& pipeline,
         const VulkanCullBuffers& buffers)
     {
-        VkDescriptorPoolSize poolSizes[2]{};
+        VkDescriptorPoolSize poolSizes[3]{};
         constexpr uint32_t kMaxGpuCullDescriptorSets = 4;
         poolSizes[0] =
             { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kMaxGpuCullDescriptorSets };
         poolSizes[1] =
-            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxGpuCullDescriptorSets * 7u };
+            { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kMaxGpuCullDescriptorSets * 9u };
+        poolSizes[2] =
+            { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kMaxGpuCullDescriptorSets };
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -362,6 +364,15 @@ namespace ic
         VkDescriptorBufferInfo binCountInfo{};
         binCountInfo.buffer = buffers.binCounts;
         binCountInfo.range = buffers.binCountsSize;
+        VkDescriptorBufferInfo classificationInfo{};
+        classificationInfo.buffer = buffers.cullClassification;
+        classificationInfo.range = buffers.cullClassificationSize;
+        VkDescriptorBufferInfo statsInfo{};
+        statsInfo.buffer = buffers.cullStats;
+        statsInfo.range = buffers.cullStatsSize;
+        VkDescriptorImageInfo previousHiZInfo{};
+        previousHiZInfo.imageView = buffers.previousHiZ;
+        previousHiZInfo.imageLayout = buffers.previousHiZLayout;
 
         VkDescriptorBufferInfo* infos[] =
         {
@@ -372,11 +383,14 @@ namespace ic
             &drawInputInfo,
             &indirectInfo,
             &metadataInfo,
-            &binCountInfo
+            &binCountInfo,
+            &statsInfo,
+            &classificationInfo
         };
 
-        VkWriteDescriptorSet writes[8]{};
-        const uint32_t bindings[] = { 0u, 22u, 23u, 24u, 25u, 26u, 27u, 28u };
+        VkWriteDescriptorSet writes[11]{};
+        const uint32_t bindings[] =
+            { 0u, 22u, 23u, 24u, 25u, 26u, 27u, 28u, 30u, 31u, 29u };
         const VkDescriptorType types[] =
         {
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
@@ -386,9 +400,12 @@ namespace ic
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
         };
-        for (uint32_t i = 0; i < 8u; ++i)
+        for (uint32_t i = 0; i < 10u; ++i)
         {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[i].dstSet = descriptorSet;
@@ -397,7 +414,19 @@ namespace ic
             writes[i].descriptorType = types[i];
             writes[i].pBufferInfo = infos[i];
         }
-        vkUpdateDescriptorSets(ctx.device, 8, writes, 0, nullptr);
+        uint32_t writeCount = 10u;
+        if (buffers.previousHiZ != VK_NULL_HANDLE)
+        {
+            writes[10].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[10].dstSet = descriptorSet;
+            writes[10].dstBinding = bindings[10];
+            writes[10].descriptorCount = 1;
+            writes[10].descriptorType = types[10];
+            writes[10].pImageInfo = &previousHiZInfo;
+            writeCount = 11u;
+        }
+        vkUpdateDescriptorSets(
+            ctx.device, writeCount, writes, 0, nullptr);
 
         vkCmdBindDescriptorSets(
             ctx.cmd,
@@ -409,6 +438,77 @@ namespace ic
             0,
             nullptr);
 
+        return true;
+    }
+
+    bool recordGpuOcclusionValidation(
+        const VulkanPassContext& ctx,
+        const VulkanComputePipeline& pipeline,
+        const VulkanOcclusionValidationInputs& inputs)
+    {
+        if (!inputs.descriptorPool ||
+            inputs.currentHiZ == VK_NULL_HANDLE)
+        {
+            return false;
+        }
+
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo allocate{};
+        allocate.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        allocate.descriptorPool = *inputs.descriptorPool;
+        allocate.descriptorSetCount = 1;
+        allocate.pSetLayouts = &pipeline.descriptorSetLayout;
+        if (vkAllocateDescriptorSets(
+                ctx.device, &allocate, &set) != VK_SUCCESS)
+        {
+            return false;
+        }
+
+        VkDescriptorBufferInfo frame{
+            inputs.frameConstants, 0, sizeof(GpuFrameData) };
+        VkDescriptorBufferInfo bounds{
+            inputs.instanceBounds, 0, inputs.instanceBoundsSize };
+        VkDescriptorBufferInfo stats{
+            inputs.cullStats, 0, inputs.cullStatsSize };
+        VkDescriptorBufferInfo classification{
+            inputs.cullClassification, 0,
+            inputs.cullClassificationSize };
+        VkDescriptorImageInfo hiZ{};
+        hiZ.imageView = inputs.currentHiZ;
+        hiZ.imageLayout = inputs.currentHiZLayout;
+
+        VkWriteDescriptorSet writes[5]{};
+        const uint32_t bindings[] = { 0u, 22u, 29u, 30u, 31u };
+        const VkDescriptorType types[] = {
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
+        VkDescriptorBufferInfo* bufferInfos[] = {
+            &frame, &bounds, nullptr, &stats, &classification };
+        for (uint32_t i = 0; i < 5u; ++i)
+        {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = set;
+            writes[i].dstBinding = bindings[i];
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = types[i];
+            if (i == 2u)
+            {
+                writes[i].pImageInfo = &hiZ;
+            }
+            else
+            {
+                writes[i].pBufferInfo = bufferInfos[i];
+            }
+        }
+        vkUpdateDescriptorSets(ctx.device, 5, writes, 0, nullptr);
+        vkCmdBindDescriptorSets(
+            ctx.cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.pipelineLayout,
+            0, 1, &set, 0, nullptr);
         return true;
     }
 

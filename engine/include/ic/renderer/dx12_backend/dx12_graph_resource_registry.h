@@ -36,6 +36,7 @@ namespace ic
 
         DX12DescriptorAllocation rtv;
         DX12DescriptorAllocation dsv;
+        DX12DescriptorAllocation fullSrv;
         std::vector<DX12DescriptorAllocation> mipSrvs;
         std::vector<DX12DescriptorAllocation> mipUavs;
 

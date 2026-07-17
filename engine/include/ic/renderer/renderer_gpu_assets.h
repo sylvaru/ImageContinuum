@@ -16,11 +16,28 @@ namespace ic
 
     struct FrameContext;
 
+    struct GpuOcclusionHistoryState
+    {
+        glm::mat4 view = glm::mat4(1.0f);
+        glm::mat4 viewProjection = glm::mat4(1.0f);
+        glm::vec3 cameraPosition = glm::vec3(0.0f);
+        float nearPlane = 0.0f;
+        float farPlane = 0.0f;
+        float verticalFovRadians = 0.0f;
+        float aspectRatio = 0.0f;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint64_t sceneVersion = UINT64_MAX;
+        bool valid = false;
+    };
+
     struct GpuFrameData
     {
         glm::mat4 view = glm::mat4(1.0f);
         glm::mat4 projection = glm::mat4(1.0f);
         glm::mat4 viewProjection = glm::mat4(1.0f);
+        glm::mat4 previousView = glm::mat4(1.0f);
+        glm::mat4 previousViewProjection = glm::mat4(1.0f);
 
         glm::vec3 cameraPosition = glm::vec3(0.0f);
         float time = 0.0f;
@@ -47,6 +64,8 @@ namespace ic
         glm::uvec4 renderExtentAndHiZ = glm::uvec4(0);
         glm::uvec4 cullingConfig = glm::uvec4(0);
         glm::vec4 cameraNearFar = glm::vec4(0.0f);
+        glm::vec4 occlusionConfig = glm::vec4(0.0f);
+        glm::uvec4 occlusionDebugConfig = glm::uvec4(0);
     };
 
     struct GpuObjectData

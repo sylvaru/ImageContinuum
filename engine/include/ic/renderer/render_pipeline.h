@@ -66,6 +66,7 @@ namespace ic
         ClusteredForward,
         HiZDepthPyramid,
         GpuFrustumCull,
+        GpuOcclusionValidation,
         PathTrace,
         PathTraceTonemap
     };

@@ -25,6 +25,7 @@
 #include <backends/imgui_impl_glfw.h>
 
 #include <stdexcept>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 
@@ -65,7 +66,12 @@ namespace ic
     {
         spdlog::info("[DX12Backend] Initializing...");
 
-        m_factory.init(spec.enableValidation);
+#ifdef IC_DEBUG
+        constexpr bool validationAvailable = true;
+#else
+        constexpr bool validationAvailable = false;
+#endif
+        m_factory.init(spec.enableValidation && validationAvailable);
         m_adapter.init(m_factory);
         m_device.init(m_adapter, m_factory.validationEnabled());
         m_resourceAllocator.init(m_device);
@@ -94,6 +100,35 @@ namespace ic
         m_lastFramebufferHeight = m_swapchain.height();
 
         m_frameExecutor.init(m_device, m_swapchain, framesInFlight);
+
+        D3D12_QUERY_HEAP_DESC timestampHeapDesc{};
+        timestampHeapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        timestampHeapDesc.Count = framesInFlight * 2u;
+        throwIfFailed(
+            m_device.device()->CreateQueryHeap(
+                &timestampHeapDesc,
+                IID_PPV_ARGS(&m_gpuCullTimestampHeap)),
+            "Failed to create DX12 GPU-cull timestamp heap.");
+        m_gpuCullTimestampReadback = m_resourceAllocator.createBuffer({
+            .size = sizeof(uint64_t) * framesInFlight * 2u,
+            .usage = BufferUsageFlags::TransferDst,
+            .memoryUsage = ResourceMemoryUsage::GpuToCpu,
+            .mappedAtCreation = true,
+            .debugName = "GPU cull timestamp readback"
+        });
+        throwIfFailed(
+            m_device.graphicsQueue()->GetTimestampFrequency(
+                &m_gpuCullTimestampFrequency),
+            "Failed to query DX12 compute timestamp frequency.");
+        m_gpuCullCpuRecordMilliseconds.assign(framesInFlight, 0.0);
+        m_gpuCullTimestampValid.assign(framesInFlight, uint8_t{0});
+
+        // Budget covers every pass of the largest demo graph with headroom;
+        // passes beyond it simply record untimed rather than failing.
+        m_gpuProfiler.init(
+            m_device, m_resourceAllocator, framesInFlight, 128u);
+
+        buildBackendDiagnostics();
 
         m_commandSystem.init(
             m_device.device(),
@@ -141,6 +176,9 @@ namespace ic
         destroyEnvironmentResources();
         destroyClusteredForwardResources();
         destroyPathTraceResources();
+        m_gpuProfiler.shutdown();
+        m_gpuCullTimestampHeap.Reset();
+        m_resourceAllocator.destroyBuffer(m_gpuCullTimestampReadback);
         m_graphResourceRegistry.shutdown();
         m_frameExecutor.shutdown();
         m_pipelineManager.shutdown();
@@ -153,6 +191,14 @@ namespace ic
         m_factory.shutdown();
 
         spdlog::info("[DX12Backend] Shutdown");
+    }
+
+    void DX12Backend::drainForSchedulingTransition()
+    {
+        // Rare control-plane transition only. Waiting all frame slots here is
+        // required because the replacement graph may move resource accesses
+        // and cross-frame edges to a different queue.
+        m_frameExecutor.waitForGpu();
     }
 
     RenderSurfaceState DX12Backend::reconcileRenderSurface()
@@ -201,6 +247,8 @@ namespace ic
         const FrameContext& ctx,
         const SceneRenderView& scene)
     {
+        m_performanceCounters = {};
+        const auto backendStart = std::chrono::steady_clock::now();
         if (!m_frameExecutor.ready())
         {
             return false;
@@ -210,7 +258,30 @@ namespace ic
             static_cast<uint32_t>(
                 ctx.frameIndex % m_frameExecutor.framesInFlight());
 
+        const auto waitStart = std::chrono::steady_clock::now();
         m_frameExecutor.waitForFrame(frameSlot);
+        m_performanceCounters.frameSlotWaitMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - waitStart).count();
+        // Safe only after the slot's fence wait above: this reads back the
+        // timestamps recorded into this slot framesInFlight frames ago.
+        const auto profilerStart = std::chrono::steady_clock::now();
+        m_gpuProfiler.beginFrame(frameSlot);
+        m_performanceCounters.profilerReadbackMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - profilerStart).count();
+        if (m_gpuCullTimestampValid[frameSlot] != 0u &&
+            m_gpuCullTimestampReadback.mapped &&
+            m_gpuCullTimestampFrequency != 0)
+        {
+            const auto* timestamps = static_cast<const uint64_t*>(
+                m_gpuCullTimestampReadback.mapped) + frameSlot * 2u;
+            m_gpuCullPerformance.gpuMilliseconds =
+                static_cast<double>(timestamps[1] - timestamps[0]) *
+                1000.0 / static_cast<double>(m_gpuCullTimestampFrequency);
+            m_gpuCullPerformance.cpuRecordMilliseconds =
+                m_gpuCullCpuRecordMilliseconds[frameSlot];
+        }
         m_retirementQueue.beginFrame(frameSlot);
 
         // The swapchain was already reconciled to the window this frame in
@@ -243,8 +314,41 @@ namespace ic
             m_swapchain.width(),
             m_swapchain.height(),
             graphImports);
+        const GraphResourceId statsReadbackId = findResourceBySemantic(
+            plan, GraphResourceSemantic::GpuDrivenCullStatsReadback);
+        if (statsReadbackId != InvalidGraphResourceId &&
+            m_gpuCullDiagnosticFrames >= m_frameExecutor.framesInFlight())
+        {
+            DX12GraphResourceEntry* readback =
+                m_graphResourceRegistry.entry(statsReadbackId);
+            if (readback && readback->buffer.mapped)
+            {
+                std::memcpy(
+                    &m_gpuCullStats,
+                    readback->buffer.mapped,
+                    sizeof(m_gpuCullStats));
+                if (m_gpuCullDiagnosticFrames % 600u == 0u)
+                {
+                    spdlog::info(
+                        "[DX12Backend] GPU cull: input={} visible={} frustum={} occlusion={} conservative={} falseOccluded={} falseVisible={} overflow={} history={} gpu={:.3f}ms cpuRecord={:.3f}ms",
+                        m_gpuCullStats.inputCount,
+                        m_gpuCullStats.visible,
+                        m_gpuCullStats.frustumCulled,
+                        m_gpuCullStats.occlusionCulled,
+                        m_gpuCullStats.conservativeRetained,
+                        m_gpuCullStats.falseOccluded,
+                        m_gpuCullStats.falseVisible,
+                        m_gpuCullStats.overflow,
+                        m_gpuCullStats.historyValid,
+                        m_gpuCullPerformance.gpuMilliseconds,
+                        m_gpuCullPerformance.cpuRecordMilliseconds);
+                }
+            }
+        }
 
-        std::vector<ID3D12CommandList*> commandLists;
+        std::vector<ID3D12CommandList*>& commandLists = m_frameCommandLists;
+        commandLists.clear();
+        const auto graphStart = std::chrono::steady_clock::now();
         executeGraph(
             plan,
             execution,
@@ -252,21 +356,43 @@ namespace ic
             scene,
             swapchainImage,
             commandLists);
+        m_performanceCounters.graphRecordMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - graphStart).count();
+        const auto uiStart = std::chrono::steady_clock::now();
         recordImGui(
             ctx,
             swapchainImage,
             commandLists);
+        m_performanceCounters.uiRecordMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - uiStart).count();
+        const auto validationStart = std::chrono::steady_clock::now();
         m_device.logValidationMessages();
+        m_performanceCounters.validationMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - validationStart).count();
 
         const DX12UploadDependency uploadDependency =
             m_uploadScheduler.flush();
+        const auto submitStart = std::chrono::steady_clock::now();
         const bool presented = m_frameExecutor.submitAndPresent(
             plan, commandLists, frameSlot, execution, uploadDependency);
+        m_performanceCounters.submitPresentMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - submitStart).count();
+        if (m_gpuCullDebugMode != GpuCullDebugMode::Off)
+        {
+            ++m_gpuCullDiagnosticFrames;
+        }
 
         if (!presented)
         {
             recreateSwapchain();
         }
+        m_performanceCounters.backendCpuMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - backendStart).count();
         return presented;
     }
 
@@ -323,6 +449,15 @@ namespace ic
 
                 const ExecutionNode& node = plan.nodes[nodeId];
 
+                const uint32_t frameSlot = static_cast<uint32_t>(
+                    ctx.frameIndex % m_frameExecutor.framesInFlight());
+
+                // Time the pass including its barriers: a cross-queue acquire
+                // that stalls the queue is part of what the pass costs, and
+                // hiding it would flatter the async path.
+                const uint32_t profileSlot = m_gpuProfiler.beginPass(
+                    cmd, frameSlot, node.nodeId, node.queue);
+
                 applyBarriers(
                     cmd,
                     plan,
@@ -363,9 +498,17 @@ namespace ic
                     }
                 }
 
-                throwIfFailed(
-                    cmd->Close(),
-                    "Failed to close DX12 frame command list.");
+                m_gpuProfiler.endPass(
+                    cmd, frameSlot, node.queue, profileSlot);
+
+                const HRESULT closeResult = cmd->Close();
+                if (FAILED(closeResult))
+                {
+                    m_device.logValidationMessages();
+                    throwIfFailed(
+                        closeResult,
+                        "Failed to close DX12 frame command list.");
+                }
 
                 return static_cast<ID3D12CommandList*>(cmd);
             };
@@ -521,7 +664,12 @@ namespace ic
             const bool writeHazard =
                 !crossQueueRelease && !crossQueueAcquire &&
                 (barrier.fromAccess != AccessType::Read ||
-                 barrier.toAccess != AccessType::Read);
+                 barrier.toAccess != AccessType::Read) &&
+                hasFlag(
+                    resource.bufferDesc.usage,
+                    BufferUsageFlags::Storage) &&
+                resource.bufferDesc.memoryUsage ==
+                    ResourceMemoryUsage::GpuOnly;
             if (writeHazard)
             {
                 D3D12_RESOURCE_BARRIER uav{};
@@ -908,6 +1056,12 @@ namespace ic
             return;
         }
 
+        const bool measureCull =
+            pipeline->desc.bindingLayout ==
+                PipelineBindingLayoutKind::GpuFrustumCull &&
+            m_gpuCullDebugMode != GpuCullDebugMode::Off;
+        const auto cullRecordStart = std::chrono::steady_clock::now();
+
         cmd->SetComputeRootSignature(pipeline->rootSignature.Get());
         cmd->SetPipelineState(pipeline->pipelineState.Get());
 
@@ -1009,8 +1163,24 @@ namespace ic
                 plan, GraphResourceSemantic::GpuDrivenInstanceBounds);
             DX12GraphResourceEntry* drawInputs = gpuDrivenBufferEntry(
                 plan, GraphResourceSemantic::GpuDrivenDrawInputs);
+            DX12GraphResourceEntry* cullClassification =
+                gpuDrivenBufferEntry(
+                    plan,
+                    GraphResourceSemantic::GpuDrivenCullClassification);
+            DX12GraphResourceEntry* cullStats = gpuDrivenBufferEntry(
+                plan, GraphResourceSemantic::GpuDrivenCullStats);
+            const GraphResourceId previousHiZId =
+                findPreviousNodeResource(
+                    plan, node, ResourceUsage::SampledTexture);
+            DX12GraphResourceEntry* previousHiZ =
+                previousHiZId != InvalidGraphResourceId
+                    ? m_graphResourceRegistry.previousEntry(previousHiZId)
+                    : nullptr;
             if (!visibleInstances || !visibleCount || !indirectArgs ||
-                !binCounts || !instanceBounds || !drawInputs)
+                !binCounts || !instanceBounds || !drawInputs ||
+                !cullClassification || !cullStats ||
+                (previousHiZId != InvalidGraphResourceId &&
+                    (!previousHiZ || !previousHiZ->fullSrv.valid())))
             {
                 return;
             }
@@ -1023,16 +1193,63 @@ namespace ic
             cull.frameConstantsAddr = frameResources.frameConstants.gpuAddress;
             cull.instanceBoundsAddr = instanceBounds->buffer.gpuAddress;
             cull.drawInputsAddr = drawInputs->buffer.gpuAddress;
+            cull.cullClassificationAddr =
+                cullClassification->buffer.gpuAddress;
+            cull.cullStatsAddr = cullStats->buffer.gpuAddress;
+            if (previousHiZ)
+            {
+                cull.previousHiZSrv = previousHiZ->fullSrv.gpuStart;
+            }
 
             recordGpuFrustumCull(passCtx, cull);
 
             if (!g.loggedGpuCull)
             {
                 spdlog::info(
-                    "[DX12Backend] GPU frustum culling dispatch prepared for {} instance(s)",
+                    "[DX12Backend] GPU frustum + previous Hi-Z occlusion culling prepared for {} instance(s)",
                     m_gpuScene.instanceCount());
                 g.loggedGpuCull = true;
             }
+        }
+        else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::GpuOcclusionValidation)
+        {
+            if (m_gpuScene.frameSlotCount() == 0)
+            {
+                return;
+            }
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_gpuScene.frameSlotCount());
+            DX12GpuSceneFrameResources& frameResources =
+                m_gpuScene.frameResources(frameSlot);
+            DX12GraphResourceEntry* bounds = gpuDrivenBufferEntry(
+                plan, GraphResourceSemantic::GpuDrivenInstanceBounds);
+            DX12GraphResourceEntry* classification = gpuDrivenBufferEntry(
+                plan,
+                GraphResourceSemantic::GpuDrivenCullClassification);
+            DX12GraphResourceEntry* stats = gpuDrivenBufferEntry(
+                plan, GraphResourceSemantic::GpuDrivenCullStats);
+            const GraphResourceId hiZId = findNodeResource(
+                plan, node, ResourceUsage::SampledTexture);
+            DX12GraphResourceEntry* hiZ =
+                m_graphResourceRegistry.entry(hiZId);
+            if (!bounds || !classification || !stats || !hiZ ||
+                !hiZ->fullSrv.valid())
+            {
+                return;
+            }
+            DX12PassContext passCtx{};
+            passCtx.cmd = cmd;
+            passCtx.descriptors = &m_descriptorSystem;
+            DX12OcclusionValidationInputs validation{};
+            validation.frameConstantsAddr =
+                frameResources.frameConstants.gpuAddress;
+            validation.instanceBoundsAddr = bounds->buffer.gpuAddress;
+            validation.cullClassificationAddr =
+                classification->buffer.gpuAddress;
+            validation.cullStatsAddr = stats->buffer.gpuAddress;
+            validation.currentHiZSrv = hiZ->fullSrv.gpuStart;
+            recordGpuOcclusionValidation(passCtx, validation);
         }
         else if (pipeline->desc.bindingLayout ==
             PipelineBindingLayoutKind::ClusteredForward)
@@ -1043,8 +1260,22 @@ namespace ic
             }
         }
 
+        if (measureCull)
+        {
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_frameExecutor.framesInFlight());
+            cmd->EndQuery(
+                m_gpuCullTimestampHeap.Get(),
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                frameSlot * 2u);
+        }
+
         if (pipeline->desc.bindingLayout ==
-            PipelineBindingLayoutKind::GpuFrustumCull)
+                PipelineBindingLayoutKind::GpuFrustumCull &&
+            nodeUsesResourceSemantic(
+                plan,
+                node,
+                GraphResourceSemantic::GpuDrivenInstanceBounds))
         {
             const uint32_t instanceCount =
                 std::min<uint32_t>(
@@ -1061,6 +1292,27 @@ namespace ic
                 pass->groupCountX,
                 pass->groupCountY,
                 pass->groupCountZ);
+        }
+
+        if (measureCull)
+        {
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_frameExecutor.framesInFlight());
+            cmd->EndQuery(
+                m_gpuCullTimestampHeap.Get(),
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                frameSlot * 2u + 1u);
+            cmd->ResolveQueryData(
+                m_gpuCullTimestampHeap.Get(),
+                D3D12_QUERY_TYPE_TIMESTAMP,
+                frameSlot * 2u,
+                2u,
+                m_gpuCullTimestampReadback.resource.Get(),
+                sizeof(uint64_t) * frameSlot * 2u);
+            m_gpuCullCpuRecordMilliseconds[frameSlot] =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cullRecordStart).count();
+            m_gpuCullTimestampValid[frameSlot] = 1u;
         }
 
         // The GPU-driven cull buffers (and the clustered cluster buffers) are
@@ -3452,6 +3704,15 @@ namespace ic
                     scene.camera.nearPlane,
                     scene.camera.farPlane);
                 frameData.viewProjection = frameData.projection * frameData.view;
+                const bool occlusionHistoryReliable =
+                    updateGpuOcclusionHistory(
+                        m_gpuOcclusionHistory,
+                        scene,
+                        m_clusteredForwardResources.width,
+                        m_clusteredForwardResources.height,
+                        frameData.view,
+                        frameData.projection,
+                        frameData);
                 frameData.cameraPosition = scene.camera.position;
                 frameData.time = ctx.timeSinceStart;
                 frameData.environmentEnabled =
@@ -3512,9 +3773,14 @@ namespace ic
                     // constants; Vulkan uses firstInstance + metadata.
                     0u,
                     geometryBinCount,
-                    0u);
+                    occlusionHistoryReliable ? 1u : 0u);
                 frameData.cameraNearFar = glm::vec4(
                     scene.camera.nearPlane, scene.camera.farPlane, 0.0f, 0.0f);
+                frameData.occlusionDebugConfig = glm::uvec4(
+                    static_cast<uint32_t>(m_gpuCullDebugMode),
+                    m_gpuCullDebugMode != GpuCullDebugMode::Off ? 1u : 0u,
+                    m_gpuOcclusionEnabled ? 1u : 0u,
+                    0u);
                 return frameData;
             });
     }
@@ -3614,54 +3880,109 @@ namespace ic
         return true;
     }
 
-    void DX12Backend::drawHiZDebugWindow()
+    HiZDebugImage DX12Backend::hiZDebugImage(bool previous, uint32_t mip)
     {
-        if (!m_hiZDebugViewEnabled)
-        {
-            return;
-        }
-
-        ImGui::SetNextWindowSize(ImVec2(360.0f, 260.0f), ImGuiCond_FirstUseEver);
-        if (!ImGui::Begin("Hi-Z Depth Pyramid", &m_hiZDebugViewEnabled))
-        {
-            ImGui::End();
-            return;
-        }
-
         const DX12GraphResourceEntry* hiZ =
-            m_graphResourceRegistry.entry(
-                m_clusteredForwardResources.hiZDebugResource);
+            previous
+                ? m_graphResourceRegistry.previousEntry(
+                    m_clusteredForwardResources.hiZDebugResource)
+                : m_graphResourceRegistry.entry(
+                    m_clusteredForwardResources.hiZDebugResource);
 
-        if (!hiZ)
+        if (!hiZ || hiZ->mipLevels() == 0)
         {
-            ImGui::TextUnformatted("Waiting for Hi-Z pyramid...");
-            ImGui::End();
-            return;
+            return {};
         }
 
-        const uint32_t mip =
-            std::min<uint32_t>(m_hiZDebugMip, hiZ->mipLevels() - 1u);
-        const uint32_t mipWidth = std::max(1u, hiZ->width() >> mip);
-        const uint32_t mipHeight = std::max(1u, hiZ->height() >> mip);
-        const ImVec2 available = ImGui::GetContentRegionAvail();
-        const float maxWidth = std::max(1.0f, available.x);
-        const float maxHeight = std::max(1.0f, available.y - 8.0f);
-        const float aspect =
-            static_cast<float>(mipWidth) / static_cast<float>(mipHeight);
-        float width = maxWidth;
-        float height = width / aspect;
-        if (height > maxHeight)
+        const uint32_t clamped = std::min(mip, hiZ->mipLevels() - 1u);
+        if (clamped >= hiZ->mipSrvs.size())
         {
-            height = maxHeight;
-            width = height * aspect;
+            return {};
         }
 
-        ImGui::Text("Mip %u / %u", mip, hiZ->mipLevels());
-        ImGui::Text("%ux%u", mipWidth, mipHeight);
-        ImGui::Image(
-            (ImTextureID)hiZ->mipSrvs[mip].gpuStart.ptr,
-            ImVec2(width, height));
-        ImGui::End();
+        return {
+            .textureId = hiZ->mipSrvs[clamped].gpuStart.ptr,
+            .width = std::max(1u, hiZ->width() >> clamped),
+            .height = std::max(1u, hiZ->height() >> clamped),
+            .mipLevels = hiZ->mipLevels(),
+            .valid = true
+        };
+    }
+
+    void DX12Backend::buildBackendDiagnostics()
+    {
+        const DXGI_ADAPTER_DESC3& adapter = m_adapter.desc();
+        m_diagnosticAdapterName.clear();
+        for (const wchar_t wide : adapter.Description)
+        {
+            if (wide == L'\0')
+            {
+                break;
+            }
+            // Adapter names are ASCII in practice; this avoids dragging in a
+            // locale-aware conversion for a debug string.
+            m_diagnosticAdapterName.push_back(
+                wide < 128 ? static_cast<char>(wide) : '?');
+        }
+
+        const DX12FeatureSupport& features = m_device.features();
+        m_diagnosticFeatures.clear();
+        m_diagnosticFeatures.push_back({
+            .name = "Debug/validation layer",
+            .enabled = m_factory.validationEnabled() });
+        m_diagnosticFeatures.push_back({
+            .name = "Async compute queue",
+            .enabled = m_device.computeQueue() != nullptr,
+            .detail = "Separate D3D12 compute engine" });
+        m_diagnosticFeatures.push_back({
+            .name = "Bindless resources",
+            .enabled = features.bindlessResources });
+        m_diagnosticFeatures.push_back({
+            .name = "Descriptor indexing",
+            .enabled = features.descriptorIndexing });
+        m_diagnosticFeatures.push_back({
+            .name = "Direct heap indexing (SM6.6)",
+            .enabled = features.directHeapIndexing,
+            .detail = "ResourceDescriptorHeap[] without a bound table" });
+        m_diagnosticFeatures.push_back({
+            .name = "GPU virtual address",
+            .enabled = features.gpuVirtualAddress });
+        m_diagnosticFeatures.push_back({
+            .name = "GPU pass timestamps",
+            .enabled = m_gpuProfiler.enabled(),
+            .detail = "Per-queue calibrated timestamps feeding the async "
+                      "policy" });
+
+        m_diagnosticLimits.clear();
+        m_diagnosticLimits.push_back({
+            .name = "Resource binding tier",
+            .value = static_cast<uint64_t>(features.resourceBindingTier) });
+        m_diagnosticLimits.push_back({
+            .name = "Root signature version (0x_)",
+            .value = static_cast<uint64_t>(features.rootSignatureVersion) });
+        m_diagnosticLimits.push_back({
+            .name = "Shader model (0x_)",
+            .value = static_cast<uint64_t>(features.shaderModel) });
+        m_diagnosticLimits.push_back({
+            .name = "Dedicated video memory (MB)",
+            .value = static_cast<uint64_t>(
+                adapter.DedicatedVideoMemory >> 20) });
+        m_diagnosticLimits.push_back({
+            .name = "Frames in flight",
+            .value = m_frameExecutor.framesInFlight() });
+        m_diagnosticLimits.push_back({
+            .name = "Recording worker slots",
+            .value = m_workerSlots });
+    }
+
+    BackendDiagnosticInfo DX12Backend::backendDiagnostics() const
+    {
+        return {
+            .backendName = "DX12",
+            .adapterName = m_diagnosticAdapterName.c_str(),
+            .features = std::span<const BackendFeature>(m_diagnosticFeatures),
+            .limits = std::span<const BackendLimit>(m_diagnosticLimits)
+        };
     }
 
     void DX12Backend::endDebugGuiFrame()
@@ -3671,7 +3992,6 @@ namespace ic
             return;
         }
 
-        drawHiZDebugWindow();
         ImGui::Render();
         m_imguiFrameActive = false;
     }
@@ -3700,6 +4020,32 @@ namespace ic
         ID3D12GraphicsCommandList4* cmd =
             lease.commandList();
 
+        DX12GraphResourceEntry* hiZDebugResource = nullptr;
+        if (m_hiZDebugViewEnabled)
+        {
+            hiZDebugResource =
+                m_hiZDebugPrevious
+                    ? m_graphResourceRegistry.previousEntry(
+                        m_clusteredForwardResources.hiZDebugResource)
+                    : m_graphResourceRegistry.entry(
+                        m_clusteredForwardResources.hiZDebugResource);
+        }
+
+        const D3D12_RESOURCE_STATES hiZOriginalState =
+            hiZDebugResource
+                ? hiZDebugResource->state
+                : D3D12_RESOURCE_STATE_COMMON;
+        if (hiZDebugResource &&
+            hiZDebugResource->nativeResource() &&
+            hiZOriginalState != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+        {
+            transitionResource(
+                cmd,
+                hiZDebugResource->nativeResource(),
+                hiZOriginalState,
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        }
+
         transitionResource(
             cmd,
             swapchainImage,
@@ -3717,6 +4063,17 @@ namespace ic
         cmd->SetDescriptorHeaps(1, heaps);
 
         ImGui_ImplDX12_RenderDrawData(drawData, cmd);
+
+        if (hiZDebugResource &&
+            hiZDebugResource->nativeResource() &&
+            hiZOriginalState != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
+        {
+            transitionResource(
+                cmd,
+                hiZDebugResource->nativeResource(),
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                hiZOriginalState);
+        }
 
         transitionResource(
             cmd,
@@ -3780,6 +4137,56 @@ namespace ic
         m_hiZDebugMip = mip;
     }
 
+    bool DX12Backend::hiZDebugPrevious() const
+    {
+        return m_hiZDebugPrevious;
+    }
+
+    void DX12Backend::setHiZDebugPrevious(bool previous)
+    {
+        m_hiZDebugPrevious = previous;
+    }
+
+    bool DX12Backend::gpuOcclusionEnabled() const
+    {
+        return m_gpuOcclusionEnabled;
+    }
+
+    void DX12Backend::setGpuOcclusionEnabled(bool enabled)
+    {
+        m_gpuOcclusionEnabled = enabled;
+    }
+
+    GpuCullDebugMode DX12Backend::gpuCullDebugMode() const
+    {
+        return m_gpuCullDebugMode;
+    }
+
+    void DX12Backend::setGpuCullDebugMode(GpuCullDebugMode mode)
+    {
+        if (m_gpuCullDebugMode != mode)
+        {
+            m_gpuCullDiagnosticFrames = 0;
+            m_gpuCullStats = {};
+            m_gpuCullPerformance = {};
+            std::fill(
+                m_gpuCullTimestampValid.begin(),
+                m_gpuCullTimestampValid.end(),
+                uint8_t{0});
+        }
+        m_gpuCullDebugMode = mode;
+    }
+
+    GpuCullStats DX12Backend::gpuCullStats() const
+    {
+        return m_gpuCullStats;
+    }
+
+    GpuCullPerformance DX12Backend::gpuCullPerformance() const
+    {
+        return m_gpuCullPerformance;
+    }
+
     D3D12_RESOURCE_STATES DX12Backend::usageToState(ResourceUsage usage) const
     {
         switch (usage)
@@ -3836,6 +4243,13 @@ namespace ic
         m_pipelineManager.shutdown();
         m_swapchain.resize();
         m_pipelineManager.init(m_device);
+        m_gpuCullDiagnosticFrames = 0;
+        m_gpuCullStats = {};
+        m_gpuCullPerformance = {};
+        std::fill(
+            m_gpuCullTimestampValid.begin(),
+            m_gpuCullTimestampValid.end(),
+            uint8_t{0});
     }
 
     TextureFormat DX12Backend::swapchainTextureFormat() const

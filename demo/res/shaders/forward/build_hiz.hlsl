@@ -46,10 +46,13 @@ void CSMain(uint3 dispatchThreadId : SV_DispatchThreadID)
     const float d3 = gHiZSource.Load(int3(src3, 0));
 
     const bool reversedZ = gFrame.renderExtentAndHiZ.w != 0u;
+    // Occlusion needs the farthest depth represented by the tile. Rejecting
+    // against the nearest depth would falsely hide bounds when even one pixel
+    // in the tile contains more distant geometry (or clear depth).
     const float reducedDepth =
         reversedZ
-            ? max(max(d0, d1), max(d2, d3))
-            : min(min(d0, d1), min(d2, d3));
+            ? min(min(d0, d1), min(d2, d3))
+            : max(max(d0, d1), max(d2, d3));
 
     gHiZOutput[dst] = reducedDepth;
 }

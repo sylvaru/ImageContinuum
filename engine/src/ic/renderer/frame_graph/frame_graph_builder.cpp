@@ -96,6 +96,13 @@ namespace ic
         return cadence(PassCadence::Once);
     }
 
+    FrameGraphBuilder::ComputePassBuilder&
+        FrameGraphBuilder::ComputePassBuilder::asyncEligible(bool eligible)
+    {
+        m_builder.setNodeAsyncEligible(m_node, eligible);
+        return *this;
+    }
+
     FrameGraphBuilder::TransferPassBuilder&
         FrameGraphBuilder::TransferPassBuilder::cadence(
             PassCadence cadence)
@@ -589,6 +596,16 @@ namespace ic
         if (node < m_nodes.size())
         {
             m_nodes[node].graphNode.queue = queue;
+        }
+    }
+
+    void FrameGraphBuilder::setNodeAsyncEligible(
+        GraphNodeId node,
+        bool eligible)
+    {
+        if (node < m_nodes.size())
+        {
+            m_nodes[node].graphNode.asyncEligible = eligible;
         }
     }
 

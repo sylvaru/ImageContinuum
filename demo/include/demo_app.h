@@ -35,8 +35,8 @@ private:
         desc.defaultConfigPath =
             //"demo/res/configs/forward.toml";
             //"demo/res/configs/forward_dx12.toml";
-            //"demo/res/configs/clustered_forward.toml";
-            "demo/res/configs/clustered_forward_dx12.toml";
+            "demo/res/configs/clustered_forward.toml";
+            //"demo/res/configs/clustered_forward_dx12.toml";
             //"demo/res/configs/path_traced.toml";
             //"demo/res/configs/path_traced_dx12.toml";
         desc.fallbackApp = createFallbackSpecification();

@@ -158,8 +158,11 @@ namespace ic
         // node actually executes this frame are applied (a cadence-skipped writer
         // creates no hazard), and only when the previous-frame signal map still
         // lines up with this plan (it is dropped on a GPU drain / graph rebuild).
-        std::vector<std::vector<CrossFrameSignal>> crossFrameWaits(
-            plan.queueSubmissions.size());
+        m_crossFrameWaits.resize(plan.queueSubmissions.size());
+        for (auto& waits : m_crossFrameWaits)
+        {
+            waits.clear();
+        }
         const bool prevSignalsUsable =
             m_prevSubmissionSignals.size() == plan.queueSubmissions.size();
         if (prevSignalsUsable)
@@ -167,7 +170,7 @@ namespace ic
             for (const CrossFrameDependency& dep : plan.crossFrameDependencies)
             {
                 if (!execution.shouldExecute(dep.consumerNode) ||
-                    dep.consumerSubmission >= crossFrameWaits.size() ||
+                    dep.consumerSubmission >= m_crossFrameWaits.size() ||
                     dep.producerSubmission >= m_prevSubmissionSignals.size())
                 {
                     continue;
@@ -176,7 +179,7 @@ namespace ic
                     m_prevSubmissionSignals[dep.producerSubmission];
                 if (producer.value != 0)
                 {
-                    crossFrameWaits[dep.consumerSubmission].push_back(producer);
+                    m_crossFrameWaits[dep.consumerSubmission].push_back(producer);
                 }
             }
         }
@@ -236,21 +239,15 @@ namespace ic
                     plan.crossFrameDependencies.size());
                 loggedSchedule = true;
             }
-            std::vector<uint32_t> commandIndexByNode(
-                plan.nodes.size(), UINT32_MAX);
+            m_commandIndexByNode.assign(plan.nodes.size(), UINT32_MAX);
             for (uint32_t i = 0;
                  i < plan.executionLevelNodes.size(); ++i)
             {
-                commandIndexByNode[plan.executionLevelNodes[i]] = i;
+                m_commandIndexByNode[plan.executionLevelNodes[i]] = i;
             }
 
-            struct SubmissionSignal
-            {
-                QueueType queue = QueueType::Graphics;
-                uint64_t value = 0;
-            };
-            std::vector<SubmissionSignal> submissionSignals(
-                plan.queueSubmissions.size());
+            m_submissionSignals.assign(
+                plan.queueSubmissions.size(), CrossFrameSignal{});
             std::array<uint64_t, 3> lastQueueSignals{};
 
             auto queueFor = [this](QueueType queue)
@@ -280,7 +277,7 @@ namespace ic
                 // intra-frame same-queue waits below, which submission order
                 // already satisfies).
                 for (const CrossFrameSignal& wait :
-                     crossFrameWaits[submissionIndex])
+                     m_crossFrameWaits[submissionIndex])
                 {
                     throwIfFailed(
                         queue->Wait(
@@ -294,11 +291,11 @@ namespace ic
                     const uint32_t dependency =
                         plan.queueSubmissionWaits[
                             submission.firstWait + i].submissionIndex;
-                    if (dependency < submissionSignals.size() &&
-                        submissionSignals[dependency].value != 0)
+                    if (dependency < m_submissionSignals.size() &&
+                        m_submissionSignals[dependency].value != 0)
                     {
-                        const SubmissionSignal& source =
-                            submissionSignals[dependency];
+                        const CrossFrameSignal& source =
+                            m_submissionSignals[dependency];
                         if (queueFor(source.queue) == queue)
                         {
                             continue;
@@ -311,24 +308,24 @@ namespace ic
                     }
                 }
 
-                std::vector<ID3D12CommandList*> batchLists;
-                batchLists.reserve(submission.nodeCount);
+                m_batchLists.clear();
+                m_batchLists.reserve(submission.nodeCount);
                 for (uint32_t i = 0; i < submission.nodeCount; ++i)
                 {
                     const GraphNodeId node =
                         plan.queueSubmissionNodes[submission.firstNode + i];
-                    const uint32_t commandIndex = commandIndexByNode[node];
+                    const uint32_t commandIndex = m_commandIndexByNode[node];
                     if (commandIndex != UINT32_MAX &&
                         commandIndex < commandLists.size())
                     {
-                        batchLists.push_back(commandLists[commandIndex]);
+                        m_batchLists.push_back(commandLists[commandIndex]);
                     }
                 }
-                if (!batchLists.empty())
+                if (!m_batchLists.empty())
                 {
                     queue->ExecuteCommandLists(
-                        static_cast<UINT>(batchLists.size()),
-                        batchLists.data());
+                        static_cast<UINT>(m_batchLists.size()),
+                        m_batchLists.data());
                 }
 
                 const uint32_t signalQueue = queueIndex(submission.queue);
@@ -337,7 +334,7 @@ namespace ic
                 throwIfFailed(
                     queue->Signal(m_queueFences[signalQueue].Get(), signal),
                     "Failed to signal DX12 queue submission.");
-                submissionSignals[submissionIndex] = {
+                m_submissionSignals[submissionIndex] = {
                     submission.queue, signal };
                 lastQueueSignals[signalQueue] = signal;
 
@@ -347,10 +344,10 @@ namespace ic
             // cross-frame edges can wait on the exact producing submission.
             m_prevSubmissionSignals.assign(
                 plan.queueSubmissions.size(), CrossFrameSignal{});
-            for (uint32_t i = 0; i < submissionSignals.size(); ++i)
+            for (uint32_t i = 0; i < m_submissionSignals.size(); ++i)
             {
                 m_prevSubmissionSignals[i] = {
-                    submissionSignals[i].queue, submissionSignals[i].value };
+                    m_submissionSignals[i].queue, m_submissionSignals[i].value };
             }
 
             const uint32_t computeIndex = queueIndex(QueueType::Compute);

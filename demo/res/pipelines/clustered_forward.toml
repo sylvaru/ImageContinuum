@@ -167,6 +167,16 @@ compute = "demo/res/compiled_shaders/dx12/gpu_frustum_cull.cs.dxil"
 [pipelines.gpu_frustum_cull.shaders.vulkan]
 compute = "demo/res/compiled_shaders/vulkan/gpu_frustum_cull.comp.spv"
 
+[pipelines.gpu_occlusion_validate]
+type = "Compute"
+bindingLayout = "GpuOcclusionValidation"
+
+[pipelines.gpu_occlusion_validate.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gpu_occlusion_validate.cs.dxil"
+
+[pipelines.gpu_occlusion_validate.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gpu_occlusion_validate.comp.spv"
+
 [pipelines.reset_visible_instance_count]
 type = "Compute"
 bindingLayout = "GpuFrustumCull"

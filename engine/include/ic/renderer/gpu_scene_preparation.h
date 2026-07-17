@@ -208,9 +208,19 @@ namespace ic
                 // Model index buffers are uploaded with model-global indices.
                 input.vertexOffset = 0;
                 input.commandBinOffset = bin.commandOffset;
+                input.commandBinLocalIndex = bin.maxDrawCount;
                 m_drawInputs.push_back(input);
                 m_sortedBounds.push_back(m_instanceBounds[draw.objectIndex]);
                 ++bin.maxDrawCount;
+            }
+            for (GpuDrawInput& input : m_drawInputs)
+            {
+                if (input.metadata.geometryBinIndex < m_geometryBins.size())
+                {
+                    input.commandBinCapacity =
+                        m_geometryBins[input.metadata.geometryBinIndex]
+                            .maxDrawCount;
+                }
             }
             m_instanceBounds.swap(m_sortedBounds);
 

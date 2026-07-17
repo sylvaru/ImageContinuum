@@ -6,8 +6,9 @@
 
 namespace ic
 {
-	void VulkanInstance::init()
+	void VulkanInstance::init(bool enableValidation)
 	{
+		m_validationEnabled = enableValidation;
 		spdlog::info("[VulkanInstance] Initializing...");
 
 		createInstance();
@@ -19,8 +20,6 @@ namespace ic
 
     void VulkanInstance::shutdown()
     {
-#ifdef IC_DEBUG
-
         if (m_debugMessenger != VK_NULL_HANDLE)
         {
             auto destroy =
@@ -42,8 +41,6 @@ namespace ic
             spdlog::info(
                 "[VulkanInstance] Debug messenger destroyed.");
         }
-
-#endif
 
         if (m_instance != VK_NULL_HANDLE)
         {
@@ -82,19 +79,10 @@ namespace ic
         createInfo.ppEnabledExtensionNames =
             extensions.data();
 
-#ifdef IC_DEBUG
-
-        createInfo.enabledLayerCount =
-            static_cast<uint32_t>(layers.size());
-
-        createInfo.ppEnabledLayerNames =
-            layers.data();
-
-#else
-
-        createInfo.enabledLayerCount = 0;
-
-#endif
+        createInfo.enabledLayerCount = m_validationEnabled
+            ? static_cast<uint32_t>(layers.size()) : 0u;
+        createInfo.ppEnabledLayerNames = m_validationEnabled
+            ? layers.data() : nullptr;
 
         VkResult result =
             vkCreateInstance(
@@ -120,11 +108,10 @@ namespace ic
 
     void VulkanInstance::setupValidationLayers()
     {
-#ifndef IC_DEBUG
-
-        return;
-
-#else
+        if (!m_validationEnabled)
+        {
+            return;
+        }
 
         if (!checkValidationLayerSupport())
         {
@@ -135,16 +122,14 @@ namespace ic
         spdlog::info(
             "[VulkanInstance] Validation layers enabled.");
 
-#endif
     }
 
     void VulkanInstance::setupDebugMessenger()
     {
-#ifndef IC_DEBUG
-
-        return;
-
-#else
+        if (!m_validationEnabled)
+        {
+            return;
+        }
 
         VkDebugUtilsMessengerCreateInfoEXT createInfo{};
 
@@ -188,7 +173,6 @@ namespace ic
         spdlog::info(
             "[VulkanInstance] Debug messenger created.");
 
-#endif
     }
 
     std::vector<const char*> VulkanInstance::requiredExtensions() const
@@ -212,9 +196,10 @@ namespace ic
             glfwExtensions + count
         );
 
-#ifdef IC_DEBUG
-        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
-#endif
+        if (m_validationEnabled)
+        {
+            extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        }
 
         return extensions;
     }

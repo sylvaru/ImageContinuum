@@ -23,6 +23,7 @@
 #include <backends/imgui_impl_vulkan.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -87,7 +88,12 @@ namespace ic
 		Window& window,
 		uint32_t workerCount)
 	{
-		m_instance.init();
+#ifdef IC_DEBUG
+        constexpr bool validationAvailable = true;
+#else
+        constexpr bool validationAvailable = false;
+#endif
+		m_instance.init(spec.enableValidation && validationAvailable);
 
 		m_platform.init(
 			m_instance.instance(),
@@ -127,6 +133,57 @@ namespace ic
         m_workerSlots = workerSlots;
 
         m_frameExecutor.init(m_device, m_swapchain, framesInFlight);
+
+        VkQueryPoolCreateInfo timestampPoolInfo{
+            VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        timestampPoolInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        timestampPoolInfo.queryCount = framesInFlight * 2u;
+        throwIfFailed(
+            vkCreateQueryPool(
+                m_device.device(),
+                &timestampPoolInfo,
+                nullptr,
+                &m_gpuCullTimestampPool),
+            "Failed to create Vulkan GPU-cull timestamp query pool.");
+        m_gpuCullCpuRecordMilliseconds.assign(framesInFlight, 0.0);
+        m_gpuCullTimestampValid.assign(framesInFlight, uint8_t{0});
+        m_gpuCullTimestampPeriodNanoseconds =
+            static_cast<double>(m_adapter.info().properties.limits.timestampPeriod);
+
+        // timestampValidBits is per queue family; take the graphics family's,
+        // and require the compute family to report timestamps too, since a
+        // compute timeline we cannot measure is one we must not schedule on.
+        uint32_t timestampValidBits = 0u;
+        {
+            uint32_t familyCount = 0u;
+            vkGetPhysicalDeviceQueueFamilyProperties(
+                m_adapter.device(), &familyCount, nullptr);
+            std::vector<VkQueueFamilyProperties> families(familyCount);
+            vkGetPhysicalDeviceQueueFamilyProperties(
+                m_adapter.device(), &familyCount, families.data());
+
+            const QueueFamilyIndices& indices = m_adapter.info().queueFamilies;
+            if (indices.graphics < familyCount)
+            {
+                timestampValidBits =
+                    families[indices.graphics].timestampValidBits;
+            }
+            if (indices.compute < familyCount &&
+                timestampValidBits != 0u)
+            {
+                timestampValidBits = std::min(
+                    timestampValidBits,
+                    families[indices.compute].timestampValidBits);
+            }
+        }
+        m_gpuProfiler.init(
+            m_device.device(),
+            m_gpuCullTimestampPeriodNanoseconds,
+            timestampValidBits,
+            framesInFlight,
+            128u);
+
+        buildBackendDiagnostics();
 
 		m_commandSystem.init(
 			m_device.device(),
@@ -177,6 +234,13 @@ namespace ic
         destroyEnvironmentResources();
         destroyClusteredForwardResources();
         destroyPathTraceResources();
+        m_gpuProfiler.shutdown();
+        if (m_gpuCullTimestampPool != VK_NULL_HANDLE)
+        {
+            vkDestroyQueryPool(
+                m_device.device(), m_gpuCullTimestampPool, nullptr);
+            m_gpuCullTimestampPool = VK_NULL_HANDLE;
+        }
         m_uploadScheduler.shutdown();
         m_retirementQueue.drain();
         m_graphResourceRegistry.shutdown();
@@ -193,6 +257,17 @@ namespace ic
         m_instance.shutdown();
 
         spdlog::info("[VulkanBackend] Shutdown");
+    }
+
+    void VulkanBackend::drainForSchedulingTransition()
+    {
+        if (m_device.device() != VK_NULL_HANDLE)
+        {
+            throwIfFailed(
+                vkDeviceWaitIdle(m_device.device()),
+                "Failed to drain Vulkan queues for a scheduling transition.");
+            m_frameExecutor.resetAfterGpuDrain();
+        }
     }
 
     RenderSurfaceState VulkanBackend::reconcileRenderSurface()
@@ -244,6 +319,8 @@ namespace ic
         const FrameContext& ctx,
         const SceneRenderView& scene)
     {
+        m_performanceCounters = {};
+        const auto backendStart = std::chrono::steady_clock::now();
         if (!m_frameExecutor.ready())
         {
             return false;
@@ -253,7 +330,38 @@ namespace ic
             static_cast<uint32_t>(
                 ctx.frameIndex % m_frameExecutor.framesInFlight());
 
+        const auto waitStart = std::chrono::steady_clock::now();
         m_frameExecutor.waitForFrameSlot(frameSlot);
+        m_performanceCounters.frameSlotWaitMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - waitStart).count();
+        // Safe only after the slot's fence wait above.
+        const auto profilerStart = std::chrono::steady_clock::now();
+        m_gpuProfiler.beginFrame(frameSlot);
+        m_performanceCounters.profilerReadbackMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - profilerStart).count();
+        if (m_gpuCullTimestampValid[frameSlot] != 0u)
+        {
+            uint64_t timestamps[2] = {};
+            const VkResult timestampResult = vkGetQueryPoolResults(
+                m_device.device(),
+                m_gpuCullTimestampPool,
+                frameSlot * 2u,
+                2u,
+                sizeof(timestamps),
+                timestamps,
+                sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT);
+            if (timestampResult == VK_SUCCESS)
+            {
+                m_gpuCullPerformance.gpuMilliseconds =
+                    static_cast<double>(timestamps[1] - timestamps[0]) *
+                    m_gpuCullTimestampPeriodNanoseconds / 1'000'000.0;
+                m_gpuCullPerformance.cpuRecordMilliseconds =
+                    m_gpuCullCpuRecordMilliseconds[frameSlot];
+            }
+        }
         m_retirementQueue.beginFrame(frameSlot);
         m_uploadScheduler.beginFrame(frameSlot);
 
@@ -301,10 +409,45 @@ namespace ic
             graphExtent.width,
             graphExtent.height,
             graphImports);
+        const GraphResourceId statsReadbackId = findResourceBySemantic(
+            plan, GraphResourceSemantic::GpuDrivenCullStatsReadback);
+        if (statsReadbackId != InvalidGraphResourceId &&
+            m_gpuCullDiagnosticFrames >= m_frameExecutor.framesInFlight())
+        {
+            VulkanGraphResourceEntry* readback =
+                m_graphResourceRegistry.entry(statsReadbackId);
+            if (readback && readback->buffer.mapped)
+            {
+                m_resourceAllocator.invalidate(
+                    readback->buffer, 0, sizeof(GpuCullStats));
+                std::memcpy(
+                    &m_gpuCullStats,
+                    readback->buffer.mapped,
+                    sizeof(m_gpuCullStats));
+                if (m_gpuCullDiagnosticFrames % 600u == 0u)
+                {
+                    spdlog::info(
+                        "[VulkanBackend] GPU cull: input={} visible={} frustum={} occlusion={} conservative={} falseOccluded={} falseVisible={} overflow={} history={} gpu={:.3f}ms cpuRecord={:.3f}ms",
+                        m_gpuCullStats.inputCount,
+                        m_gpuCullStats.visible,
+                        m_gpuCullStats.frustumCulled,
+                        m_gpuCullStats.occlusionCulled,
+                        m_gpuCullStats.conservativeRetained,
+                        m_gpuCullStats.falseOccluded,
+                        m_gpuCullStats.falseVisible,
+                        m_gpuCullStats.overflow,
+                        m_gpuCullStats.historyValid,
+                        m_gpuCullPerformance.gpuMilliseconds,
+                        m_gpuCullPerformance.cpuRecordMilliseconds);
+                }
+            }
+        }
 
         m_commandSystem.beginFrame(frameSlot);
 
-        std::vector<VkCommandBuffer> commandBuffers;
+        std::vector<VkCommandBuffer>& commandBuffers = m_frameCommandBuffers;
+        commandBuffers.clear();
+        const auto graphStart = std::chrono::steady_clock::now();
         executeGraph(
             plan,
             execution,
@@ -313,20 +456,38 @@ namespace ic
             swapchainImage,
             frame.initialLayout,
             commandBuffers);
+        m_performanceCounters.graphRecordMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - graphStart).count();
+        const auto uiStart = std::chrono::steady_clock::now();
         recordImGui(
             ctx,
             swapchainImage,
             commandBuffers);
+        m_performanceCounters.uiRecordMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - uiStart).count();
 
         const VulkanUploadDependency uploadDependency =
             m_uploadScheduler.flush();
+        const auto submitStart = std::chrono::steady_clock::now();
         const bool presented = m_frameExecutor.submitAndPresent(
             plan, commandBuffers, frameSlot, execution, uploadDependency);
+        m_performanceCounters.submitPresentMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - submitStart).count();
+        if (m_gpuCullDebugMode != GpuCullDebugMode::Off)
+        {
+            ++m_gpuCullDiagnosticFrames;
+        }
 
         if (!presented)
         {
             onSwapchainRecreated();
         }
+        m_performanceCounters.backendCpuMs =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - backendStart).count();
         return presented;
     }
 
@@ -400,6 +561,15 @@ namespace ic
                 const ExecutionNode& node =
                     plan.nodes[nodeId];
 
+                const uint32_t frameSlot = static_cast<uint32_t>(
+                    ctx.frameIndex % m_frameExecutor.framesInFlight());
+
+                // Time the pass including its barriers: a cross-queue acquire
+                // that stalls the queue is part of what the pass costs, and
+                // hiding it would flatter the async path.
+                const uint32_t profileSlot = m_gpuProfiler.beginPass(
+                    cmd, frameSlot, node.nodeId, node.queue);
+
                 applyBarriers(
                     cmd,
                     plan,
@@ -439,6 +609,8 @@ namespace ic
                         }
                     }
                 }
+
+                m_gpuProfiler.endPass(cmd, frameSlot, profileSlot);
 
                 if (vkEndCommandBuffer(cmd) != VK_SUCCESS)
                 {
@@ -1082,6 +1254,12 @@ namespace ic
             return;
         }
 
+        const bool measureCull =
+            pipeline->desc.bindingLayout ==
+                PipelineBindingLayoutKind::GpuFrustumCull &&
+            m_gpuCullDebugMode != GpuCullDebugMode::Off;
+        const auto cullRecordStart = std::chrono::steady_clock::now();
+
         vkCmdBindPipeline(
             cmd,
             VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -1194,6 +1372,26 @@ namespace ic
             cull.drawMetadataSize = m_gpuDrivenBuffers.drawMetadataSize;
             cull.binCounts = m_gpuDrivenBuffers.binCounts;
             cull.binCountsSize = m_gpuDrivenBuffers.binCountsSize;
+            cull.cullClassification =
+                m_gpuDrivenBuffers.cullClassification;
+            cull.cullClassificationSize =
+                m_gpuDrivenBuffers.cullClassificationSize;
+            cull.cullStats = m_gpuDrivenBuffers.cullStats;
+            cull.cullStatsSize = m_gpuDrivenBuffers.cullStatsSize;
+            const GraphResourceId previousHiZId =
+                findPreviousNodeResource(
+                    plan, node, ResourceUsage::SampledTexture);
+            if (previousHiZId != InvalidGraphResourceId)
+            {
+                VulkanGraphResourceEntry* previousHiZ =
+                    m_graphResourceRegistry.previousEntry(previousHiZId);
+                if (!previousHiZ || previousHiZ->view == VK_NULL_HANDLE)
+                {
+                    return;
+                }
+                cull.previousHiZ = previousHiZ->view;
+                cull.previousHiZLayout = previousHiZ->layout;
+            }
 
             if (!recordGpuFrustumCull(passCtx, *pipeline, cull))
             {
@@ -1203,9 +1401,55 @@ namespace ic
             if (!g.loggedGpuCull)
             {
                 spdlog::info(
-                    "[VulkanBackend] GPU frustum culling dispatch prepared for {} instance(s)",
+                    "[VulkanBackend] GPU frustum + previous Hi-Z occlusion culling prepared for {} instance(s)",
                     m_gpuScene.instanceCount());
                 g.loggedGpuCull = true;
+            }
+        }
+        else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::GpuOcclusionValidation)
+        {
+            if (m_gpuScene.frameSlotCount() == 0)
+            {
+                return;
+            }
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_gpuScene.frameSlotCount());
+            VulkanGpuSceneFrameResources& frameResources =
+                m_gpuScene.frameResources(frameSlot);
+            const GraphResourceId hiZId = findNodeResource(
+                plan, node, ResourceUsage::SampledTexture);
+            VulkanGraphResourceEntry* hiZ =
+                m_graphResourceRegistry.entry(hiZId);
+            if (!hiZ || hiZ->view == VK_NULL_HANDLE)
+            {
+                return;
+            }
+            VulkanPassContext passCtx{};
+            passCtx.cmd = cmd;
+            passCtx.device = m_device.device();
+            VulkanOcclusionValidationInputs validation{};
+            validation.descriptorPool =
+                &frameResources.gpuCullDescriptorPool;
+            validation.frameConstants =
+                frameResources.frameConstants.buffer;
+            validation.instanceBounds =
+                m_gpuDrivenBuffers.instanceBounds;
+            validation.instanceBoundsSize =
+                m_gpuDrivenBuffers.instanceBoundsSize;
+            validation.cullClassification =
+                m_gpuDrivenBuffers.cullClassification;
+            validation.cullClassificationSize =
+                m_gpuDrivenBuffers.cullClassificationSize;
+            validation.cullStats = m_gpuDrivenBuffers.cullStats;
+            validation.cullStatsSize =
+                m_gpuDrivenBuffers.cullStatsSize;
+            validation.currentHiZ = hiZ->view;
+            validation.currentHiZLayout = hiZ->layout;
+            if (!recordGpuOcclusionValidation(
+                    passCtx, *pipeline, validation))
+            {
+                return;
             }
         }
         else if (pipeline->desc.bindingLayout ==
@@ -1217,8 +1461,25 @@ namespace ic
             }
         }
 
+        if (measureCull)
+        {
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_frameExecutor.framesInFlight());
+            vkCmdResetQueryPool(
+                cmd, m_gpuCullTimestampPool, frameSlot * 2u, 2u);
+            vkCmdWriteTimestamp(
+                cmd,
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                m_gpuCullTimestampPool,
+                frameSlot * 2u);
+        }
+
         if (pipeline->desc.bindingLayout ==
-            PipelineBindingLayoutKind::GpuFrustumCull)
+                PipelineBindingLayoutKind::GpuFrustumCull &&
+            nodeUsesResourceSemantic(
+                plan,
+                node,
+                GraphResourceSemantic::GpuDrivenInstanceBounds))
         {
             const uint32_t instanceCount =
                 std::min<uint32_t>(
@@ -1237,6 +1498,21 @@ namespace ic
                 pass->groupCountX,
                 pass->groupCountY,
                 pass->groupCountZ);
+        }
+
+        if (measureCull)
+        {
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_frameExecutor.framesInFlight());
+            vkCmdWriteTimestamp(
+                cmd,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                m_gpuCullTimestampPool,
+                frameSlot * 2u + 1u);
+            m_gpuCullCpuRecordMilliseconds[frameSlot] =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - cullRecordStart).count();
+            m_gpuCullTimestampValid[frameSlot] = 1u;
         }
 
         // The clustered cluster buffers and the GPU-driven cull buffers are all
@@ -3407,6 +3683,14 @@ namespace ic
             m_gpuDrivenBuffers.binCounts,
             m_gpuDrivenBuffers.binCountsSize,
             GraphResourceSemantic::GpuDrivenBinCounts);
+        bind(
+            m_gpuDrivenBuffers.cullClassification,
+            m_gpuDrivenBuffers.cullClassificationSize,
+            GraphResourceSemantic::GpuDrivenCullClassification);
+        bind(
+            m_gpuDrivenBuffers.cullStats,
+            m_gpuDrivenBuffers.cullStatsSize,
+            GraphResourceSemantic::GpuDrivenCullStats);
     }
 
     void VulkanBackend::resolveClusterBuffers(const CompiledGraphPlan& plan)
@@ -4733,6 +5017,15 @@ namespace ic
                     scene.camera.farPlane);
                 frameData.projection[1][1] *= -1.0f;
                 frameData.viewProjection = frameData.projection * frameData.view;
+                const bool occlusionHistoryReliable =
+                    updateGpuOcclusionHistory(
+                        m_gpuOcclusionHistory,
+                        scene,
+                        m_clusteredForwardResources.width,
+                        m_clusteredForwardResources.height,
+                        frameData.view,
+                        frameData.projection,
+                        frameData);
                 frameData.cameraPosition = scene.camera.position;
                 frameData.time = ctx.timeSinceStart;
                 frameData.environmentEnabled =
@@ -4791,9 +5084,14 @@ namespace ic
                         instanceBoundsCount, ClusteredForwardMaxGpuCullInstances),
                     1u,
                     geometryBinCount,
-                    0u);
+                    occlusionHistoryReliable ? 1u : 0u);
                 frameData.cameraNearFar = glm::vec4(
                     scene.camera.nearPlane, scene.camera.farPlane, 0.0f, 0.0f);
+                frameData.occlusionDebugConfig = glm::uvec4(
+                    static_cast<uint32_t>(m_gpuCullDebugMode),
+                    m_gpuCullDebugMode != GpuCullDebugMode::Off ? 1u : 0u,
+                    m_gpuOcclusionEnabled ? 1u : 0u,
+                    0u);
                 return frameData;
             });
 
@@ -5294,23 +5592,14 @@ namespace ic
         m_clusteredForwardResources.hiZDebugViews.clear();
     }
 
-    void VulkanBackend::drawHiZDebugWindow()
+    HiZDebugImage VulkanBackend::hiZDebugImage(bool previous, uint32_t mip)
     {
-        if (!m_hiZDebugViewEnabled)
-        {
-            return;
-        }
-
-        ImGui::SetNextWindowSize(ImVec2(360.0f, 260.0f), ImGuiCond_FirstUseEver);
-        if (!ImGui::Begin("Hi-Z Depth Pyramid", &m_hiZDebugViewEnabled))
-        {
-            ImGui::End();
-            return;
-        }
-
         VulkanGraphResourceEntry* hiZ =
-            m_graphResourceRegistry.entry(
-                m_clusteredForwardResources.hiZDebugResource);
+            previous
+                ? m_graphResourceRegistry.previousEntry(
+                    m_clusteredForwardResources.hiZDebugResource)
+                : m_graphResourceRegistry.entry(
+                    m_clusteredForwardResources.hiZDebugResource);
 
         if (hiZ)
         {
@@ -5321,39 +5610,113 @@ namespace ic
             m_clusteredForwardResources.hiZDebugDescriptors;
         if (!hiZ || descriptors.empty())
         {
-            ImGui::TextUnformatted("Waiting for Hi-Z pyramid...");
-            ImGui::End();
-            return;
+            return {};
         }
 
-        const uint32_t mip =
-            std::min<uint32_t>(
-                m_hiZDebugMip,
-                static_cast<uint32_t>(descriptors.size() - 1u));
-        const uint32_t mipWidth = std::max(1u, hiZ->width >> mip);
-        const uint32_t mipHeight = std::max(1u, hiZ->height >> mip);
-        const ImVec2 available = ImGui::GetContentRegionAvail();
-        const float maxWidth = std::max(1.0f, available.x);
-        const float maxHeight = std::max(1.0f, available.y - 8.0f);
-        const float aspect =
-            static_cast<float>(mipWidth) / static_cast<float>(mipHeight);
-        float width = maxWidth;
-        float height = width / aspect;
-        if (height > maxHeight)
-        {
-            height = maxHeight;
-            width = height * aspect;
-        }
+        const uint32_t mipLevels = static_cast<uint32_t>(descriptors.size());
+        const uint32_t clamped = std::min(mip, mipLevels - 1u);
 
-        ImGui::Text("Mip %u / %u", mip, static_cast<uint32_t>(descriptors.size()));
-        ImGui::Text(
-            "%ux%u",
-            mipWidth,
-            mipHeight);
-        ImGui::Image(
-            (ImTextureID)descriptors[mip],
-            ImVec2(width, height));
-        ImGui::End();
+        return {
+            .textureId = reinterpret_cast<uint64_t>(descriptors[clamped]),
+            .width = std::max(1u, hiZ->width >> clamped),
+            .height = std::max(1u, hiZ->height >> clamped),
+            .mipLevels = mipLevels,
+            .valid = true
+        };
+    }
+
+    void VulkanBackend::buildBackendDiagnostics()
+    {
+        m_diagnosticAdapterName = m_adapter.info().properties.deviceName;
+
+        const VulkanFeatureSupport& features =
+            m_adapter.info().supportedFeatures;
+        const QueueFamilyIndices& families = m_adapter.info().queueFamilies;
+
+        m_diagnosticFeatures.clear();
+        m_diagnosticFeatures.push_back({
+            .name = "Validation layers",
+            .enabled = m_instance.validationEnabled() });
+        m_diagnosticFeatures.push_back({
+            .name = "Async compute queue",
+            .enabled = m_device.computeQueue() != VK_NULL_HANDLE &&
+                m_device.computeQueue() != m_device.graphicsQueue(),
+            .detail = "Distinct compute queue family" });
+        m_diagnosticFeatures.push_back({
+            .name = "Dynamic rendering",
+            .enabled = features.dynamicRendering });
+        m_diagnosticFeatures.push_back({
+            .name = "Synchronization2",
+            .enabled = features.synchronization2 });
+        m_diagnosticFeatures.push_back({
+            .name = "Timeline semaphores",
+            .enabled = features.timelineSemaphore,
+            .detail = "Cross-queue ordering for async compute" });
+        m_diagnosticFeatures.push_back({
+            .name = "Descriptor indexing",
+            .enabled = features.descriptorIndexing });
+        m_diagnosticFeatures.push_back({
+            .name = "Descriptor heap (EXT)",
+            .enabled = features.descriptorHeap,
+            .detail = features.descriptorHeapAvailable && !features.descriptorHeap
+                ? "Advertised but disabled by the current runtime/validation "
+                  "state"
+                : "" });
+        m_diagnosticFeatures.push_back({
+            .name = "Descriptor buffer (EXT)",
+            .enabled = features.descriptorBuffer });
+        m_diagnosticFeatures.push_back({
+            .name = "Buffer device address",
+            .enabled = features.bufferDeviceAddress });
+        m_diagnosticFeatures.push_back({
+            .name = "Draw indirect count",
+            .enabled = features.drawIndirectCount,
+            .detail = "GPU-driven draw count without a readback" });
+        m_diagnosticFeatures.push_back({
+            .name = "GPU pass timestamps",
+            .enabled = m_gpuProfiler.enabled(),
+            .detail = "Feeds the async-compute policy" });
+
+        const VkPhysicalDeviceLimits& limits =
+            m_adapter.info().properties.limits;
+        m_diagnosticLimits.clear();
+        m_diagnosticLimits.push_back({
+            .name = "Graphics queue family",
+            .value = families.graphics });
+        m_diagnosticLimits.push_back({
+            .name = "Compute queue family",
+            .value = families.compute });
+        m_diagnosticLimits.push_back({
+            .name = "Transfer queue family",
+            .value = families.transfer });
+        m_diagnosticLimits.push_back({
+            .name = "Timestamp period (ps)",
+            .value = static_cast<uint64_t>(limits.timestampPeriod * 1000.0f) });
+        m_diagnosticLimits.push_back({
+            .name = "Max compute workgroup invocations",
+            .value = limits.maxComputeWorkGroupInvocations });
+        m_diagnosticLimits.push_back({
+            .name = "Max 2D image dimension",
+            .value = limits.maxImageDimension2D });
+        m_diagnosticLimits.push_back({
+            .name = "Max bound descriptor sets",
+            .value = limits.maxBoundDescriptorSets });
+        m_diagnosticLimits.push_back({
+            .name = "Frames in flight",
+            .value = m_frameExecutor.framesInFlight() });
+        m_diagnosticLimits.push_back({
+            .name = "Recording worker slots",
+            .value = m_workerSlots });
+    }
+
+    BackendDiagnosticInfo VulkanBackend::backendDiagnostics() const
+    {
+        return {
+            .backendName = "Vulkan",
+            .adapterName = m_diagnosticAdapterName.c_str(),
+            .features = std::span<const BackendFeature>(m_diagnosticFeatures),
+            .limits = std::span<const BackendLimit>(m_diagnosticLimits)
+        };
     }
 
     void VulkanBackend::endDebugGuiFrame()
@@ -5363,7 +5726,6 @@ namespace ic
             return;
         }
 
-        drawHiZDebugWindow();
         ImGui::Render();
         m_imguiFrameActive = false;
     }
@@ -5406,19 +5768,27 @@ namespace ic
         if (m_hiZDebugViewEnabled)
         {
             hiZDebugResource =
-                m_graphResourceRegistry.entry(
-                    m_clusteredForwardResources.hiZDebugResource);
+                m_hiZDebugPrevious
+                    ? m_graphResourceRegistry.previousEntry(
+                        m_clusteredForwardResources.hiZDebugResource)
+                    : m_graphResourceRegistry.entry(
+                        m_clusteredForwardResources.hiZDebugResource);
         }
 
         // ImGui is an external consumer of the compiled frame graph. Acquire
         // the pyramid for sampling here, then restore the graph's GENERAL
         // layout below so the next frame starts from its compiled state.
-        if (hiZDebugResource && hiZDebugResource->texture.image != VK_NULL_HANDLE)
+        const VkImageLayout hiZOriginalLayout = hiZDebugResource
+            ? hiZDebugResource->layout
+            : VK_IMAGE_LAYOUT_UNDEFINED;
+        if (hiZDebugResource &&
+            hiZDebugResource->texture.image != VK_NULL_HANDLE &&
+            hiZOriginalLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
         {
             transitionImage(
                 cmd,
                 hiZDebugResource->texture.image,
-                VK_IMAGE_LAYOUT_GENERAL,
+                hiZOriginalLayout,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 0,
                 VK_ACCESS_SHADER_READ_BIT,
@@ -5459,13 +5829,15 @@ namespace ic
         ImGui_ImplVulkan_RenderDrawData(drawData, cmd);
         vkCmdEndRendering(cmd);
 
-        if (hiZDebugResource && hiZDebugResource->texture.image != VK_NULL_HANDLE)
+        if (hiZDebugResource &&
+            hiZDebugResource->texture.image != VK_NULL_HANDLE &&
+            hiZOriginalLayout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
         {
             transitionImage(
                 cmd,
                 hiZDebugResource->texture.image,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_IMAGE_LAYOUT_GENERAL,
+                hiZOriginalLayout,
                 VK_ACCESS_SHADER_READ_BIT,
                 0,
                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
@@ -5541,6 +5913,60 @@ namespace ic
     void VulkanBackend::setHiZDebugMip(uint32_t mip)
     {
         m_hiZDebugMip = mip;
+    }
+
+    bool VulkanBackend::hiZDebugPrevious() const
+    {
+        return m_hiZDebugPrevious;
+    }
+
+    void VulkanBackend::setHiZDebugPrevious(bool previous)
+    {
+        if (m_hiZDebugPrevious != previous)
+        {
+            destroyHiZDebugDescriptors();
+        }
+        m_hiZDebugPrevious = previous;
+    }
+
+    bool VulkanBackend::gpuOcclusionEnabled() const
+    {
+        return m_gpuOcclusionEnabled;
+    }
+
+    void VulkanBackend::setGpuOcclusionEnabled(bool enabled)
+    {
+        m_gpuOcclusionEnabled = enabled;
+    }
+
+    GpuCullDebugMode VulkanBackend::gpuCullDebugMode() const
+    {
+        return m_gpuCullDebugMode;
+    }
+
+    void VulkanBackend::setGpuCullDebugMode(GpuCullDebugMode mode)
+    {
+        if (m_gpuCullDebugMode != mode)
+        {
+            m_gpuCullDiagnosticFrames = 0;
+            m_gpuCullStats = {};
+            m_gpuCullPerformance = {};
+            std::fill(
+                m_gpuCullTimestampValid.begin(),
+                m_gpuCullTimestampValid.end(),
+                uint8_t{0});
+        }
+        m_gpuCullDebugMode = mode;
+    }
+
+    GpuCullStats VulkanBackend::gpuCullStats() const
+    {
+        return m_gpuCullStats;
+    }
+
+    GpuCullPerformance VulkanBackend::gpuCullPerformance() const
+    {
+        return m_gpuCullPerformance;
     }
 
     bool VulkanBackend::supportsAsyncCompute() const
@@ -5733,6 +6159,13 @@ namespace ic
         destroySceneResources();
         m_graphResourceRegistry.reset();
         m_pipelineManager.shutdown();
+        m_gpuCullDiagnosticFrames = 0;
+        m_gpuCullStats = {};
+        m_gpuCullPerformance = {};
+        std::fill(
+            m_gpuCullTimestampValid.begin(),
+            m_gpuCullTimestampValid.end(),
+            uint8_t{0});
 
         if (!m_swapchain.validForRendering())
             return;

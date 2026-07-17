@@ -81,7 +81,7 @@ namespace ic
                 .debugName = "ClusteredForward.SceneDepth"
                 });
 
-            depthPyramid = builder.createTexture({
+            depthPyramid = builder.createHistoryTexture({
                 .width = renderWidth,
                 .height = renderHeight,
                 .depth = 1,
@@ -177,21 +177,26 @@ namespace ic
             // -> CullLightsToClusters) has no dependency on sceneDepth or the
             // depth prepass: it reads/writes only the cluster buffers and reads
             // visibleLightBuffer, joining graphics work solely at
-            // ClusteredForwardOpaque. That makes it safe to run on the async
+            // ClusteredForwardOpaque. That makes it SAFE to run on the async
             // compute queue concurrently with the depth prepass + Hi-Z build.
             // Hi-Z and the GPU-driven cull stay on graphics (they touch
             // sceneDepth / feed the depth prepass), so sceneDepth never crosses
-            // the queue boundary. When async is disabled the whole chain falls
-            // back to the graphics queue for byte-identical serial behavior.
+            // the queue boundary.
+            //
+            // Safety is all this path asserts. Whether async is WORTH it is the
+            // scheduler's deterministic async-compute setting, because it depends on
+            // measurements no pass can see -- on a CPU-bound frame the extra
+            // submissions and fences cost more than the overlap saves. The
+            // chain is marked eligible below and ctx.asyncComputeEnabled
+            // carries the scheduler's verdict; when it is false the whole chain
+            // stays on graphics, byte-identical to the serial baseline.
             const QueueType clusterQueue = ctx.asyncComputeEnabled
                 ? QueueType::Compute
                 : QueueType::Graphics;
 
-            gpuDriven = declareGpuDrivenResources(builder);
-            addGpuDrivenCullPasses(builder, gpuDriven);
-
-            // Frustum culling is deliberately before depth. A previous-frame
-            // Hi-Z input can be inserted into the shared cull stage later.
+            gpuDriven = declareGpuDrivenResources(
+                builder, ctx.occlusionDiagnosticsEnabled);
+            addGpuDrivenCullPasses(builder, gpuDriven, depthPyramid);
 
             auto depthPrepassNode =
                 builder.addGraphicsPass("DepthPrepass")
@@ -208,6 +213,11 @@ namespace ic
                 .dispatch((renderWidth + 7) / 8, (renderHeight + 7) / 8, 1)
                 .read(sceneDepth, ResourceUsage::SampledTexture)
                 .write(depthPyramid, ResourceUsage::StorageTexture);
+            addGpuDrivenOcclusionValidationPasses(
+                builder,
+                gpuDriven,
+                depthPyramid,
+                clusterQueue);
 
             // Build clusters
             //
@@ -222,6 +232,7 @@ namespace ic
                 .dispatch(clusterDispatchGroups, 1, 1)
                 .write(clusterBoundsBuffer, ResourceUsage::StorageBuffer)
                 .write(clusterExecutionToken, ResourceUsage::StorageBuffer)
+                .asyncEligible()
                 .onInvalidation(
                     PassInvalidation::GraphRebuild |
                     PassInvalidation::Resize |
@@ -234,7 +245,8 @@ namespace ic
                 .pipeline("reset_cluster_light_counter")
                 .dispatch(1, 1, 1)
                 .write(clusterLightCounterBuffer, ResourceUsage::StorageBuffer)
-                .write(clusterExecutionToken, ResourceUsage::StorageBuffer);
+                .write(clusterExecutionToken, ResourceUsage::StorageBuffer)
+                .asyncEligible();
 
             // Cull lights into clusters.
             //
@@ -252,7 +264,8 @@ namespace ic
                 .write(clusterLightGridBuffer, ResourceUsage::StorageBuffer)
                 .write(clusterLightIndexBuffer, ResourceUsage::StorageBuffer)
                 .write(clusterLightCounterBuffer, ResourceUsage::StorageBuffer)
-                .write(clusterExecutionToken, ResourceUsage::StorageBuffer);
+                .write(clusterExecutionToken, ResourceUsage::StorageBuffer)
+                .asyncEligible();
 
 
             // Opaque clustered forward pass

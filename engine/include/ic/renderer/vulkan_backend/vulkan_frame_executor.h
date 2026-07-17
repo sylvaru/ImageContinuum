@@ -103,6 +103,21 @@ namespace ic
             uint64_t value = 0;
         };
         std::vector<CrossFrameSignal> m_prevSubmissionSignals;
+        std::vector<std::vector<CrossFrameSignal>> m_crossFrameWaits;
+        std::vector<uint32_t> m_commandIndexByNode;
+        std::vector<CrossFrameSignal> m_submissionSignals;
+        std::vector<VkQueue> m_uploadWaitedQueues;
+        std::vector<VkSemaphore> m_waitSemaphores;
+        std::vector<uint64_t> m_waitValues;
+        std::vector<VkPipelineStageFlags> m_waitStages;
+        std::vector<VkCommandBuffer> m_batchCommands;
+
+    public:
+        // Call only after vkDeviceWaitIdle. Submission indices from the prior
+        // compiled plan are then stale and must not be carried into a rebuild.
+        void resetAfterGpuDrain() { m_prevSubmissionSignals.clear(); }
+
+    private:
 
         void destroyFrameSync();
         void destroySwapchainSync();
