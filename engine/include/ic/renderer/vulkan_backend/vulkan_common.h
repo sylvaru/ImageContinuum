@@ -27,6 +27,8 @@ namespace ic
         bool drawIndirectCount = false;
         bool maintenance5 = false;
         bool extendedFlags = false;
+        bool accelerationStructure = false;
+        bool rayQuery = false;
     };
 
     struct QueueFamilyIndices
@@ -72,6 +74,9 @@ namespace ic
         VkPhysicalDeviceBufferDeviceAddressFeatures bufferDeviceAddressFeatures{};
         VkPhysicalDeviceVulkan13Features vulkan13Features{};
         VkPhysicalDeviceTimelineSemaphoreFeatures timelineSemaphoreFeatures{};
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR
+            accelerationStructureFeatures{};
+        VkPhysicalDeviceRayQueryFeaturesKHR rayQueryFeatures{};
 
 #ifdef VK_EXT_descriptor_buffer
         VkPhysicalDeviceDescriptorBufferFeaturesEXT descriptorBufferFeatures{};

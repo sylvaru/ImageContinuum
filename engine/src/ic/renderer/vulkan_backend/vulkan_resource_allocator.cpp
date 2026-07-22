@@ -277,7 +277,8 @@ namespace ic
     VulkanTexture VulkanResourceAllocator::createTexture(
         const ImageAsset& image,
         TextureUsageFlags usage,
-        const char* debugName)
+        const char* debugName,
+        uint32_t mipLevels)
     {
         if (!image.valid())
         {
@@ -288,7 +289,7 @@ namespace ic
         desc.width = image.width;
         desc.height = image.height;
         desc.depth = 1;
-        desc.mipLevels = 1;
+        desc.mipLevels = std::max(1u, mipLevels);
         desc.arrayLayers = 1;
         desc.format = textureFormatFromImageAsset(image);
         desc.usage = usage;
@@ -446,6 +447,13 @@ namespace ic
             flags |= VK_BUFFER_USAGE_TRANSFER_DST_BIT;
         if (hasFlag(usage, BufferUsageFlags::Indirect))
             flags |= VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+        if (hasFlag(
+                usage, BufferUsageFlags::AccelerationStructureStorage))
+            flags |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR;
+        if (hasFlag(
+                usage, BufferUsageFlags::AccelerationStructureBuildInput))
+            flags |=
+                VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR;
 
         return flags == 0 ? VK_BUFFER_USAGE_TRANSFER_DST_BIT : flags;
     }

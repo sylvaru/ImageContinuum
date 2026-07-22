@@ -92,8 +92,21 @@ namespace ic
         D3D12_HEAP_PROPERTIES heap =
             heapProperties(desc.memoryUsage);
 
-        const D3D12_RESOURCE_STATES initialState =
+        D3D12_RESOURCE_STATES initialState =
             initialBufferState(desc.memoryUsage);
+        if (desc.memoryUsage == ResourceMemoryUsage::GpuOnly &&
+            (desc.usage & BufferUsageFlags::AccelerationStructureStorage) !=
+                BufferUsageFlags::None)
+        {
+            initialState =
+                D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+        }
+        else if (desc.memoryUsage == ResourceMemoryUsage::GpuOnly &&
+                 (desc.usage & BufferUsageFlags::AccelerationStructureScratch) !=
+                    BufferUsageFlags::None)
+        {
+            initialState = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        }
 
         DX12Buffer buffer{};
         buffer.size = desc.size;
@@ -180,7 +193,7 @@ namespace ic
         if (hasFlag(desc.usage, TextureUsageFlags::DepthAttachment))
         {
             clearValue.Format = toDxgiFormat(desc.format);
-            clearValue.DepthStencil.Depth = 1.0f;
+            clearValue.DepthStencil.Depth = 0.0f;
             clearValue.DepthStencil.Stencil = 0;
             optimizedClearValue = &clearValue;
         }
@@ -225,7 +238,8 @@ namespace ic
     DX12Texture DX12ResourceAllocator::createTexture(
         const ImageAsset& image,
         TextureUsageFlags usage,
-        const char* debugName)
+        const char* debugName,
+        uint32_t mipLevels)
     {
         if (!image.valid())
         {
@@ -236,7 +250,7 @@ namespace ic
         desc.width = image.width;
         desc.height = image.height;
         desc.depth = 1;
-        desc.mipLevels = 1;
+        desc.mipLevels = std::max(1u, mipLevels);
         desc.arrayLayers = 1;
         desc.format = textureFormatFromImageAsset(image);
         desc.usage = usage;
@@ -279,7 +293,10 @@ namespace ic
             return buffer.mapped;
         }
 
-        D3D12_RANGE readRange{};
+        const D3D12_RANGE readRange =
+            buffer.memoryUsage == ResourceMemoryUsage::GpuToCpu
+                ? D3D12_RANGE{ 0, static_cast<SIZE_T>(buffer.size) }
+                : D3D12_RANGE{ 0, 0 };
         throwIfFailed(
             buffer.resource->Map(
                 0,
@@ -315,6 +332,12 @@ namespace ic
         // API-neutral declaration carries BufferUsageFlags::Storage for both.
         if (hasFlag(desc.usage, BufferUsageFlags::Storage) &&
             desc.memoryUsage == ResourceMemoryUsage::GpuOnly)
+        {
+            flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        }
+        if (hasFlag(
+                desc.usage,
+                BufferUsageFlags::AccelerationStructureStorage))
         {
             flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
         }

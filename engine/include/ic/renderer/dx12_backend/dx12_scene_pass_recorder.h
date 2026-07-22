@@ -54,6 +54,7 @@ namespace ic
         D3D12_GPU_DESCRIPTOR_HANDLE irradianceSrv = {};
         D3D12_GPU_DESCRIPTOR_HANDLE prefilteredSrv = {};
         D3D12_GPU_DESCRIPTOR_HANDLE brdfLutSrv = {};
+        D3D12_GPU_DESCRIPTOR_HANDLE diffuseGiSrv = {};
         D3D12_GPU_DESCRIPTOR_HANDLE environmentSampler = {};
 
         bool useGpuDriven = false;

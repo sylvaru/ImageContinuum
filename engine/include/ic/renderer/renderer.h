@@ -93,6 +93,24 @@ namespace ic
         // changing it performs one fence-safe graph transition and is never
         // overridden by runtime measurements.
         void setAsyncComputeEnabled(bool enabled);
+        [[nodiscard]] bool globalIlluminationEnabled() const;
+        void setGlobalIlluminationEnabled(bool enabled);
+        [[nodiscard]] GlobalIlluminationQuality globalIlluminationQuality() const;
+        void setGlobalIlluminationQuality(GlobalIlluminationQuality quality);
+        [[nodiscard]] GlobalIlluminationConfiguration
+            globalIlluminationConfiguration() const;
+        void setGlobalIlluminationConfiguration(
+            const GlobalIlluminationConfiguration& configuration);
+        [[nodiscard]] GlobalIlluminationDebugView globalIlluminationDebugView() const;
+        void setGlobalIlluminationDebugView(GlobalIlluminationDebugView view);
+        [[nodiscard]] float globalIlluminationDiagnosticIntensity() const;
+        void setGlobalIlluminationDiagnosticIntensity(float intensity);
+        [[nodiscard]] float globalIlluminationDebugExposure() const;
+        void setGlobalIlluminationDebugExposure(float exposure);
+        [[nodiscard]] bool rayTracingEnabled() const;
+        void setRayTracingEnabled(bool enabled);
+        [[nodiscard]] GlobalIlluminationRuntimeStatistics
+            globalIlluminationStatistics() const;
         [[nodiscard]] RenderPathType renderPathType() const;
         
         void buildOrRebuildFrameGraph();
@@ -123,6 +141,7 @@ namespace ic
             FrameContext& frame);
 
         void updateGpuTimeline();
+        void updateRayTracingDemand();
         void requestAsyncComputeRebuild();
 
         struct Runtime;

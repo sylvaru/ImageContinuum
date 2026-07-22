@@ -1,3 +1,75 @@
+[pipelines.gi_cache_initialize]
+type = "Compute"
+bindingLayout = "GlobalIllumination"
+[pipelines.gi_cache_initialize.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gi_cache_initialize.cs.dxil"
+[pipelines.gi_cache_initialize.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gi_cache_initialize.comp.spv"
+
+[pipelines.gi_surface_prepare]
+type = "Compute"
+bindingLayout = "GlobalIllumination"
+[pipelines.gi_surface_prepare.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gi_surface_prepare.cs.dxil"
+[pipelines.gi_surface_prepare.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gi_surface_prepare.comp.spv"
+
+[pipelines.gi_surfel_allocate]
+type = "Compute"
+bindingLayout = "GlobalIllumination"
+[pipelines.gi_surfel_allocate.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gi_surfel_allocate.cs.dxil"
+[pipelines.gi_surfel_allocate.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gi_surfel_allocate.comp.spv"
+
+[pipelines.gi_prioritize_updates]
+type = "Compute"
+bindingLayout = "GlobalIllumination"
+[pipelines.gi_prioritize_updates.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gi_prioritize_updates.cs.dxil"
+[pipelines.gi_prioritize_updates.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gi_prioritize_updates.comp.spv"
+
+[pipelines.gi_trace_surfel_updates]
+type = "Compute"
+bindingLayout = "GlobalIllumination"
+[pipelines.gi_trace_surfel_updates.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gi_trace_surfel_updates.cs.dxil"
+[pipelines.gi_trace_surfel_updates.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gi_trace_surfel_updates.comp.spv"
+
+[pipelines.gi_update_probes]
+type = "Compute"
+bindingLayout = "GlobalIllumination"
+[pipelines.gi_update_probes.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gi_update_probes.cs.dxil"
+[pipelines.gi_update_probes.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gi_update_probes.comp.spv"
+
+[pipelines.gi_preserve_probes]
+type = "Compute"
+bindingLayout = "GlobalIllumination"
+[pipelines.gi_preserve_probes.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gi_preserve_probes.cs.dxil"
+[pipelines.gi_preserve_probes.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gi_preserve_probes.comp.spv"
+
+[pipelines.gi_evaluate]
+type = "Compute"
+bindingLayout = "GlobalIllumination"
+[pipelines.gi_evaluate.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gi_evaluate.cs.dxil"
+[pipelines.gi_evaluate.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gi_evaluate.comp.spv"
+
+[pipelines.gi_temporal_reconstruct]
+type = "Compute"
+bindingLayout = "GlobalIllumination"
+[pipelines.gi_temporal_reconstruct.shaders.dx12]
+compute = "demo/res/compiled_shaders/dx12/gi_temporal_reconstruct.cs.dxil"
+[pipelines.gi_temporal_reconstruct.shaders.vulkan]
+compute = "demo/res/compiled_shaders/vulkan/gi_temporal_reconstruct.comp.spv"
+
 [pipelines.forward_bindless]
 type = "Graphics"
 vertexLayout = "AssetVertex"
@@ -11,7 +83,7 @@ depthClip = true
 [pipelines.forward_bindless.depth]
 enabled = true
 write = true
-compare = "LessEqual"
+compare = "GreaterEqual"
 format = "D32_Float"
 
 [pipelines.forward_bindless.blend]
@@ -41,8 +113,11 @@ depthClip = true
 [pipelines.depth_prepass.depth]
 enabled = true
 write = true
-compare = "LessEqual"
+compare = "GreaterEqual"
 format = "D32_Float"
+
+[pipelines.depth_prepass.color]
+formats = ["RGBA32_Float"]
 
 [pipelines.depth_prepass.shaders.dx12]
 vertex = "demo/res/compiled_shaders/dx12/depth_prepass.vs.dxil"
@@ -103,7 +178,7 @@ cullMode = "None"
 [pipelines.skybox.depth]
 enabled = true
 write = false
-compare = "LessEqual"
+compare = "GreaterEqual"
 format = "D32_Float"
 
 [pipelines.skybox.color]
@@ -220,7 +295,7 @@ depthClip = true
 [pipelines.clustered_forward_opaque.depth]
 enabled = true
 write = true
-compare = "LessEqual"
+compare = "GreaterEqual"
 format = "D32_Float"
 
 [pipelines.clustered_forward_opaque.blend]

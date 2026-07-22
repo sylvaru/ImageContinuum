@@ -185,11 +185,31 @@ namespace ic
     }
 
     FrameGraphBuilder::ComputePassBuilder&
+        FrameGraphBuilder::ComputePassBuilder::dispatchIndirect(
+            GraphResourceId arguments,
+            uint64_t byteOffset)
+    {
+        m_builder.setComputePassIndirectDispatch(
+            m_node, arguments, byteOffset);
+        m_builder.read(m_node, arguments, ResourceUsage::IndirectArgument);
+        return *this;
+    }
+
+    FrameGraphBuilder::ComputePassBuilder&
         FrameGraphBuilder::ComputePassBuilder::write(
             GraphResourceId resource,
             ResourceUsage usage)
     {
         m_builder.write(m_node, resource, usage);
+        return *this;
+    }
+
+    FrameGraphBuilder::ComputePassBuilder&
+        FrameGraphBuilder::ComputePassBuilder::userData(
+            uint32_t x, uint32_t y, uint32_t z, uint32_t w,
+            uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+    {
+        m_builder.setComputePassUserData(m_node, {x, y, z, w, a, b, c, d});
         return *this;
     }
 
@@ -559,10 +579,47 @@ namespace ic
         if (ComputePassData* data =
             std::get_if<ComputePassData>(&m_payloads[payloadIndex]))
         {
+            data->indirectArguments = InvalidGraphResourceId;
+            data->indirectArgumentOffset = 0;
             data->groupCountX = groupCountX;
             data->groupCountY = groupCountY;
             data->groupCountZ = groupCountZ;
         }
+    }
+
+    void FrameGraphBuilder::setComputePassIndirectDispatch(
+        GraphNodeId node,
+        GraphResourceId arguments,
+        uint64_t byteOffset)
+    {
+        if (node >= m_nodes.size())
+        {
+            return;
+        }
+        const uint32_t payloadIndex = m_nodes[node].graphNode.payloadIndex;
+        if (payloadIndex >= m_payloads.size())
+        {
+            return;
+        }
+        if (ComputePassData* data =
+                std::get_if<ComputePassData>(&m_payloads[payloadIndex]))
+        {
+            data->indirectArguments = arguments;
+            data->indirectArgumentOffset = byteOffset;
+        }
+    }
+
+    void FrameGraphBuilder::setComputePassUserData(
+        GraphNodeId node, std::array<uint32_t, 8> data)
+    {
+        if (node >= m_nodes.size())
+            return;
+        NodeRecord& record = m_nodes[node];
+        if (record.graphNode.payloadIndex >= m_payloads.size())
+            return;
+        if (auto* pass = std::get_if<ComputePassData>(
+                &m_payloads[record.graphNode.payloadIndex]))
+            pass->userData = data;
     }
 
     void FrameGraphBuilder::setTransferCopy(

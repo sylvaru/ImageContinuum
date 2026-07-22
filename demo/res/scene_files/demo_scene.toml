@@ -30,7 +30,7 @@ fast_move_multiplier = 4.0
 mouse_sensitivity = 0.0010
 yaw = 0.0
 pitch = 0.0
-capture_mouse = true
+capture_mouse = false
 
 
 [[entities]]
@@ -42,17 +42,6 @@ model = "FPS_MAP/scene.glb"
 translation = [0.0, -0.5, -0.85]
 rotation = [0.0, 0.0, 0.0, 1.0]
 scale = [0.222, 0.222, 0.222]
-
-
-[[entities]]
-id = 4
-name = "Bathroom PBR Floor"
-model = "bathroom_floor/scene.gltf"
-
-[entities.transform]
-translation = [0.0, -0.5																																																																																																														, -0.85]
-rotation = [0.0, 0.0, 0.0, 1.0]
-scale = [0.002, 0.002, 0.002]
 
 
 [[entities]]

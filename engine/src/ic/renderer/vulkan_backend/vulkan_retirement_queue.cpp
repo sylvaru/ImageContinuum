@@ -11,6 +11,9 @@ namespace ic
         uint32_t framesInFlight)
     {
         m_device = device;
+        m_destroyAccelerationStructure = reinterpret_cast<
+            PFN_vkDestroyAccelerationStructureKHR>(
+                vkGetDeviceProcAddr(device, "vkDestroyAccelerationStructureKHR"));
         m_allocator = &allocator;
         m_slots.resize(std::max(1u, framesInFlight));
     }
@@ -56,6 +59,16 @@ namespace ic
         if (pool != VK_NULL_HANDLE) m_slots[m_currentSlot].descriptorPools.push_back(pool);
     }
 
+    void VulkanRetirementQueue::retireAccelerationStructure(
+        VkAccelerationStructureKHR accelerationStructure)
+    {
+        if (accelerationStructure == VK_NULL_HANDLE)
+            return;
+        std::scoped_lock lock(m_mutex);
+        m_slots[m_currentSlot].accelerationStructures.push_back(
+            accelerationStructure);
+    }
+
     void VulkanRetirementQueue::drain()
     {
         std::scoped_lock lock(m_mutex);
@@ -67,6 +80,10 @@ namespace ic
 
     void VulkanRetirementQueue::recycle(Slot& slot)
     {
+        for (VkAccelerationStructureKHR as : slot.accelerationStructures)
+            if (m_destroyAccelerationStructure)
+                m_destroyAccelerationStructure(m_device, as, nullptr);
+        slot.accelerationStructures.clear();
         // Descriptor objects and views must die before their backing images.
         for (VkDescriptorPool pool : slot.descriptorPools)
             vkDestroyDescriptorPool(m_device, pool, nullptr);

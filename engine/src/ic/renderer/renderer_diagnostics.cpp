@@ -1335,6 +1335,171 @@ namespace ic
                 renderer.setClusteredForwardHeatmapEnabled(heatmap);
             }
             helpMarker("Tints pixels by the number of lights in their cluster.");
+
+            const GlobalIlluminationQuality currentQuality =
+                renderer.globalIlluminationQuality();
+            const auto& currentPreset =
+                globalIlluminationPresetInfo(currentQuality);
+            ImGui::SetNextItemWidth(210.0f);
+            if (ImGui::BeginCombo("RT / diffuse GI quality",
+                    currentQuality == GlobalIlluminationQuality::Custom
+                        ? "Custom" : currentPreset.name.data()))
+            {
+                for (const auto& preset : globalIlluminationPresets())
+                {
+                    const bool selected = currentQuality == preset.quality;
+                    if (ImGui::Selectable(preset.name.data(), selected))
+                        renderer.setGlobalIlluminationQuality(preset.quality);
+                    if (selected) ImGui::SetItemDefaultFocus();
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("%.*s\nTarget %.2f ms; memory limit %.0f MiB",
+                            static_cast<int>(preset.description.size()),
+                            preset.description.data(),
+                            preset.gpuTimeTargetMilliseconds,
+                            static_cast<double>(preset.memoryLimitBytes) /
+                                (1024.0 * 1024.0));
+                }
+                if (ImGui::Selectable("Custom",
+                        currentQuality == GlobalIlluminationQuality::Custom))
+                    renderer.setGlobalIlluminationQuality(
+                        GlobalIlluminationQuality::Custom);
+                ImGui::EndCombo();
+            }
+            helpMarker(
+                "Presets change coherent spatial, ray, update, and reconstruction "
+                "budgets without changing lighting intensity. Off removes GI and "
+                "its hardware-RT demand when no other RT path is active.");
+
+            if (currentQuality == GlobalIlluminationQuality::Custom)
+            {
+                auto custom = renderer.globalIlluminationConfiguration();
+                bool changed = false;
+                int clipmaps = static_cast<int>(custom.limits.probeClipmapCount);
+                int resolution = static_cast<int>(custom.limits.probeResolution);
+                int updates = static_cast<int>(custom.limits.maxProbeUpdates);
+                int rays = static_cast<int>(custom.limits.rayBudget);
+                int visibilityRays = std::clamp(
+                    rays / std::max(updates, 1), 1, 32);
+                int divisor = static_cast<int>(custom.evaluationDivisor);
+                int memoryMiB = static_cast<int>(custom.memoryLimitBytes /
+                    (1024ull * 1024ull));
+                float gpuTarget = custom.gpuTimeTargetMilliseconds;
+                ImGui::SetNextItemWidth(130.0f);
+                changed |= ImGui::SliderInt("Probe clipmaps", &clipmaps, 1, 8);
+                ImGui::SetNextItemWidth(130.0f);
+                changed |= ImGui::SliderInt("Probe resolution", &resolution, 8, 64);
+                ImGui::SetNextItemWidth(130.0f);
+                changed |= ImGui::InputInt("Probe updates / frame", &updates, 64, 256);
+                ImGui::SetNextItemWidth(130.0f);
+                changed |= ImGui::InputInt("GI ray budget", &rays, 1024, 8192);
+                ImGui::SetNextItemWidth(130.0f);
+                if (ImGui::SliderInt(
+                        "Visibility rays / probe", &visibilityRays, 1, 32))
+                {
+                    rays = std::max(updates, 64) * visibilityRays;
+                    changed = true;
+                }
+                ImGui::SetNextItemWidth(130.0f);
+                changed |= ImGui::SliderInt(
+                    "Temporal reconstruction divisor", &divisor, 2, 4);
+                ImGui::SetNextItemWidth(130.0f);
+                changed |= ImGui::InputInt(
+                    "GI memory limit (MiB)", &memoryMiB, 16, 64);
+                ImGui::SetNextItemWidth(130.0f);
+                changed |= ImGui::InputFloat(
+                    "GI GPU target (ms)", &gpuTarget, 0.1f, 0.5f, "%.2f");
+                changed |= ImGui::Checkbox("Surfel detail", &custom.surfelDetail);
+                if (changed)
+                {
+                    custom.quality = GlobalIlluminationQuality::Custom;
+                    custom.limits.probeClipmapCount =
+                        static_cast<uint32_t>(std::max(clipmaps, 1));
+                    custom.limits.probeResolution =
+                        static_cast<uint32_t>(std::max(resolution, 2));
+                    custom.limits.maxProbeUpdates =
+                        static_cast<uint32_t>(std::max(updates, 64));
+                    custom.limits.rayBudget =
+                        static_cast<uint32_t>(std::max(rays, 1));
+                    custom.evaluationDivisor = divisor <= 2 ? 2u : 4u;
+                    custom.memoryLimitBytes = static_cast<uint64_t>(
+                        std::max(memoryMiB, 0)) * 1024ull * 1024ull;
+                    custom.gpuTimeTargetMilliseconds =
+                        std::max(gpuTarget, 0.0f);
+                    renderer.setGlobalIlluminationConfiguration(custom);
+                }
+            }
+
+            const auto views = globalIlluminationDebugViews();
+            const GlobalIlluminationDebugView selectedView =
+                renderer.globalIlluminationDebugView();
+            const auto& selectedViewInfo =
+                globalIlluminationDebugViewInfo(selectedView);
+            ImGui::SetNextItemWidth(250.0f);
+            if (ImGui::BeginCombo("GI debug", selectedViewInfo.name.data()))
+            {
+                for (const auto& view : views)
+                {
+                    const bool selected = selectedView == view.view;
+                    if (ImGui::Selectable(view.name.data(), selected))
+                        renderer.setGlobalIlluminationDebugView(view.view);
+                    if (selected) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::BeginTooltip();
+                ImGui::TextWrapped("%.*s", static_cast<int>(selectedViewInfo.tooltip.size()),
+                    selectedViewInfo.tooltip.data());
+                ImGui::Separator();
+                ImGui::Text("Legend: %.*s", static_cast<int>(selectedViewInfo.legend.size()),
+                    selectedViewInfo.legend.data());
+                ImGui::Text("Units/range: %.*s", static_cast<int>(selectedViewInfo.unitsAndRange.size()),
+                    selectedViewInfo.unitsAndRange.data());
+                ImGui::Text("Source: %.*s / %.*s",
+                    static_cast<int>(selectedViewInfo.sourcePass.size()), selectedViewInfo.sourcePass.data(),
+                    static_cast<int>(selectedViewInfo.sourceResource.size()), selectedViewInfo.sourceResource.data());
+                ImGui::Text("Class: %s", selectedViewInfo.filtered
+                    ? "cached / filtered (must be stable)" : "raw state (may change/noise)");
+                ImGui::EndTooltip();
+            }
+            if (selectedViewInfo.radiometric)
+            {
+                float exposure = renderer.globalIlluminationDebugExposure();
+                ImGui::SetNextItemWidth(210.0f);
+                if (ImGui::SliderFloat("GI debug exposure", &exposure,
+                        0.03125f, 32.0f, "%.3fx",
+                        ImGuiSliderFlags_Logarithmic))
+                    renderer.setGlobalIlluminationDebugExposure(exposure);
+            }
+            if (selectedView ==
+                    GlobalIlluminationDebugView::DiagnosticIntensity)
+            {
+                float intensity =
+                    renderer.globalIlluminationDiagnosticIntensity();
+                ImGui::SetNextItemWidth(210.0f);
+                if (ImGui::SliderFloat(
+                        "GI diagnostic intensity", &intensity,
+                        0.0f, 16.0f, "%.2fx"))
+                {
+                    renderer.setGlobalIlluminationDiagnosticIntensity(intensity);
+                }
+            }
+            helpMarker(
+                "The intensity slider affects only its diagnostic view. "
+                "Normal shading remains fixed at physically neutral 1.0x.");
+
+            const GlobalIlluminationRuntimeStatistics giStats =
+                renderer.globalIlluminationStatistics();
+            ImGui::Text("GI: %s | %.3f ms inclusive",
+                giStats.active ? "active" :
+                    (giStats.memoryLimitExceeded ? "memory limit exceeded" :
+                        "fallback off"),
+                giStats.inclusiveGpuMilliseconds);
+            ImGui::Text("%u probe updates | %u rays | %.2f MiB (probes %.2f MiB)",
+                giStats.configuredProbeUpdates, giStats.configuredRayBudget,
+                static_cast<double>(giStats.allocatedBytes) / (1024.0 * 1024.0),
+                static_cast<double>(giStats.probeBytes) / (1024.0 * 1024.0));
         }
 
         if (renderer.gpuCullDebugMode() != GpuCullDebugMode::Off)

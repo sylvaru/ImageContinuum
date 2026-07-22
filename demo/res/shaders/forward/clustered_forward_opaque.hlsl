@@ -21,6 +21,11 @@ TextureCube<float4> gPrefilteredEnvironmentTexture : register(t1, space1);
 Texture2D<float4> gBrdfLutTexture : register(t2, space1);
 
 #if defined(IC_TARGET_VULKAN)
+[[vk::binding(4101, 0)]]
+#endif
+Texture2D<float4> gResolvedDiffuseIrradiance : register(t3, space1);
+
+#if defined(IC_TARGET_VULKAN)
 [[vk::binding(256, 0)]]
 #endif
 SamplerState gIblSampler : register(s0, space1);
@@ -99,15 +104,27 @@ float4 sampleMaterialTexture(
     return fallbackValue;
 }
 
-float3 evaluateIblAmbient(
+void unpackGiCoverageVisibility(float packed, out float coverage,
+    out float visibility)
+{
+    const float integerPart = floor(max(packed, 0.0f));
+    coverage = saturate(integerPart * (1.0f / 1023.0f));
+    visibility = saturate(frac(max(packed, 0.0f)) *
+        (1024.0f / 1023.0f));
+}
+
+void evaluateIblAmbient(
     float3 baseColor,
     float metallic,
     float roughness,
     float ao,
     float3 normal,
-    float3 viewDirection)
+    float3 viewDirection,
+    out float3 diffuseAmbient,
+    out float3 specularAmbient)
 {
-    float3 ambient = 0.03f * baseColor * ao;
+    diffuseAmbient = 0.03f * baseColor * ao;
+    specularAmbient = 0.0f;
 
     if (gFrame.environmentEnabled != 0u)
     {
@@ -150,14 +167,12 @@ float3 evaluateIblAmbient(
         const float3 specular =
             prefilteredColor * (fresnel * brdf.x + brdf.y);
 
-        ambient =
-            (diffuse + specular) *
-            ao *
+        const float environmentScale =
             gFrame.environmentIntensity *
             gFrame.environmentExposure;
+        diffuseAmbient = diffuse * ao * environmentScale;
+        specularAmbient = specular * ao * environmentScale;
     }
-
-    return ambient;
 }
 
 float4 PSMain(VertexOutput input) : SV_Target0
@@ -221,11 +236,15 @@ float4 PSMain(VertexOutput input) : SV_Target0
     const float metallic =
         saturate(material.metallicFactor * metallicRoughnessSample.b);
 
-    const float roughness =
+    const float materialRoughness =
         clamp(
             material.roughnessFactor * metallicRoughnessSample.g,
             0.04f,
             1.0f);
+    const float roughness = specularAntiAliasedRoughness(
+        materialRoughness,
+        normal,
+        saturate(length(normalMap)));
 
     const float ao =
         lerp(
@@ -251,7 +270,7 @@ float4 PSMain(VertexOutput input) : SV_Target0
     const float3 lightDirection =
         safeNormalize(-gFrame.lightDirection, float3(0.0f, 1.0f, 0.0f));
 
-    float3 direct =
+    const float3 directionalDirect =
         pbrDirectLighting(
             baseColor,
             metallic,
@@ -260,6 +279,7 @@ float4 PSMain(VertexOutput input) : SV_Target0
             viewDirection,
             lightDirection,
             gFrame.lightColor * gFrame.lightIntensity);
+    float3 direct = directionalDirect;
 
     const uint clusterIndex =
         clusteredClusterIndexFromPixel(input.position, input.worldPosition);
@@ -368,17 +388,99 @@ float4 PSMain(VertexOutput input) : SV_Target0
                     attenuation);
     }
 
-    const float3 ambient =
-        evaluateIblAmbient(
-            baseColor,
-            metallic,
-            roughness,
-            ao,
-            normal,
-            viewDirection);
+    float3 diffuseAmbient = 0.0f;
+    float3 specularAmbient = 0.0f;
+    evaluateIblAmbient(
+        baseColor,
+        metallic,
+        roughness,
+        ao,
+        normal,
+        viewDirection,
+        diffuseAmbient,
+        specularAmbient);
 
-    float3 color =
-        ambient + direct + emissive;
+    float3 diffuseGi = 0.0f;
+    float4 resolvedGi = 0.0f;
+    const uint giDebugView = gFrame.globalIlluminationConfig.y;
+    if (gFrame.globalIlluminationConfig.x != 0u)
+    {
+        const float2 giUv =
+            input.position.xy /
+            max(float2(gFrame.renderExtentAndHiZ.xy), 1.0f.xx);
+        resolvedGi = gResolvedDiffuseIrradiance.SampleLevel(
+            gIblSampler, saturate(giUv), 0.0f);
+        diffuseGi = resolvedGi.rgb *
+            baseColor * (1.0f - metallic) * ao;
+    }
+
+    float giCoverage = 0.0f;
+    float directionalVisibility = 1.0f;
+    if (gFrame.globalIlluminationConfig.x != 0u)
+        unpackGiCoverageVisibility(resolvedGi.a, giCoverage,
+            directionalVisibility);
+    direct -= directionalDirect * (1.0f - directionalVisibility);
+    // The traced cache contains the same environment path as diffuse IBL, plus
+    // visibility and bounced direct/emissive light. Replace diffuse IBL where
+    // validated GI exists instead of adding both estimates. Specular IBL is a
+    // separate transport path and remains untouched.
+    const float3 indirectDiffuse = lerp(
+        diffuseAmbient, diffuseGi, giCoverage);
+    const float3 withoutGi = diffuseAmbient + specularAmbient + direct + emissive;
+    const float3 withGi = indirectDiffuse + specularAmbient + direct + emissive;
+    float3 color = withGi;
+
+    // Views 1-5 diagnose the end-to-end forward injection. The cache stores
+    // E/pi, so view 1 multiplies by pi to display irradiance before the
+    // Lambert/material term; view 2 displays the actual post-BRDF contribution.
+    if (giDebugView == 1u)
+        color = resolvedGi.rgb * 3.14159265359f;
+    else if (giDebugView == 2u)
+        color = diffuseGi;
+    else if (giDebugView == 3u)
+    {
+        color = lerp(float3(0.35f, 0.0f, 0.05f),
+            float3(0.0f, 1.0f, 0.15f), giCoverage);
+    }
+    else if (giDebugView == 4u)
+    {
+        color = input.position.x < 0.5f * gFrame.renderExtentAndHiZ.x
+            ? withoutGi : withGi;
+    }
+    else if (giDebugView == 5u)
+    {
+        const float diagnosticIntensity = clamp(
+            asfloat(gFrame.globalIlluminationConfig.z), 0.0f, 16.0f);
+        color = diffuseGi * diagnosticIntensity;
+    }
+    else if (giDebugView == 23u)
+    {
+        // Diagnostic-only isolation of the rasterized direct/emissive path.
+        // The skybox remains visible because it is drawn by its own pass.
+        color = direct + emissive;
+    }
+    else if (giDebugView >= 6u)
+    {
+        // Cache/trace/reconstruction diagnostics are already display values.
+        // Do not apply the receiver BRDF or mix direct/IBL/emissive lighting;
+        // doing so previously hid chroma loss and made cache artifacts appear
+        // to be part of the final lighting path.
+        color = resolvedGi.rgb;
+    }
+
+    // Radiometric diagnostics use one explicit, frame-invariant exposure.
+    // Categorical/normalized views bypass it so their legends remain exact.
+    const bool radiometricGiDebug =
+        giDebugView == 1u || giDebugView == 2u || giDebugView == 4u ||
+        giDebugView == 5u || giDebugView == 13u || giDebugView == 14u ||
+        giDebugView == 18u || giDebugView == 20u || giDebugView == 21u ||
+        giDebugView == 22u || giDebugView == 23u;
+    if (radiometricGiDebug)
+    {
+        const float debugExposure = clamp(
+            asfloat(gFrame.globalIlluminationConfig.w), 0.03125f, 32.0f);
+        color *= debugExposure;
+    }
 
     color =
         color / (color + 1.0f);

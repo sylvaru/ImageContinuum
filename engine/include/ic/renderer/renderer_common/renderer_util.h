@@ -1,6 +1,9 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
@@ -22,6 +25,66 @@ namespace ic
     inline constexpr uint32_t DefaultPathTraceSamplesPerPixel = 2;
     inline constexpr uint32_t MaxPathTracePointLights = 8;
 
+    inline uint32_t configuredPathTraceMaxBounces() noexcept
+    {
+        static const uint32_t value = []
+        {
+            const char* text = nullptr;
+#if defined(_MSC_VER)
+            char* ownedText = nullptr;
+            size_t textLength = 0;
+            if (_dupenv_s(&ownedText, &textLength,
+                    "IC_PATH_TRACE_MAX_BOUNCES") != 0)
+                return DefaultPathTraceMaxBounces;
+            text = ownedText;
+#else
+            text = std::getenv("IC_PATH_TRACE_MAX_BOUNCES");
+#endif
+            uint32_t result = DefaultPathTraceMaxBounces;
+            if (!text || *text == '\0')
+            {
+#if defined(_MSC_VER)
+                std::free(ownedText);
+#endif
+                return result;
+            }
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(text, &end, 10);
+            if (end != text && *end == '\0')
+                result = std::clamp(static_cast<uint32_t>(parsed), 1u, 8u);
+#if defined(_MSC_VER)
+            std::free(ownedText);
+#endif
+            return result;
+        }();
+        return value;
+    }
+
+    inline uint32_t configuredPathTraceReferenceMode() noexcept
+    {
+        static const uint32_t value = []
+        {
+            const char* text = nullptr;
+#if defined(_MSC_VER)
+            char* ownedText = nullptr;
+            size_t textLength = 0;
+            if (_dupenv_s(&ownedText, &textLength,
+                    "IC_PATH_TRACE_INDIRECT_ONLY") != 0)
+                return 0u;
+            text = ownedText;
+#else
+            text = std::getenv("IC_PATH_TRACE_INDIRECT_ONLY");
+#endif
+            const uint32_t result =
+                text && text[0] == '1' && text[1] == '\0' ? 1u : 0u;
+#if defined(_MSC_VER)
+            std::free(ownedText);
+#endif
+            return result;
+        }();
+        return value;
+    }
+
     struct PathTraceConstants
     {
         uint32_t renderWidth = 0;
@@ -42,11 +105,12 @@ namespace ic
         uint32_t useSceneGeometry = 0;
         uint32_t environmentEnabled = 0;
         uint32_t sceneEmissiveTriangleIndex = UINT32_MAX;
-        uint32_t paddingScene0 = 0;
+        uint32_t referenceMode = 0;
 
         float environmentIntensity = 1.0f;
         float environmentExposure = 1.0f;
-        glm::vec2 paddingScene1 = glm::vec2(0.0f);
+        uint32_t sceneEmissiveTriangleCount = 0;
+        uint32_t paddingScene1 = 0;
 
         glm::vec4 cameraPositionAndTanHalfFov = glm::vec4(0.0f);
         glm::vec4 cameraForwardAndAspect = glm::vec4(0.0f);
@@ -58,6 +122,9 @@ namespace ic
 
         glm::vec4 pointLightPositionRange[MaxPathTracePointLights] = {};
         glm::vec4 pointLightColorIntensity[MaxPathTracePointLights] = {};
+
+        glm::vec4 directionalLightDirectionIntensity = glm::vec4(0.0f);
+        glm::vec4 directionalLightColor = glm::vec4(0.0f);
     };
 
     struct TonemapConstants
@@ -79,7 +146,7 @@ namespace ic
         glm::vec2 padding0 = glm::vec2(0.0f);
     };
 
-    static_assert(sizeof(PathTraceConstants) == 416);
+    static_assert(sizeof(PathTraceConstants) == 448);
     static_assert(sizeof(TonemapConstants) == 16);
     static_assert(sizeof(SkyboxConstants) == 80);
 
@@ -128,6 +195,119 @@ namespace ic
             static_cast<uint64_t>(image.height) *
             static_cast<uint64_t>(image.channels) *
             componentBytes;
+    }
+
+    struct ImageMipLevel
+    {
+        uint32_t width = 1;
+        uint32_t height = 1;
+        uint64_t offset = 0;
+        uint64_t size = 0;
+    };
+
+    struct ImageMipChain
+    {
+        std::vector<std::byte> pixels;
+        std::vector<ImageMipLevel> levels;
+    };
+
+    inline uint32_t completeMipCount(uint32_t width, uint32_t height)
+    {
+        uint32_t levels = 1;
+        for (uint32_t extent = std::max(width, height); extent > 1u;
+             extent >>= 1u)
+            ++levels;
+        return levels;
+    }
+
+    // Complete, backend-independent mip generation for model textures. sRGB
+    // colors are filtered in linear space; data and normal maps remain linear.
+    inline ImageMipChain buildImageMipChain(const ImageAsset& image)
+    {
+        ImageMipChain result{};
+        if (!image.valid())
+            return result;
+
+        const uint32_t componentBytes =
+            image.format == ImageFormat::RGBA32F ? sizeof(float) : 1u;
+        const uint32_t pixelBytes = image.channels * componentBytes;
+        const uint32_t mipCount = completeMipCount(image.width, image.height);
+        result.levels.reserve(mipCount);
+
+        uint64_t totalBytes = 0;
+        uint32_t width = image.width;
+        uint32_t height = image.height;
+        for (uint32_t mip = 0; mip < mipCount; ++mip)
+        {
+            const uint64_t levelBytes = static_cast<uint64_t>(width) * height *
+                pixelBytes;
+            result.levels.push_back({ width, height, totalBytes, levelBytes });
+            totalBytes += levelBytes;
+            width = std::max(1u, width >> 1u);
+            height = std::max(1u, height >> 1u);
+        }
+        result.pixels.resize(static_cast<size_t>(totalBytes));
+        std::memcpy(result.pixels.data(), image.pixels.data(),
+            static_cast<size_t>(result.levels.front().size));
+
+        const auto srgbToLinear = [](float value)
+        {
+            return value <= 0.04045f ? value / 12.92f :
+                std::pow((value + 0.055f) / 1.055f, 2.4f);
+        };
+        const auto linearToSrgb = [](float value)
+        {
+            value = std::clamp(value, 0.0f, 1.0f);
+            return value <= 0.0031308f ? value * 12.92f :
+                1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
+        };
+
+        for (uint32_t mip = 1; mip < mipCount; ++mip)
+        {
+            const ImageMipLevel& srcLevel = result.levels[mip - 1u];
+            const ImageMipLevel& dstLevel = result.levels[mip];
+            const std::byte* src = result.pixels.data() + srcLevel.offset;
+            std::byte* dst = result.pixels.data() + dstLevel.offset;
+            for (uint32_t y = 0; y < dstLevel.height; ++y)
+            for (uint32_t x = 0; x < dstLevel.width; ++x)
+            for (uint32_t channel = 0; channel < image.channels; ++channel)
+            {
+                float sum = 0.0f;
+                for (uint32_t oy = 0; oy < 2u; ++oy)
+                for (uint32_t ox = 0; ox < 2u; ++ox)
+                {
+                    const uint32_t sx = std::min(x * 2u + ox,
+                        srcLevel.width - 1u);
+                    const uint32_t sy = std::min(y * 2u + oy,
+                        srcLevel.height - 1u);
+                    const uint64_t index =
+                        (static_cast<uint64_t>(sy) * srcLevel.width + sx) *
+                            image.channels + channel;
+                    float value = 0.0f;
+                    if (componentBytes == sizeof(float))
+                        std::memcpy(&value, src + index * sizeof(float),
+                            sizeof(float));
+                    else
+                        value = std::to_integer<uint8_t>(src[index]) / 255.0f;
+                    if (image.srgb && componentBytes == 1u && channel < 3u)
+                        value = srgbToLinear(value);
+                    sum += value;
+                }
+                float value = sum * 0.25f;
+                if (image.srgb && componentBytes == 1u && channel < 3u)
+                    value = linearToSrgb(value);
+                const uint64_t index =
+                    (static_cast<uint64_t>(y) * dstLevel.width + x) *
+                        image.channels + channel;
+                if (componentBytes == sizeof(float))
+                    std::memcpy(dst + index * sizeof(float), &value,
+                        sizeof(float));
+                else
+                    dst[index] = static_cast<std::byte>(std::clamp(
+                        static_cast<int>(value * 255.0f + 0.5f), 0, 255));
+            }
+        }
+        return result;
     }
 
     inline bool matricesDiffer(

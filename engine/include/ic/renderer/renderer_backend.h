@@ -7,6 +7,7 @@
 #include "gpu_queue_profiler.h"
 #include "ibl_baker.h"
 #include "render_handles.h"
+#include "ic/renderer/ray_tracing/ray_tracing_scene.h"
 
 namespace ic 
 {
@@ -14,6 +15,7 @@ namespace ic
     struct GraphExecutionContext;
     struct FrameContext;
     struct SceneRenderView;
+    struct GpuGiDiagnostics;
 
     struct RendererSpecification;
 
@@ -220,6 +222,23 @@ namespace ic
         {
             return false;
         }
+
+        virtual RayTracingCapabilities rayTracingCapabilities() const
+        {
+            return {};
+        }
+        virtual bool globalIlluminationDiagnostics(
+            GpuGiDiagnostics&) const { return false; }
+        virtual void setGlobalIlluminationDisplay(
+            uint32_t, float, float) {}
+        virtual void setGlobalIlluminationRuntimeSettings(
+            uint32_t, uint32_t, uint32_t, uint32_t) {}
+
+        virtual void setRayTracingSceneService(RayTracingSceneService*)
+        {
+        }
+        virtual void setRayTracingEnabled(bool) {}
+        [[nodiscard]] virtual bool rayTracingEnabled() const { return false; }
 
         // Queue assignment is part of the compiled schedule. Before replacing
         // that schedule, the renderer calls this once so submissions made with

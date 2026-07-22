@@ -34,6 +34,7 @@ namespace
         Tonemap,
         EnvironmentConvert,
         Transfer,
+        NativeAccelerationStructure,
         NoOp
     };
 
@@ -68,6 +69,10 @@ namespace
         RecorderKind operator()(const TransferPassData&) const
         {
             return RecorderKind::Transfer;
+        }
+        RecorderKind operator()(const AccelerationStructureBuildPassData&) const
+        {
+            return RecorderKind::NativeAccelerationStructure;
         }
         RecorderKind operator()(const GeometryPassData&) const
         {
@@ -116,6 +121,9 @@ namespace
             "EnvironmentConvertPassData -> EnvironmentConvert recorder");
         check(route(PassPayload{TransferPassData{}}) == RecorderKind::Transfer,
             "TransferPassData -> Transfer recorder");
+        check(route(PassPayload{AccelerationStructureBuildPassData{}}) ==
+                  RecorderKind::NativeAccelerationStructure,
+            "AccelerationStructureBuildPassData -> native AS recorder");
         check(route(PassPayload{PresentPassData{}}) == RecorderKind::NoOp,
             "PresentPassData is graph-only (NoOp)");
         check(route(PassPayload{ClearPassData{}}) == RecorderKind::NoOp,
@@ -139,7 +147,7 @@ namespace
     // revisited rather than defaulting an unclassified pass to some neighbour.
     void testVariantAlternativeCount()
     {
-        check(std::variant_size_v<PassPayload> == 12,
+        check(std::variant_size_v<PassPayload> == 13,
             "PassPayload alternative count matches the dispatch routing table");
     }
 }

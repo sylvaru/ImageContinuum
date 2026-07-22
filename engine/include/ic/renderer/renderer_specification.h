@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include "render_types.h"
+#include "ic/renderer/global_illumination/global_illumination.h"
 
 namespace ic
 {
@@ -31,7 +32,9 @@ namespace ic
         // Uncapped by default. Vsync remains a separate presentation control.
         float targetFps = 0.0f;
         bool gpuOcclusion = true;
+        bool rayTracing = true;
         GpuCullDebugMode gpuCullDebugMode = GpuCullDebugMode::Off;
+        GlobalIlluminationConfiguration globalIllumination = {};
         EnvironmentSettings environment;
     };
 

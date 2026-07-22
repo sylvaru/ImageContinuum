@@ -86,7 +86,10 @@ namespace ic
         TransferSrc = 1u << 4,
         TransferDst = 1u << 5,
         Indirect = 1u << 6,
-        ShaderDeviceAddress = 1u << 7
+        ShaderDeviceAddress = 1u << 7,
+        AccelerationStructureStorage = 1u << 8,
+        AccelerationStructureBuildInput = 1u << 9,
+        AccelerationStructureScratch = 1u << 10
     };
 
     enum class TextureUsageFlags : uint32_t

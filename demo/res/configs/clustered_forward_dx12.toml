@@ -28,5 +28,30 @@ path_trace_exposure = 0.25
 tonemap_exposure = 1.0
 cubemap_size = 512
 
+[renderer.global_illumination]
+quality = "high"
+enabled = true
+async_compute = true
+diagnostics_readback = false
+evaluation_divisor = 2
+temporal_reconstruction_divisor = 2
+visibility_rays_per_probe = 32
+memory_limit_mb = 192
+gpu_time_target_ms = 1.9
+surfel_cell_size = 0.25
+surfel_detail = false
+max_surfels = 262144
+hash_buckets = 131072
+max_surfel_updates = 8192
+ray_budget = 32768
+probe_clipmaps = 4
+probe_resolution = 24
+max_probe_updates = 1024
+multi_bounce = false
+probe_fallback = true
+debug_view = "none"
+diagnostic_intensity = 1.0
+debug_exposure = 1.0
+
 [scene]
 file = "demo/res/scene_files/demo_scene.toml"

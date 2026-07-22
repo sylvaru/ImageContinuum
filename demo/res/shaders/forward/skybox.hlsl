@@ -24,7 +24,8 @@ VSOut VSMain(uint vertexId : SV_VertexID)
     };
 
     VSOut output;
-    output.position = float4(positions[vertexId], 1.0f, 1.0f);
+    // Reversed-Z clears to zero, so the skybox sits exactly on the far plane.
+    output.position = float4(positions[vertexId], 0.0f, 1.0f);
     output.uv = positions[vertexId] * 0.5f + 0.5f;
     return output;
 }

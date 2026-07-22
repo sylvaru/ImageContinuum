@@ -556,6 +556,42 @@ namespace
         }
     }
 
+    void testSkippedPersistentWriterDoesNotHidePerFrameWriter()
+    {
+        std::pmr::monotonic_buffer_resource mem;
+        FrameGraphBuilder builder(&mem);
+
+        const GraphResourceId persistent = builder.createPersistentBuffer({
+            .size = 256,
+            .usage = BufferUsageFlags::Storage,
+            .debugName = "Test.PersistentWithInitialization" });
+
+        const GraphNodeId initialize = builder.addComputePass("Initialize")
+            .write(persistent, ResourceUsage::StorageBuffer)
+            .once();
+        const GraphNodeId update = builder.addComputePass("Update")
+            .write(persistent, ResourceUsage::StorageBuffer);
+        const GraphNodeId reader = builder.addComputePass("Consume");
+        builder.read(reader, persistent, ResourceUsage::StorageBuffer);
+
+        FrameGraphCompiler compiler(&mem);
+        const CompiledGraphPlan plan = compiler.compile(builder);
+
+        bool initializesSafely = false;
+        bool updatesSafely = false;
+        for (const CrossFrameDependency& dep : plan.crossFrameDependencies)
+        {
+            if (dep.resource != persistent)
+                continue;
+            initializesSafely |= dep.consumerNode == initialize;
+            updatesSafely |= dep.consumerNode == update;
+        }
+        check(initializesSafely,
+            "once initialization retains its persistent cross-frame edge");
+        check(updatesSafely,
+            "per-frame writer retains an edge when an earlier once writer skips");
+    }
+
     void testReadOnlyPersistentHasNoCrossFrameEdge()
     {
         std::pmr::monotonic_buffer_resource mem;
@@ -629,6 +665,7 @@ int runFrameGraphResourceTests()
     testOcclusionHistoryReliabilityFallbacks();
     testPerFrameSlotHasNoCrossFrameDependency();
     testPersistentWriteEmitsCrossFrameEdge();
+    testSkippedPersistentWriterDoesNotHidePerFrameWriter();
     testReadOnlyPersistentHasNoCrossFrameEdge();
     testHistoryPreviousReadEmitsCrossFrameEdge();
 

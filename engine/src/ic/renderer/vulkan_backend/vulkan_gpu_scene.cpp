@@ -22,6 +22,8 @@ namespace ic
             m_resourceAllocator->destroyBuffer(frame.frameConstants);
             m_resourceAllocator->destroyBuffer(frame.objects);
             m_resourceAllocator->destroyBuffer(frame.materials);
+            m_resourceAllocator->destroyBuffer(frame.giRtGeometries);
+            m_resourceAllocator->destroyBuffer(frame.giRtInstances);
 
             if (device != VK_NULL_HANDLE)
             {
@@ -39,6 +41,11 @@ namespace ic
                 {
                     vkDestroyDescriptorPool(
                         device, frame.gpuCullDescriptorPool, nullptr);
+                }
+                if (frame.giDescriptorPool != VK_NULL_HANDLE)
+                {
+                    vkDestroyDescriptorPool(
+                        device, frame.giDescriptorPool, nullptr);
                 }
             }
         }

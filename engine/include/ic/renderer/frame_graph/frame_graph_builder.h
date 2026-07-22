@@ -59,6 +59,14 @@ namespace ic
                 uint32_t groupCountX,
                 uint32_t groupCountY = 1,
                 uint32_t groupCountZ = 1);
+            ComputePassBuilder& dispatchIndirect(
+                GraphResourceId arguments,
+                uint64_t byteOffset = 0);
+            ComputePassBuilder& userData(
+                uint32_t x, uint32_t y = 0,
+                uint32_t z = 0, uint32_t w = 0,
+                uint32_t a = 0, uint32_t b = 0,
+                uint32_t c = 0, uint32_t d = 0);
             ComputePassBuilder& read(
                 GraphResourceId resource,
                 ResourceUsage usage);
@@ -269,6 +277,12 @@ namespace ic
             uint32_t groupCountX,
             uint32_t groupCountY,
             uint32_t groupCountZ);
+        void setComputePassIndirectDispatch(
+            GraphNodeId node,
+            GraphResourceId arguments,
+            uint64_t byteOffset);
+        void setComputePassUserData(
+            GraphNodeId node, std::array<uint32_t, 8> data);
 
         void setTransferCopy(
             GraphNodeId node,

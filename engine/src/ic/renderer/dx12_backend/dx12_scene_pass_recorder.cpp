@@ -42,6 +42,10 @@ namespace ic
                 cmd->SetGraphicsRootDescriptorTable(8, inputs.brdfLutSrv);
                 cmd->SetGraphicsRootDescriptorTable(9, inputs.environmentSampler);
             }
+            if (inputs.diffuseGiSrv.ptr != 0)
+            {
+                cmd->SetGraphicsRootDescriptorTable(18, inputs.diffuseGiSrv);
+            }
             cmd->SetGraphicsRootShaderResourceView(
                 13,
                 clusterBufferAddress(ctx, GraphResourceSemantic::VisibleLights));

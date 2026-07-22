@@ -134,7 +134,26 @@ namespace ic
         GpuDrivenBinCounts,
         GpuDrivenCullClassification,
         GpuDrivenCullStats,
-        GpuDrivenCullStatsReadback
+        GpuDrivenCullStatsReadback,
+        GiSurfaceData,
+        GiSurfels,
+        GiVisibilityMoments,
+        GiHashBuckets,
+        GiProbes,
+        GiProbeStaging,
+        GiAllocationQueue,
+        GiPriorityQueue,
+        GiIndirectArguments,
+        GiCounters,
+        GiDiagnostics,
+        GiDiagnosticsReadback,
+        GiResidualInterface,
+        GiHitRecords,
+        GiRawIrradiance,
+        GiResolvedIrradiance,
+        GiSceneDepth,
+        GiSurfaceAttributes,
+        RayTracingSceneToken
     };
 
     enum class ImportedResource : uint8_t
@@ -321,9 +340,10 @@ namespace ic
     // frame's `producerSubmission` to complete, but only when `consumerNode`
     // actually executes this frame (a cadence-skipped writer creates no hazard,
     // so per-frame-slot-only and skipped-write frames overlap freely).
-    //   - Single/persistent written resource (WAR/WAW): consumerNode = the first
-    //     writer this frame; producerSubmission = the submission that last
-    //     accessed the resource (so the new write waits for the old last read).
+    //   - Single/persistent written resource (WAR/WAW): consumerNode candidates
+    //     cover cadence-conditional writers through the first per-frame writer;
+    //     producerSubmission = the submission that last accessed the resource.
+    //     The first candidate that executes therefore waits for the old last read.
     //   - History previous-instance read (RAW): consumerNode = the previous-
     //     version reader; producerSubmission = the submission that writes the
     //     current instance (the one the next frame reads).

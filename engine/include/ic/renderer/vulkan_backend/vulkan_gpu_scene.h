@@ -41,6 +41,8 @@ namespace ic
         VulkanBuffer frameConstants;
         VulkanBuffer objects;
         VulkanBuffer materials;
+        VulkanBuffer giRtGeometries;
+        VulkanBuffer giRtInstances;
         // visibleLights and the GPU-driven cull inputs are NOT here:
         // they are frame-graph-registry owned (per frame slot) and uploaded into
         // by the backend, so there is no duplicate backend allocation.
@@ -48,13 +50,19 @@ namespace ic
         VkDescriptorPool descriptorPool = VK_NULL_HANDLE;
         VkDescriptorPool hiZDescriptorPool = VK_NULL_HANDLE;
         VkDescriptorPool gpuCullDescriptorPool = VK_NULL_HANDLE;
+        VkDescriptorPool giDescriptorPool = VK_NULL_HANDLE;
+        std::array<VkDescriptorSet, 8> giDescriptorSets{};
         VkDescriptorSet descriptorSet = VK_NULL_HANDLE;
 
         uint32_t objectCapacity = 0;
         uint32_t materialCapacity = 0;
+        uint32_t giGeometryCapacity = 0;
+        uint32_t giInstanceCapacity = 0;
+        uint64_t giRayQueryGeneration = UINT64_MAX;
         uint32_t bindlessTextureCount = 0;
         uint32_t bindlessSamplerCount = 0;
         uint64_t environmentVersion = UINT64_MAX;
+        GraphResourceId diffuseGiResource = InvalidGraphResourceId;
         bool iblBaked = false;
         PipelineBindingLayoutKind descriptorLayout =
             PipelineBindingLayoutKind::Unknown;

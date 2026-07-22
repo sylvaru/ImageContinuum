@@ -54,7 +54,8 @@ namespace ic
         float environmentExposure = 1.0f;
 
         uint32_t pointLightCount = 0;
-        glm::vec3 padding1 = glm::vec3(0.0f);
+        float environmentTransportExposure = 1.0f;
+        glm::vec2 padding1 = glm::vec2(0.0f);
 
         glm::vec4 pointLightPositionRange[MaxGpuPointLights] = {};
         glm::vec4 pointLightColorIntensity[MaxGpuPointLights] = {};
@@ -66,6 +67,9 @@ namespace ic
         glm::vec4 cameraNearFar = glm::vec4(0.0f);
         glm::vec4 occlusionConfig = glm::vec4(0.0f);
         glm::uvec4 occlusionDebugConfig = glm::uvec4(0);
+        // x: resolved diffuse-GI texture valid; y: debug view; z: float bits of
+        // diagnostic-only intensity; w reserved.
+        glm::uvec4 globalIlluminationConfig = glm::uvec4(0);
     };
 
     struct GpuObjectData

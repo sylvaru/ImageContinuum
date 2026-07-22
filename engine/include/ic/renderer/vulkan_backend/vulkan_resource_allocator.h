@@ -156,7 +156,8 @@ namespace ic
             const ImageAsset& image,
             TextureUsageFlags usage =
                 TextureUsageFlags::Sampled | TextureUsageFlags::TransferDst,
-            const char* debugName = nullptr);
+            const char* debugName = nullptr,
+            uint32_t mipLevels = 1);
 
         void destroyBuffer(VulkanBuffer& buffer);
         void destroyTexture(VulkanTexture& texture);

@@ -1,0 +1,3 @@
+#include "_gi_common.hlsli"
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) { giTemporal(id); }

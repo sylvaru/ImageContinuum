@@ -41,6 +41,10 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/pipeline_library.h"
     "include/ic/renderer/path_tracing/path_tracer_types.h"
     "include/ic/renderer/path_tracing/path_trace_scene_builder.h"
+    "include/ic/renderer/ray_tracing/ray_tracing_scene.h"
+    "include/ic/renderer/ray_tracing/ray_tracing_acceleration_structure.h"
+    "include/ic/renderer/global_illumination/global_illumination.h"
+    "include/ic/renderer/global_illumination/global_illumination_bindings.h"
     "include/ic/renderer/render_world.h"
     "include/ic/renderer/renderer_gpu_assets.h"
     "include/ic/renderer/gpu_scene_preparation.h"
@@ -48,10 +52,13 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/gpu_queue_profiler.h"
     "include/ic/renderer/renderer_diagnostics.h"
     "include/ic/renderer/ibl_baker.h"
+    "include/ic/util/app_core_util.h"
+    "include/ic/util/app_benchmark_utils.h"
      
     "include/ic/renderer/vulkan_backend/vulkan_backend.h" 
     "include/ic/renderer/vulkan_backend/vulkan_upload_scheduler.h"
     "include/ic/renderer/vulkan_backend/vulkan_retirement_queue.h"
+    "include/ic/renderer/vulkan_backend/vulkan_acceleration_structure_provider.h"
     
     "include/ic/renderer/renderer_backend.h"
     "include/ic/renderer/render_handles.h" 
@@ -86,6 +93,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "include/ic/scene/scene_transform_system.h"
 
     "src/ic/core/app_base.cpp" 
+    "src/ic/util/app_benchmark_utils.cpp"
     "src/ic/core/app_config.cpp"
     "src/ic/core/debug_gui_layer.cpp"
     "src/ic/core/layer_stack.cpp" 
@@ -99,6 +107,7 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/renderer/vulkan_backend/vulkan_backend.cpp"
     "src/ic/renderer/vulkan_backend/vulkan_upload_scheduler.cpp"
     "src/ic/renderer/vulkan_backend/vulkan_retirement_queue.cpp"
+    "src/ic/renderer/vulkan_backend/vulkan_acceleration_structure_provider.cpp"
     
     
     
@@ -121,6 +130,8 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/renderer/pipeline_library.cpp"
     "src/ic/renderer/ibl_baker.cpp"
     "src/ic/renderer/path_tracing/path_trace_scene_builder.cpp"
+    "src/ic/renderer/ray_tracing/ray_tracing_scene.cpp"
+    "src/ic/renderer/global_illumination/global_illumination.cpp"
     "src/ic/renderer/renderer_gpu_assets.cpp"
     "include/ic/renderer/frame_graph/frame_graph_arena.h"
     "include/ic/renderer/renderer_types.h"  
@@ -174,11 +185,12 @@ target_sources(ImageContinuumEngine PRIVATE
     "src/ic/scene/scene_transform_system.cpp"
     "src/ic/scene/scene.cpp"
     "src/ic/scene/scene_camera_controller_system.cpp"
-     "include/ic/renderer/renderer_path/path_tracer.h" "include/ic/renderer/renderer_path/clustered_forward.h")
+     "include/ic/renderer/renderer_path/path_tracer.h" "include/ic/renderer/renderer_path/clustered_forward.h" )
 
     if (WIN32)
     target_sources(ImageContinuumEngine PRIVATE
     "include/ic/renderer/dx12_backend/dx12_backend.h"
+    "include/ic/renderer/dx12_backend/dx12_acceleration_structure_provider.h"
     "include/ic/renderer/dx12_backend/dx12_factory.h"
     "include/ic/renderer/dx12_backend/dx12_adapter.h"
     "include/ic/renderer/dx12_backend/dx12_swapchain.h"
@@ -193,6 +205,7 @@ target_sources(ImageContinuumEngine PRIVATE
 
     "src/ic/renderer/dx12_backend/dx12_gpu_profiler.cpp"
     "src/ic/renderer/dx12_backend/dx12_backend.cpp"
+    "src/ic/renderer/dx12_backend/dx12_acceleration_structure_provider.cpp"
     "src/ic/renderer/dx12_backend/dx12_graph_resource_registry.cpp"
     "src/ic/renderer/dx12_backend/dx12_frame_executor.cpp"
     "src/ic/renderer/dx12_backend/dx12_pass_recorders.cpp"

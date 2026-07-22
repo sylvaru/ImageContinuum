@@ -22,11 +22,12 @@ struct PathTraceConstants
     uint useSceneGeometry;
     uint environmentEnabled;
     uint sceneEmissiveTriangleIndex;
-    uint paddingScene0;
+    uint referenceMode;
 
     float environmentIntensity;
     float environmentExposure;
-    float2 paddingScene1;
+    uint sceneEmissiveTriangleCount;
+    uint paddingScene1;
 
     float4 cameraPositionAndTanHalfFov;
     float4 cameraForwardAndAspect;
@@ -38,6 +39,9 @@ struct PathTraceConstants
 
     float4 pointLightPositionRange[IC_MAX_PATH_TRACE_POINT_LIGHTS];
     float4 pointLightColorIntensity[IC_MAX_PATH_TRACE_POINT_LIGHTS];
+
+    float4 directionalLightDirectionIntensity;
+    float4 directionalLightColor;
 };
 
 struct TonemapConstants

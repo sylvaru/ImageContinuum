@@ -104,39 +104,6 @@ namespace ic
 
         VkCommandBuffer cmd = ctx.cmd;
 
-        if (hiZ->layout != VK_IMAGE_LAYOUT_GENERAL)
-        {
-            VkImageMemoryBarrier hiZWriteBarrier{};
-            hiZWriteBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            hiZWriteBarrier.oldLayout = hiZ->layout;
-            hiZWriteBarrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            hiZWriteBarrier.srcAccessMask =
-                hiZ->layout == VK_IMAGE_LAYOUT_UNDEFINED
-                    ? 0
-                    : VK_ACCESS_SHADER_READ_BIT;
-            hiZWriteBarrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            hiZWriteBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            hiZWriteBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            hiZWriteBarrier.image = hiZ->texture.image;
-            hiZWriteBarrier.subresourceRange.aspectMask =
-                VK_IMAGE_ASPECT_COLOR_BIT;
-            hiZWriteBarrier.subresourceRange.levelCount = hiZ->mipLevels;
-            hiZWriteBarrier.subresourceRange.layerCount = 1;
-
-            vkCmdPipelineBarrier(
-                cmd,
-                hiZ->layout == VK_IMAGE_LAYOUT_UNDEFINED
-                    ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-                    : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                0,
-                0, nullptr,
-                0, nullptr,
-                1,
-                &hiZWriteBarrier);
-            hiZ->layout = VK_IMAGE_LAYOUT_GENERAL;
-        }
-
         VkDescriptorPoolSize poolSizes[3]{};
         constexpr uint32_t kMaxHiZDescriptorSets = 32;
         poolSizes[0] =

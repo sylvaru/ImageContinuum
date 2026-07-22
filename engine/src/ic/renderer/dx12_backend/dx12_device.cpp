@@ -248,6 +248,15 @@ namespace ic
             m_features.bindlessResources &&
             m_features.shaderModel >= D3D_SHADER_MODEL_6_6;
 
+        D3D12_FEATURE_DATA_D3D12_OPTIONS5 rayTracing{};
+        if (SUCCEEDED(m_device->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS5,
+                &rayTracing,
+                sizeof(rayTracing))))
+        {
+            m_features.rayTracingTier = rayTracing.RaytracingTier;
+        }
+
         if (!m_features.descriptorIndexing)
         {
             throw std::runtime_error(
@@ -255,12 +264,13 @@ namespace ic
         }
 
         spdlog::info(
-            "[DX12Device] Features | resourceBindingTier={} rootSignature={} shaderModel={:#x} gpuVA={} bindless={} directHeapIndexing={}",
+            "[DX12Device] Features | resourceBindingTier={} rootSignature={} shaderModel={:#x} gpuVA={} bindless={} directHeapIndexing={} rayTracingTier={}",
             static_cast<uint32_t>(m_features.resourceBindingTier),
             static_cast<uint32_t>(m_features.rootSignatureVersion),
             static_cast<uint32_t>(m_features.shaderModel),
             m_features.gpuVirtualAddress,
             m_features.bindlessResources,
-            m_features.directHeapIndexing);
+            m_features.directHeapIndexing,
+            static_cast<uint32_t>(m_features.rayTracingTier));
     }
 }

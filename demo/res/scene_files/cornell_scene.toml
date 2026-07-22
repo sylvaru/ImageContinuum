@@ -2,6 +2,7 @@
 name = "Cornell Box"
 
 [scene.environment]
+enabled = true
 equirect = "../hdri/puresky_4k.hdr"
 intensity = 1.0
 skybox_exposure = 0.9

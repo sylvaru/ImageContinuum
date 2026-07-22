@@ -2,11 +2,13 @@
 #pragma once
 
 #include <cstdint>
+#include "ic/renderer/frame_graph/frame_graph_types.h"
 
 
 namespace ic
 {
 	class FrameGraphBuilder;
+    class GlobalIlluminationSystem;
 
 	struct RenderExtent
 	{
@@ -35,6 +37,8 @@ namespace ic
         // the graphics queue and behavior matches the serial baseline.
         bool asyncComputeEnabled = false;
         bool occlusionDiagnosticsEnabled = false;
+        GlobalIlluminationSystem* globalIllumination = nullptr;
+        GraphResourceId rayTracingSceneToken = InvalidGraphResourceId;
 	};
 
 	class RendererPath

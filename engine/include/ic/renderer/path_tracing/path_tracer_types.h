@@ -113,6 +113,7 @@ namespace ic
         std::vector<PathTraceVertex> vertices;
         std::vector<PathTraceMaterial> materials;
         std::vector<PathTraceTriangle> triangles;
+        std::vector<PathTraceTriangle> emissiveTriangles;
         std::vector<PathTraceBVHNode> bvhNodes;
         uint32_t firstEmissiveTriangleIndex = UINT32_MAX;
     };

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <fstream>
+#include "ic/renderer/global_illumination/global_illumination_bindings.h"
 #include <stdexcept>
 
 #include <d3dcompiler.h>
@@ -332,6 +333,119 @@ namespace ic
                     IID_PPV_ARGS(&rootSignature)),
                 "Failed to create DX12 compute root signature.");
 
+            return rootSignature;
+        }
+
+        if (layout == PipelineBindingLayoutKind::GlobalIllumination)
+        {
+            std::array<D3D12_ROOT_PARAMETER, GiBufferBindingCount + 19u>
+                parameters{};
+            for (uint32_t i = 0; i < GiBufferBindingCount; ++i)
+            {
+                parameters[i].ParameterType =
+                    D3D12_ROOT_PARAMETER_TYPE_UAV;
+                parameters[i].Descriptor.ShaderRegister = i;
+                parameters[i].Descriptor.RegisterSpace = 0;
+                parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
+            D3D12_DESCRIPTOR_RANGE ranges[13]{};
+            ranges[0] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
+                GiPrimaryInputBinding, 0, 0 };
+            ranges[1] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
+                GiHistoryInputBinding, 0, 0 };
+            ranges[2] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
+                GiSceneDepthBinding, 0, 0 };
+            ranges[3] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
+                GiSurfaceAttributesBinding, 0, 0 };
+            ranges[4] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
+                GiPreviousSceneDepthBinding, 0, 0 };
+            ranges[5] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
+                GiPreviousSurfaceAttributesBinding, 0, 0 };
+            ranges[6] = { D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1,
+                GiOutputBinding, 0, 0 };
+            ranges[7] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                GiMaxGeometryBufferCount, GiVertexBuffersBinding, 0, 0 };
+            ranges[8] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                GiMaxGeometryBufferCount, GiIndexBuffersBinding, 0, 0 };
+            ranges[9] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV,
+                MaxBindlessTextures, GiBindlessTexturesBinding, 0, 0 };
+            ranges[10] = { D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+                MaxBindlessSamplers, GiBindlessSamplersBinding, 0, 0 };
+            ranges[11] = { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1,
+                GiEnvironmentBinding, 0, 0 };
+            ranges[12] = { D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, 1,
+                GiEnvironmentSamplerBinding, 0, 0 };
+            for (uint32_t i = 0; i < 7u; ++i)
+            {
+                D3D12_ROOT_PARAMETER& parameter =
+                    parameters[GiBufferBindingCount + i];
+                parameter.ParameterType =
+                    D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                parameter.DescriptorTable.NumDescriptorRanges = 1;
+                parameter.DescriptorTable.pDescriptorRanges = &ranges[i];
+                parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
+            D3D12_ROOT_PARAMETER& tlas =
+                parameters[GiBufferBindingCount + 7u];
+            tlas.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+            tlas.Descriptor.ShaderRegister = GiTlasBinding;
+            tlas.Descriptor.RegisterSpace = 0;
+            tlas.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            for (uint32_t i = 0; i < 3u; ++i)
+            {
+                D3D12_ROOT_PARAMETER& srv =
+                    parameters[GiBufferBindingCount + 8u + i];
+                srv.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+                srv.Descriptor.ShaderRegister = GiGeometryTableBinding + i;
+                srv.Descriptor.RegisterSpace = 0;
+                srv.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
+            for (uint32_t i = 0; i < 6u; ++i)
+            {
+                D3D12_ROOT_PARAMETER& table =
+                    parameters[GiBufferBindingCount + 11u + i];
+                table.ParameterType =
+                    D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                table.DescriptorTable.NumDescriptorRanges = 1;
+                table.DescriptorTable.pDescriptorRanges = &ranges[7u + i];
+                table.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
+            // b0: GI trace constants (128-byte payload — bound as a CBV rather
+            // than root constants so the root signature stays within 64 DWORDs).
+            D3D12_ROOT_PARAMETER& constants =
+                    parameters[GiBufferBindingCount + 17u];
+            constants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            constants.Descriptor.ShaderRegister = 0;
+            constants.Descriptor.RegisterSpace = 0;
+            constants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            // b1: shared frame constants (camera + scene lights) for world
+            // reconstruction and direct lighting at surfel-ray hits.
+            D3D12_ROOT_PARAMETER& frameConstants =
+                    parameters[GiBufferBindingCount + 18u];
+            frameConstants.ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+            frameConstants.Descriptor.ShaderRegister = 1;
+            frameConstants.Descriptor.RegisterSpace = 0;
+            frameConstants.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+            rootDesc.NumParameters = static_cast<UINT>(parameters.size());
+            rootDesc.pParameters = parameters.data();
+            rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+            Microsoft::WRL::ComPtr<ID3DBlob> signature;
+            Microsoft::WRL::ComPtr<ID3DBlob> error;
+            const HRESULT hr = D3D12SerializeRootSignature(
+                &rootDesc, D3D_ROOT_SIGNATURE_VERSION_1,
+                &signature, &error);
+            if (FAILED(hr))
+            {
+                throw std::runtime_error(error
+                    ? static_cast<const char*>(error->GetBufferPointer())
+                    : "Failed to serialize DX12 GI root signature.");
+            }
+            Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature;
+            throwIfFailed(m_device->CreateRootSignature(
+                0, signature->GetBufferPointer(), signature->GetBufferSize(),
+                IID_PPV_ARGS(&rootSignature)),
+                "Failed to create DX12 GI root signature.");
             return rootSignature;
         }
 
@@ -807,7 +921,7 @@ namespace ic
 
         if (layout == PipelineBindingLayoutKind::ClusteredForward)
         {
-            D3D12_ROOT_PARAMETER rootParameters[18]{};
+            D3D12_ROOT_PARAMETER rootParameters[19]{};
 
             // 0: Frame constants, b0 space0
             rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -988,6 +1102,21 @@ namespace ic
             rootParameters[17].Descriptor.ShaderRegister = 12;
             rootParameters[17].Descriptor.RegisterSpace = 2;
             rootParameters[17].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+            // 18: Resolved diffuse irradiance, t3 space1
+            D3D12_DESCRIPTOR_RANGE diffuseGiRange{};
+            diffuseGiRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            diffuseGiRange.NumDescriptors = 1;
+            diffuseGiRange.BaseShaderRegister = 3;
+            diffuseGiRange.RegisterSpace = 1;
+            diffuseGiRange.OffsetInDescriptorsFromTableStart = 0;
+            rootParameters[18].ParameterType =
+                D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rootParameters[18].DescriptorTable.NumDescriptorRanges = 1;
+            rootParameters[18].DescriptorTable.pDescriptorRanges =
+                &diffuseGiRange;
+            rootParameters[18].ShaderVisibility =
+                D3D12_SHADER_VISIBILITY_PIXEL;
 
             D3D12_ROOT_SIGNATURE_DESC rootDesc{};
             rootDesc.NumParameters =
@@ -1266,6 +1395,8 @@ namespace ic
             return D3D12_COMPARISON_FUNC_LESS_EQUAL;
         case CompareOp::Greater:
             return D3D12_COMPARISON_FUNC_GREATER;
+        case CompareOp::GreaterEqual:
+            return D3D12_COMPARISON_FUNC_GREATER_EQUAL;
         case CompareOp::Always:
             return D3D12_COMPARISON_FUNC_ALWAYS;
         }

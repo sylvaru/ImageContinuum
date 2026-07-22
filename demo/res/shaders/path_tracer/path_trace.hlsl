@@ -459,13 +459,20 @@ bool visibleToLight(float3 origin, float3 lightPoint)
 float3 sampleSceneDirectLight(Hit hit, inout uint rngState)
 {
     const uint lightTriangleIndex = gConstants.sceneEmissiveTriangleIndex;
+    const uint lightTriangleCount = gConstants.sceneEmissiveTriangleCount;
     if (lightTriangleIndex == IC_INVALID_BINDLESS_INDEX ||
-        lightTriangleIndex >= gConstants.sceneTriangleCount)
+        lightTriangleIndex >= gConstants.sceneTriangleCount ||
+        lightTriangleCount == 0u ||
+        lightTriangleIndex + lightTriangleCount > gConstants.sceneTriangleCount)
     {
         return 0.0f;
     }
 
-    const PathTraceTriangle tri = gSceneTriangles[lightTriangleIndex];
+    const uint selectedLight = min(
+        (uint)(random01(rngState) * lightTriangleCount),
+        lightTriangleCount - 1u);
+    const PathTraceTriangle tri =
+        gSceneTriangles[lightTriangleIndex + selectedLight];
     if (tri.materialIndex >= gConstants.sceneMaterialCount)
     {
         return 0.0f;
@@ -516,7 +523,8 @@ float3 sampleSceneDirectLight(Hit hit, inout uint rngState)
     }
 
     const float3 brdf = hit.albedo * hit.ao * (1.0f - hit.metallic) * 0.31830988618f;
-    return brdf * lightMaterial.emissive.rgb * nDotL * lightDot * area / distanceSq;
+    return brdf * lightMaterial.emissive.rgb * nDotL * lightDot *
+        (area * float(lightTriangleCount)) / distanceSq;
 }
 
 float3 sampleDirectLight(Hit hit, inout uint rngState)
@@ -621,7 +629,12 @@ float3 environmentRadiance(float3 direction)
             (gConstants.environmentIntensity * gConstants.environmentExposure);
     }
 
-    return skyColor(direction) * 0.015f;
+    // Authored scenes with explicit geometry may intentionally disable the
+    // environment (for example, a light-box reference). The procedural sky is
+    // retained only for the shader's geometry-free fallback scene.
+    return gConstants.useSceneGeometry != 0u
+        ? 0.0f
+        : skyColor(direction) * 0.015f;
 }
 
 Ray makeCameraRay(uint2 pixel, uint rngSeed)
@@ -665,22 +678,27 @@ float3 tracePath(Ray ray, inout uint rngState)
         Hit hit = traceScene(ray);
         if (hit.t >= 1.0e19f)
         {
+            // A miss always sees the scene environment. Reference mode only
+            // changes which surface-lighting bounce is accumulated; it must
+            // not turn a valid environment into a black background.
             radiance += throughput * environmentRadiance(ray.direction);
             break;
         }
 
         if (hit.materialType == MaterialEmissive)
         {
-            if (bounce == 0u)
+            if ((gConstants.referenceMode == 0u && bounce == 0u) ||
+                (gConstants.referenceMode != 0u && bounce == 1u))
             {
                 radiance += throughput * hit.emission;
             }
             break;
         }
 
-        radiance += clampLuminance(
-            throughput * sampleDirectLight(hit, rngState),
-            bounce == 0u ? 4.0f : 2.0f);
+        if (gConstants.referenceMode == 0u || bounce == 1u)
+            radiance += clampLuminance(
+                throughput * sampleDirectLight(hit, rngState),
+                bounce == 0u ? 4.0f : 2.0f);
         ray.origin = hit.position + hit.normal * 0.002f;
         if (hit.metallic > 0.5f)
         {

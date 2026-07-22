@@ -24,6 +24,7 @@ namespace ic
         void retireImageView(VkImageView view);
         void retireSampler(VkSampler sampler);
         void retireDescriptorPool(VkDescriptorPool pool);
+        void retireAccelerationStructure(VkAccelerationStructureKHR as);
         void drain();
 
     private:
@@ -34,11 +35,13 @@ namespace ic
             std::vector<VkImageView> imageViews;
             std::vector<VkSampler> samplers;
             std::vector<VkDescriptorPool> descriptorPools;
+            std::vector<VkAccelerationStructureKHR> accelerationStructures;
         };
 
         void recycle(Slot& slot);
 
         VkDevice m_device = VK_NULL_HANDLE;
+        PFN_vkDestroyAccelerationStructureKHR m_destroyAccelerationStructure = nullptr;
         VulkanResourceAllocator* m_allocator = nullptr;
         std::vector<Slot> m_slots;
         uint32_t m_currentSlot = 0;

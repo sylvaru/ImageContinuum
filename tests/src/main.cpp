@@ -2,6 +2,8 @@
 #include "job_system_stress_tests.h"
 #include "frame_graph_resource_tests.h"
 #include "pass_dispatch_tests.h"
+#include "global_illumination_tests.h"
+#include "ray_tracing_scene_tests.h"
 
 #include <spdlog/spdlog.h>
 
@@ -15,5 +17,7 @@ int main()
     failures += runJobSystemStressTests();
     failures += runFrameGraphResourceTests();
     failures += runPassDispatchTests();
+    failures += runGlobalIlluminationTests();
+    failures += runRayTracingSceneTests();
     return failures;
 }

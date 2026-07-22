@@ -4,6 +4,7 @@
 #include "ic/renderer/frame_graph/frame_graph_types.h"
 #include "ic/renderer/frame_graph/frame_graph_builder.h"
 #include "ic/renderer/gpu_driven_submission.h"
+#include "ic/renderer/global_illumination/global_illumination.h"
 
 
 namespace ic
@@ -14,6 +15,7 @@ namespace ic
         GraphResourceId backBuffer;
 
         GraphResourceId sceneDepth;
+        GraphResourceId surfaceAttributes;
         GraphResourceId depthPyramid;
 
         GraphResourceId clusterBoundsBuffer;
@@ -25,6 +27,7 @@ namespace ic
         GpuDrivenGraphResources gpuDriven;
 
         GraphResourceId environmentCubemap;
+        GraphResourceId diffuseGlobalIllumination = InvalidGraphResourceId;
 
         void buildFrameGraph(
             RendererPathContext& ctx,
@@ -68,7 +71,7 @@ namespace ic
                 });
 
             // Per frame render resources
-            sceneDepth = builder.createTexture({
+            sceneDepth = builder.createHistoryTexture({
                 .width = renderWidth,
                 .height = renderHeight,
                 .depth = 1,
@@ -80,6 +83,21 @@ namespace ic
                     TextureUsageFlags::Sampled,
                 .debugName = "ClusteredForward.SceneDepth"
                 });
+            surfaceAttributes = builder.createHistoryTexture({
+                .width = renderWidth,
+                .height = renderHeight,
+                .depth = 1,
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .format = TextureFormat::RGBA32_Float,
+                .usage = TextureUsageFlags::ColorAttachment |
+                    TextureUsageFlags::Sampled,
+                .debugName = "ClusteredForward.GiSurfaceAttributes"
+                });
+            builder.setResourceSemantic(
+                sceneDepth, GraphResourceSemantic::GiSceneDepth);
+            builder.setResourceSemantic(
+                surfaceAttributes, GraphResourceSemantic::GiSurfaceAttributes);
 
             depthPyramid = builder.createHistoryTexture({
                 .width = renderWidth,
@@ -202,7 +220,9 @@ namespace ic
                 builder.addGraphicsPass("DepthPrepass")
                 .pipeline("depth_prepass")
                 .drawList(DrawListKind::SceneGeometry)
+                .colorLoadOp(AttachmentLoadOp::Clear)
                 .depthLoadOp(AttachmentLoadOp::Clear)
+                .color(surfaceAttributes)
                 .depth(sceneDepth);
             readGpuDrivenStream(builder, depthPrepassNode, gpuDriven);
 
@@ -218,6 +238,18 @@ namespace ic
                 gpuDriven,
                 depthPyramid,
                 clusterQueue);
+
+            const GlobalIlluminationGraphOutputs giOutputs =
+                ctx.globalIllumination
+                ? ctx.globalIllumination->contributePasses(builder, {
+                    .sceneDepth = sceneDepth,
+                    .surfaceAttributes = surfaceAttributes,
+                    .rayTracingSceneToken = ctx.rayTracingSceneToken,
+                    .renderExtent = ctx.renderExtent,
+                    .asyncComputeEnabled = ctx.asyncComputeEnabled })
+                : GlobalIlluminationGraphOutputs{};
+            diffuseGlobalIllumination =
+                giOutputs.resolvedDiffuseIrradiance;
 
             // Build clusters
             //
@@ -307,6 +339,14 @@ namespace ic
                 opaqueNode,
                 environmentCubemap,
                 ResourceUsage::SampledTexture);
+
+            if (diffuseGlobalIllumination != InvalidGraphResourceId)
+            {
+                builder.read(
+                    opaqueNode,
+                    diffuseGlobalIllumination,
+                    ResourceUsage::SampledTexture);
+            }
 
             // Skybox
             auto skyboxNode =

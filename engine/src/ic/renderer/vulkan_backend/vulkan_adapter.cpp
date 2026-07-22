@@ -102,6 +102,10 @@ namespace ic
 
 		m_info.timelineSemaphoreFeatures.sType =
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+		m_info.accelerationStructureFeatures.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+		m_info.rayQueryFeatures.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
 
 #ifdef VK_EXT_descriptor_buffer
 		m_info.descriptorBufferFeatures.sType =
@@ -113,7 +117,14 @@ namespace ic
 
 #ifdef VK_EXT_descriptor_buffer
 		m_info.vulkan13Features.pNext = &m_info.descriptorBufferFeatures;
+		m_info.descriptorBufferFeatures.pNext =
+			&m_info.accelerationStructureFeatures;
+#else
+		m_info.vulkan13Features.pNext =
+			&m_info.accelerationStructureFeatures;
 #endif
+		m_info.accelerationStructureFeatures.pNext =
+			&m_info.rayQueryFeatures;
 
 		vkGetPhysicalDeviceFeatures2(
 			m_device,
@@ -121,6 +132,17 @@ namespace ic
 
 		const auto extensions =
 			enumerateDeviceExtensions(m_device);
+
+		m_info.supportedFeatures.accelerationStructure =
+			hasExtension(extensions,
+				VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME) &&
+			hasExtension(extensions,
+				VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME) &&
+			m_info.accelerationStructureFeatures.accelerationStructure == VK_TRUE;
+		m_info.supportedFeatures.rayQuery =
+			m_info.supportedFeatures.accelerationStructure &&
+			hasExtension(extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME) &&
+			m_info.rayQueryFeatures.rayQuery == VK_TRUE;
 
 		m_info.supportedFeatures.dynamicRendering =
 			m_info.vulkan13Features.dynamicRendering == VK_TRUE;
@@ -149,6 +171,18 @@ namespace ic
 		m_info.supportedFeatures.descriptorBuffer =
 			hasExtension(extensions, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) &&
 			m_info.descriptorBufferFeatures.descriptorBuffer == VK_TRUE;
+		char* disableDescriptorBuffer = nullptr;
+		size_t disableDescriptorBufferLength = 0;
+		(void)_dupenv_s(&disableDescriptorBuffer,
+			&disableDescriptorBufferLength,
+			"IC_VK_DISABLE_DESCRIPTOR_BUFFER");
+		if (disableDescriptorBuffer && disableDescriptorBuffer[0] == '1')
+		{
+			m_info.supportedFeatures.descriptorBuffer = false;
+			spdlog::info(
+				"[VulkanAdapter] Descriptor-buffer mode disabled by diagnostic override.");
+		}
+		std::free(disableDescriptorBuffer);
 #endif
 
 #ifdef VK_KHR_maintenance5

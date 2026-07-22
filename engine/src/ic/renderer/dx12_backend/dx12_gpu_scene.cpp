@@ -44,8 +44,13 @@ namespace ic
             m_resourceAllocator->destroyBuffer(frame.frameConstants);
             m_resourceAllocator->destroyBuffer(frame.objects);
             m_resourceAllocator->destroyBuffer(frame.materials);
+            m_resourceAllocator->destroyBuffer(frame.giRtGeometries);
+            m_resourceAllocator->destroyBuffer(frame.giRtInstances);
+            m_resourceAllocator->destroyBuffer(frame.giTraceConstants);
             m_descriptorSystem->releaseResourceDescriptors(frame.objectSrv);
             m_descriptorSystem->releaseResourceDescriptors(frame.materialSrv);
+            m_descriptorSystem->releaseResourceDescriptors(
+                frame.giModelBufferSrvs);
         }
         m_frames.clear();
 

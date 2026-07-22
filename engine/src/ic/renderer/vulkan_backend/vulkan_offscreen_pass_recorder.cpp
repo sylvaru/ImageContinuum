@@ -48,13 +48,15 @@ namespace ic
         constants.accumulatedSampleCount = inputs.accumulatedSampleCount;
         constants.exposure = inputs.exposure;
         constants.resetAccumulation = inputs.resetAccumulation ? 1u : 0u;
-        constants.maxBounces = DefaultPathTraceMaxBounces;
+        constants.maxBounces = configuredPathTraceMaxBounces();
         constants.samplesPerPixel = DefaultPathTraceSamplesPerPixel;
         constants.sceneVertexCount = inputs.sceneVertexCount;
         constants.sceneMaterialCount = inputs.sceneMaterialCount;
         constants.sceneTriangleCount = inputs.sceneTriangleCount;
         constants.sceneBvhNodeCount = inputs.sceneBvhNodeCount;
         constants.sceneEmissiveTriangleIndex = inputs.firstEmissiveTriangleIndex;
+        constants.sceneEmissiveTriangleCount = inputs.emissiveTriangleCount;
+        constants.referenceMode = configuredPathTraceReferenceMode();
         constants.useSceneGeometry =
             inputs.sceneTriangleCount != 0u &&
             inputs.sceneBvhNodeCount != 0u

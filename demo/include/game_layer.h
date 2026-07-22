@@ -4,6 +4,7 @@
 #include "ic/scene/scene_types.h"
 
 #include <filesystem>
+#include <glm/glm.hpp>
 
 using namespace ic;
 
@@ -22,4 +23,10 @@ public:
 private:
     std::filesystem::path m_scenePath;
     SceneHandle m_scene;
+    bool m_cameraSweepEnabled = false;
+    bool m_cameraSweepInitialized = false;
+    glm::vec3 m_cameraSweepOrigin = glm::vec3(0.0f);
+    bool m_dynamicSweepEnabled = false;
+    bool m_dynamicSweepInitialized = false;
+    glm::vec3 m_dynamicSweepOrigin = glm::vec3(0.0f);
 };

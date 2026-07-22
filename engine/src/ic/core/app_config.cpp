@@ -276,6 +276,90 @@ namespace
         throw std::runtime_error(
             "Unknown GPU cull debug mode: " + value);
     }
+
+    ic::GlobalIlluminationDebugView parseGlobalIlluminationDebugView(
+        std::string value)
+    {
+        value = lower(std::move(value));
+        if (value == "none" || value == "off")
+            return ic::GlobalIlluminationDebugView::None;
+        if (value == "irradiance" || value == "irradiance_only")
+            return ic::GlobalIlluminationDebugView::IrradianceOnly;
+        if (value == "contribution" || value == "contribution_only")
+            return ic::GlobalIlluminationDebugView::ContributionOnly;
+        if (value == "coverage" || value == "coverage_confidence")
+            return ic::GlobalIlluminationDebugView::CoverageConfidence;
+        if (value == "comparison" || value == "enabled_disabled")
+            return ic::GlobalIlluminationDebugView::EnabledDisabledComparison;
+        if (value == "diagnostic_intensity" || value == "intensity")
+            return ic::GlobalIlluminationDebugView::DiagnosticIntensity;
+        if (value == "traced_rays")
+            return ic::GlobalIlluminationDebugView::TracedRays;
+        if (value == "hit_distance")
+            return ic::GlobalIlluminationDebugView::HitDistance;
+        if (value == "reconstructed_normals")
+            return ic::GlobalIlluminationDebugView::ReconstructedNormals;
+        if (value == "reconstructed_materials")
+            return ic::GlobalIlluminationDebugView::ReconstructedMaterials;
+        if (value == "clipmap_probe_identity" || value == "selected_surfel" ||
+            value == "selected_surfel_id")
+            return ic::GlobalIlluminationDebugView::ClipmapLevelProbeIdentity;
+        if (value == "probe_classification_relocation" ||
+            value == "surfel_position" || value == "surfel_world_position")
+            return ic::GlobalIlluminationDebugView::ProbeClassificationRelocation;
+        if (value == "probe_depth_visibility_moments" ||
+            value == "surfel_normal" || value == "surfel_world_normal")
+            return ic::GlobalIlluminationDebugView::ProbeDepthVisibilityMoments;
+        if (value == "probe_radiance_sh" || value == "raw_sh" ||
+            value == "raw_sh_coefficients")
+            return ic::GlobalIlluminationDebugView::ProbeRadianceSh;
+        if (value == "current_previous" ||
+            value == "current_previous_irradiance")
+            return ic::GlobalIlluminationDebugView::CurrentPreviousIrradiance;
+        if (value == "temporal_rejection" ||
+            value == "temporal_rejection_reason")
+            return ic::GlobalIlluminationDebugView::TemporalRejectionReason;
+        if (value == "probe_age_update_state" || value == "surfel_age" ||
+            value == "allocation_update_age")
+            return ic::GlobalIlluminationDebugView::ProbeAgeUpdateState;
+        if (value == "probe_confidence_variance" || value == "variance" ||
+            value == "variance_confidence")
+            return ic::GlobalIlluminationDebugView::ProbeConfidenceVariance;
+        if (value == "raw_gathered_half_resolution" || value == "raw_half" ||
+            value == "raw_half_resolution")
+            return ic::GlobalIlluminationDebugView::RawGatheredHalfResolution;
+        if (value == "probe_update_workload" || value == "raw_traced_probe_radiance" || value == "raw_traced_indirect" ||
+            value == "raw_traced_indirect_radiance")
+            return ic::GlobalIlluminationDebugView::ProbeUpdateWorkload;
+        if (value == "cached_probe_irradiance" || value == "cached_surfel" ||
+            value == "cached_surfel_radiance")
+            return ic::GlobalIlluminationDebugView::CachedProbeIrradiance;
+        if (value == "gathered_irradiance_coverage" || value == "gathered" ||
+            value == "gathered_irradiance")
+            return ic::GlobalIlluminationDebugView::GatheredIrradianceCoverage;
+        if (value == "temporal_filtered_irradiance" || value == "temporal" ||
+            value == "temporal_result")
+            return ic::GlobalIlluminationDebugView::TemporalFilteredIrradiance;
+        if (value == "direct" || value == "direct_only")
+            return ic::GlobalIlluminationDebugView::DirectOnly;
+        if (value == "temporal_weight" || value == "history_weight" ||
+            value == "temporal_history_weight")
+            return ic::GlobalIlluminationDebugView::TemporalHistoryWeight;
+        throw std::runtime_error("Unknown global illumination debug view: " + value);
+    }
+
+    ic::GlobalIlluminationQuality parseGlobalIlluminationQuality(
+        std::string value)
+    {
+        value = lower(std::move(value));
+        if (value == "off") return ic::GlobalIlluminationQuality::Off;
+        if (value == "low") return ic::GlobalIlluminationQuality::Low;
+        if (value == "medium") return ic::GlobalIlluminationQuality::Medium;
+        if (value == "high") return ic::GlobalIlluminationQuality::High;
+        if (value == "ultra") return ic::GlobalIlluminationQuality::Ultra;
+        if (value == "custom") return ic::GlobalIlluminationQuality::Custom;
+        throw std::runtime_error("Unknown global illumination quality: " + value);
+    }
 }
 
 namespace ic
@@ -419,6 +503,9 @@ namespace ic
                     *renderer,
                     "gpu_occlusion",
                     config.app.rendererSpec.settings.gpuOcclusion);
+            config.app.rendererSpec.settings.rayTracing =
+                boolOr(*renderer, "ray_tracing",
+                    config.app.rendererSpec.settings.rayTracing);
             if (const std::optional<std::string> debugMode =
                 (*renderer)["gpu_cull_debug"].value<std::string>())
             {
@@ -431,6 +518,113 @@ namespace ic
                 readEnvironmentSettings(
                     *environment,
                     config.app.rendererSpec.settings.environment);
+            }
+            if (const toml::table* gi =
+                    renderer->get_as<toml::table>("global_illumination"))
+            {
+                auto& settings =
+                    config.app.rendererSpec.settings.globalIllumination;
+                if (const std::optional<std::string> quality =
+                    (*gi)["quality"].value<std::string>())
+                {
+                    settings = globalIlluminationPreset(
+                        parseGlobalIlluminationQuality(*quality), settings);
+                }
+                settings.enabled = boolOr(*gi, "enabled", settings.enabled);
+                settings.asyncCompute =
+                    boolOr(*gi, "async_compute", settings.asyncCompute);
+                settings.diagnosticsReadback = boolOr(
+                    *gi, "diagnostics_readback", settings.diagnosticsReadback);
+                settings.evaluationDivisor = uintOr(
+                    *gi, "evaluation_divisor", settings.evaluationDivisor);
+                settings.evaluationDivisor = uintOr(
+                    *gi, "temporal_reconstruction_divisor",
+                    settings.evaluationDivisor);
+                settings.gpuTimeTargetMilliseconds = std::clamp(floatOr(
+                    *gi, "gpu_time_target_ms",
+                    settings.gpuTimeTargetMilliseconds), 0.0f, 1000.0f);
+                const uint64_t memoryLimitMiB = uintOr(
+                    *gi, "memory_limit_mb", static_cast<uint32_t>(
+                        settings.memoryLimitBytes / (1024ull * 1024ull)));
+                settings.memoryLimitBytes = memoryLimitMiB * 1024ull * 1024ull;
+                settings.surfelCellSize = std::max(floatOr(
+                    *gi, "surfel_cell_size", settings.surfelCellSize),
+                    1.0e-3f);
+                settings.surfelDetail = boolOr(
+                    *gi, "surfel_detail", settings.surfelDetail);
+                settings.diagnosticIntensity = std::clamp(floatOr(
+                    *gi, "diagnostic_intensity", settings.diagnosticIntensity),
+                    0.0f, 16.0f);
+                settings.debugExposure = std::clamp(floatOr(
+                    *gi, "debug_exposure", settings.debugExposure),
+                    0.03125f, 32.0f);
+                settings.freezeAfterFrames = uintOr(
+                    *gi, "freeze_after_frames", settings.freezeAfterFrames);
+                settings.multiBounce = boolOr(
+                    *gi, "multi_bounce", settings.multiBounce);
+                settings.probeFallback = boolOr(
+                    *gi, "probe_fallback", settings.probeFallback);
+                if (const std::optional<std::string> debugView =
+                    (*gi)["debug_view"].value<std::string>())
+                {
+                    settings.debugView =
+                        parseGlobalIlluminationDebugView(*debugView);
+                }
+                settings.limits.maxSurfels = uintOr(
+                    *gi, "max_surfels", settings.limits.maxSurfels);
+                settings.limits.hashBucketCount = uintOr(
+                    *gi, "hash_buckets", settings.limits.hashBucketCount);
+                settings.limits.maxSurfelUpdates = uintOr(
+                    *gi, "max_surfel_updates",
+                    settings.limits.maxSurfelUpdates);
+                settings.limits.probeClipmapCount = uintOr(
+                    *gi, "probe_clipmaps",
+                    settings.limits.probeClipmapCount);
+                settings.limits.probeResolution = uintOr(
+                    *gi, "probe_resolution",
+                    settings.limits.probeResolution);
+                settings.limits.maxProbeUpdates = uintOr(
+                    *gi, "max_probe_updates",
+                    settings.limits.maxProbeUpdates);
+                settings.limits.rayBudget = uintOr(
+                    *gi, "ray_budget", settings.limits.rayBudget);
+                if (const auto visibilityRays =
+                    (*gi)["visibility_rays_per_probe"].value<uint32_t>())
+                {
+                    const uint64_t budget = static_cast<uint64_t>(
+                        settings.limits.maxProbeUpdates) *
+                        std::clamp(*visibilityRays, 1u, 32u);
+                    settings.limits.rayBudget = static_cast<uint32_t>(
+                        std::min<uint64_t>(budget,
+                            std::numeric_limits<uint32_t>::max()));
+                }
+                if (settings.quality != GlobalIlluminationQuality::Off &&
+                    settings.quality != GlobalIlluminationQuality::Custom)
+                {
+                    const auto preset = globalIlluminationPreset(
+                        settings.quality, settings);
+                    const auto& a = settings.limits;
+                    const auto& b = preset.limits;
+                    if (a.maxSurfels != b.maxSurfels ||
+                        a.hashBucketCount != b.hashBucketCount ||
+                        a.maxSurfelUpdates != b.maxSurfelUpdates ||
+                        a.probeClipmapCount != b.probeClipmapCount ||
+                        a.probeResolution != b.probeResolution ||
+                        a.maxProbeUpdates != b.maxProbeUpdates ||
+                        a.rayBudget != b.rayBudget ||
+                        settings.evaluationDivisor != preset.evaluationDivisor ||
+                        settings.surfelCellSize != preset.surfelCellSize ||
+                        settings.surfelDetail != preset.surfelDetail ||
+                        settings.multiBounce != preset.multiBounce ||
+                        settings.probeFallback != preset.probeFallback)
+                    {
+                        settings.quality = GlobalIlluminationQuality::Custom;
+                    }
+                }
+                if (!settings.enabled)
+                    settings.quality = GlobalIlluminationQuality::Off;
+                else if (settings.quality == GlobalIlluminationQuality::Off)
+                    settings.enabled = false;
             }
             config.app.rendererSpec.framesInFlight =
                 uintOr(

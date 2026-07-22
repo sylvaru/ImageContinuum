@@ -388,6 +388,8 @@ namespace ic
             return PipelineBindingLayoutKind::GpuFrustumCull;
         if (value == "GpuOcclusionValidation")
             return PipelineBindingLayoutKind::GpuOcclusionValidation;
+        if (value == "GlobalIllumination")
+            return PipelineBindingLayoutKind::GlobalIllumination;
         if (value == "PathTrace")
             return PipelineBindingLayoutKind::PathTrace;
         if (value == "PathTraceTonemap")
@@ -421,6 +423,7 @@ namespace ic
         if (value == "Equal") return CompareOp::Equal;
         if (value == "LessEqual") return CompareOp::LessEqual;
         if (value == "Greater") return CompareOp::Greater;
+        if (value == "GreaterEqual") return CompareOp::GreaterEqual;
         if (value == "Always") return CompareOp::Always;
         throw std::runtime_error("Invalid compare op.");
     }

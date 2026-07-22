@@ -13,12 +13,14 @@
 #include "ic/renderer/dx12_backend/dx12_graph_resource_registry.h"
 #include "ic/renderer/dx12_backend/dx12_pass_recorders.h"
 #include "ic/renderer/dx12_backend/dx12_frame_executor.h"
+#include "ic/renderer/dx12_backend/dx12_acceleration_structure_provider.h"
 #include "ic/renderer/dx12_backend/dx12_gpu_scene.h"
 #include "ic/renderer/dx12_backend/dx12_retirement_queue.h"
 #include "ic/renderer/dx12_backend/dx12_upload_scheduler.h"
 #include "ic/renderer/dx12_backend/dx12_gpu_profiler.h"
 #include "ic/renderer/renderer_gpu_assets.h"
 #include "ic/renderer/path_tracing/path_tracer_types.h"
+#include "ic/renderer/global_illumination/global_illumination.h"
 
 #include <d3d12.h>
 #include <glm/glm.hpp>
@@ -96,6 +98,35 @@ namespace ic
         // uploaded data. That wait is now correctly scoped to the graphics
         // (consumer) queue only. See DX12FrameExecutor::submitAndPresent.
         bool supportsAsyncCompute() const override { return true; }
+        RayTracingCapabilities rayTracingCapabilities() const override
+        {
+            RayTracingCapabilities result =
+                m_accelerationStructures.capabilities();
+            // Graph textures still use legacy cross-list state tracking; keep
+            // GI ray queries on graphics until enhanced barriers are adopted.
+            result.asyncComputeQueries = false;
+            return result;
+        }
+        void setRayTracingSceneService(
+            RayTracingSceneService* service) override
+        {
+            m_rayTracingSceneService = service;
+            if (service)
+                service->setAccelerationStructureProvider(
+                    &m_accelerationStructures);
+        }
+        void setRayTracingEnabled(bool enabled) override
+        { m_accelerationStructures.setEnabled(enabled); }
+        bool rayTracingEnabled() const override
+        { return m_accelerationStructures.enabled(); }
+        bool globalIlluminationDiagnostics(
+            GpuGiDiagnostics& result) const override;
+        void setGlobalIlluminationDisplay(
+            uint32_t debugView, float diagnosticIntensity,
+            float debugExposure) override;
+        void setGlobalIlluminationRuntimeSettings(
+            uint32_t maxSurfelUpdates, uint32_t maxProbeUpdates,
+            uint32_t rayBudget, uint32_t freezeAfterFrames) override;
         void drainForSchedulingTransition() override;
 
         std::span<const GpuPassSample> gpuPassSamples() const override
@@ -170,6 +201,7 @@ namespace ic
             uint32_t sceneTriangleCount = 0;
             uint32_t sceneBvhNodeCount = 0;
             uint32_t firstEmissiveTriangleIndex = UINT32_MAX;
+            uint32_t emissiveTriangleCount = 0;
             uint32_t accumulatedSampleCount = 0;
             uint64_t sceneVersion = UINT64_MAX;
             uint64_t environmentVersion = UINT64_MAX;
@@ -323,6 +355,11 @@ namespace ic
             const CompiledGraphPlan& plan, const ExecutionNode& node,
             const FrameContext& ctx, const SceneRenderView& scene,
             ID3D12GraphicsCommandList4* cmd, ID3D12Resource* swapchainImage);
+        void recordPassPayload(
+            const AccelerationStructureBuildPassData&,
+            const CompiledGraphPlan&, const ExecutionNode&,
+            const FrameContext& ctx, const SceneRenderView&,
+            ID3D12GraphicsCommandList4* cmd, ID3D12Resource*);
         // Declared-but-unused PassPayload alternatives. They keep the visit
         // exhaustive and record nothing (the graph still emits their barriers and
         // queue ordering); collapse them into real recorders when a pass adopts
@@ -464,6 +501,7 @@ namespace ic
         bool prepareSceneResources(
             const FrameContext& ctx,
             const SceneRenderView& scene);
+        bool prepareGiRayQueryResources(const FrameContext& ctx);
 
         GraphicsPipelineHandle pipelineForNode(
             const CompiledGraphPlan& plan,
@@ -500,7 +538,10 @@ namespace ic
         std::mutex m_clusteredForwardResourcesMutex;
         GpuOcclusionHistoryState m_gpuOcclusionHistory;
         PathTraceResources m_pathTraceResources;
+        RayTracingSceneService* m_rayTracingSceneService = nullptr;
+        DX12AccelerationStructureProvider m_accelerationStructures;
         EnvironmentResources m_environmentResources;
+        GraphResourceId m_resolvedDiffuseGi = InvalidGraphResourceId;
 
         const PipelineLibrary* m_pipelineLibrary = nullptr;
         std::unordered_map<AssetHandle, DX12UploadedModel, AssetHandleHash> m_uploadedModels;
@@ -529,6 +570,8 @@ namespace ic
         GpuCullPerformance m_gpuCullPerformance = {};
         uint64_t m_gpuCullDiagnosticFrames = 0;
         Microsoft::WRL::ComPtr<ID3D12QueryHeap> m_gpuCullTimestampHeap;
+        Microsoft::WRL::ComPtr<ID3D12CommandSignature>
+            m_dispatchIndirectSignature;
         DX12Buffer m_gpuCullTimestampReadback;
         std::vector<double> m_gpuCullCpuRecordMilliseconds;
         std::vector<uint8_t> m_gpuCullTimestampValid;
@@ -536,6 +579,19 @@ namespace ic
         DX12GpuProfiler m_gpuProfiler;
         std::vector<ID3D12CommandList*> m_frameCommandLists;
         RendererPerformanceCounters m_performanceCounters{};
+        std::array<uint32_t, sizeof(GpuGiDiagnostics) / sizeof(uint32_t)>
+            m_giDiagnosticWords{};
+        uint64_t m_giDiagnosticFrames = 0;
+        bool m_loggedGiDiagnostics = false;
+        bool m_giDiagnosticsReadbackActive = false;
+        uint32_t m_giDebugView = 0;
+        uint32_t m_giDiagnosticIntensityBits = 0x3f800000u;
+        uint32_t m_giDebugExposureBits = 0x3f800000u;
+        uint32_t m_giMaxSurfelUpdates = 1u;
+        uint32_t m_giMaxProbeUpdates = 64u;
+        uint32_t m_giRayBudget = 1u;
+        uint32_t m_giFreezeAfterFrames = 0;
+        uint64_t m_giCacheInitializationFrame = 0;
         // Built once at init; backendDiagnostics() returns spans into these.
         std::string m_diagnosticAdapterName;
         std::vector<BackendFeature> m_diagnosticFeatures;

@@ -526,6 +526,8 @@ namespace ic
         m_crossFrameDependencies.clear();
 
         const auto resources = builder.resources();
+        const auto nodes = builder.nodes();
+        const auto payloads = builder.payloads();
 
         std::pmr::vector<uint32_t> execIndex(
             m_nodes.size(), 0, m_nodes.get_allocator());
@@ -539,6 +541,24 @@ namespace ic
             return node < m_nodeSubmission.size()
                 ? m_nodeSubmission[node]
                 : UINT32_MAX;
+        };
+
+        const auto cadenceOf = [&](GraphNodeId node) -> PassCadence
+        {
+            if (node >= nodes.size())
+                return PassCadence::PerFrame;
+            const uint32_t payloadIndex =
+                nodes[node].graphNode.payloadIndex;
+            if (payloadIndex >= payloads.size())
+                return PassCadence::PerFrame;
+            const PassPayload& payload = payloads[payloadIndex];
+            if (const auto* pass = std::get_if<GraphicsPassData>(&payload))
+                return pass->execution.cadence;
+            if (const auto* pass = std::get_if<ComputePassData>(&payload))
+                return pass->execution.cadence;
+            if (const auto* pass = std::get_if<TransferPassData>(&payload))
+                return pass->execution.cadence;
+            return PassCadence::PerFrame;
         };
 
         // Scan a chain's REAL (non-synthetic) accesses for the earliest writer,
@@ -658,17 +678,44 @@ namespace ic
             {
                 continue;
             }
-            const uint32_t consumerSub = submissionOf(firstWriter->node);
             const uint32_t producerSub = submissionOf(lastAccess->node);
-            if (consumerSub == UINT32_MAX || producerSub == UINT32_MAX)
+            if (producerSub == UINT32_MAX)
             {
                 continue;
             }
-            m_crossFrameDependencies.push_back({
-                .resource = chain.resource,
-                .consumerNode = firstWriter->node,
-                .consumerSubmission = consumerSub,
-                .producerSubmission = producerSub });
+
+            // A cadence-skipped writer cannot be the sole consumer of this
+            // edge: when it skips, the next executing writer becomes the first
+            // overwrite of the shared physical allocation. Emit candidates in
+            // execution order through the first guaranteed per-frame writer.
+            // The executor activates only the candidates that execute, so the
+            // actual first writer always waits for the prior frame's last use.
+            std::pmr::vector<const ResourceAccess*> writers(
+                m_nodes.get_allocator());
+            for (const ResourceAccess& access : chain.accesses)
+            {
+                if (!access.external && access.access != AccessType::Read)
+                    writers.push_back(&access);
+            }
+            std::sort(writers.begin(), writers.end(),
+                [&](const ResourceAccess* lhs, const ResourceAccess* rhs)
+                {
+                    return execIndex[lhs->node] < execIndex[rhs->node];
+                });
+            for (const ResourceAccess* writer : writers)
+            {
+                const uint32_t consumerSub = submissionOf(writer->node);
+                if (consumerSub != UINT32_MAX)
+                {
+                    m_crossFrameDependencies.push_back({
+                        .resource = chain.resource,
+                        .consumerNode = writer->node,
+                        .consumerSubmission = consumerSub,
+                        .producerSubmission = producerSub });
+                }
+                if (cadenceOf(writer->node) == PassCadence::PerFrame)
+                    break;
+            }
         }
     }
 

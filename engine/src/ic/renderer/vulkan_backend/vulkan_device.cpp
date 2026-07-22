@@ -89,13 +89,19 @@ namespace ic
             !m_info.supportedFeatures.timelineSemaphore ||
             !m_info.supportedFeatures.descriptorIndexing ||
             !m_info.supportedFeatures.bufferDeviceAddress ||
-            !m_info.supportedFeatures.drawIndirectCount)
+            !m_info.supportedFeatures.drawIndirectCount ||
+            !m_info.features.features.drawIndirectFirstInstance ||
+            !m_info.features.features.multiDrawIndirect)
         {
             throw std::runtime_error(
                 "Selected Vulkan device does not support required renderer features.");
         }
 
         VkPhysicalDeviceFeatures deviceFeatures{};
+        deviceFeatures.drawIndirectFirstInstance = VK_TRUE;
+        deviceFeatures.multiDrawIndirect = VK_TRUE;
+        deviceFeatures.samplerAnisotropy =
+            m_info.features.features.samplerAnisotropy;
 
         VkPhysicalDeviceVulkan12Features enabledVulkan12{};
         enabledVulkan12.sType =
@@ -137,6 +143,17 @@ namespace ic
         enabledVulkan13Features.synchronization2 =
             VK_TRUE;
 
+        VkPhysicalDeviceAccelerationStructureFeaturesKHR enabledAs{};
+        enabledAs.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
+        enabledAs.accelerationStructure =
+            m_info.supportedFeatures.accelerationStructure ? VK_TRUE : VK_FALSE;
+        VkPhysicalDeviceRayQueryFeaturesKHR enabledRayQuery{};
+        enabledRayQuery.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
+        enabledRayQuery.rayQuery =
+            m_info.supportedFeatures.rayQuery ? VK_TRUE : VK_FALSE;
+
 #ifdef VK_EXT_descriptor_buffer
         VkPhysicalDeviceDescriptorBufferFeaturesEXT enabledDescriptorBuffer{};
         enabledDescriptorBuffer.sType =
@@ -149,12 +166,26 @@ namespace ic
 
 #ifdef VK_EXT_descriptor_buffer
         enabledVulkan13Features.pNext = &enabledDescriptorBuffer;
+        enabledDescriptorBuffer.pNext = &enabledAs;
+#else
+        enabledVulkan13Features.pNext = &enabledAs;
 #endif
+        enabledAs.pNext = &enabledRayQuery;
 
         std::vector<const char*> deviceExtensions =
         {
             VK_KHR_SWAPCHAIN_EXTENSION_NAME
         };
+
+        if (m_info.supportedFeatures.accelerationStructure)
+        {
+            deviceExtensions.push_back(
+                VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+            deviceExtensions.push_back(
+                VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+        }
+        if (m_info.supportedFeatures.rayQuery)
+            deviceExtensions.push_back(VK_KHR_RAY_QUERY_EXTENSION_NAME);
 
 #ifdef VK_EXT_descriptor_buffer
         if (m_info.supportedFeatures.descriptorBuffer)

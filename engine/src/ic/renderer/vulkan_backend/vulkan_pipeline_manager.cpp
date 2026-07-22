@@ -1,6 +1,7 @@
 ﻿#include "ic/renderer/vulkan_backend/vulkan_pipeline_manager.h"
 
 #include <fstream>
+#include "ic/renderer/global_illumination/global_illumination_bindings.h"
 #include <stdexcept>
 
 #include "ic/core/asset_manager.h"
@@ -410,6 +411,15 @@ namespace ic
             layoutInfo.setLayoutCount = 1;
             layoutInfo.pSetLayouts = &pipeline.descriptorSetLayout;
         }
+        VkPushConstantRange giPushConstants{};
+        if (desc.bindingLayout == PipelineBindingLayoutKind::GlobalIllumination)
+        {
+            giPushConstants.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+            giPushConstants.offset = 0;
+            giPushConstants.size = 32u * sizeof(uint32_t);
+            layoutInfo.pushConstantRangeCount = 1;
+            layoutInfo.pPushConstantRanges = &giPushConstants;
+        }
 
         throwIfFailed(
             vkCreatePipelineLayout(
@@ -477,6 +487,79 @@ namespace ic
                     &setLayout),
                 "Failed to create Vulkan compute descriptor set layout.");
 
+            return setLayout;
+        }
+
+        if (layout == PipelineBindingLayoutKind::GlobalIllumination)
+        {
+            std::array<VkDescriptorSetLayoutBinding,
+                GiBufferBindingCount + 18u> bindings{};
+            for (uint32_t i = 0; i < GiBufferBindingCount; ++i)
+                bindings[i] = { i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                    VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount] = {
+                GiPrimaryInputBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 1u] = {
+                GiHistoryInputBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 2u] = {
+                GiSceneDepthBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 3u] = {
+                GiSurfaceAttributesBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 4u] = {
+                GiPreviousSceneDepthBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 5u] = {
+                GiPreviousSurfaceAttributesBinding,
+                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 6u] = {
+                GiOutputBinding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 7u] = {
+                GiTlasBinding, VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 8u] = {
+                GiGeometryTableBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 9u] = {
+                GiInstanceTableBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 10u] = {
+                GiMaterialTableBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 11u] = {
+                GiVkVertexBuffersBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                GiMaxGeometryBufferCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 12u] = {
+                GiVkIndexBuffersBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                GiMaxGeometryBufferCount, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 13u] = {
+                GiVkBindlessTexturesBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                MaxBindlessTextures, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 14u] = {
+                GiVkBindlessSamplersBinding, VK_DESCRIPTOR_TYPE_SAMPLER,
+                MaxBindlessSamplers, VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 15u] = {
+                GiVkEnvironmentBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 16u] = {
+                GiVkEnvironmentSamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            bindings[GiBufferBindingCount + 17u] = {
+                GiVkFrameConstantsBinding, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
+                VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
+            VkDescriptorSetLayoutCreateInfo info{};
+            info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            info.bindingCount = static_cast<uint32_t>(bindings.size());
+            info.pBindings = bindings.data();
+            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            throwIfFailed(vkCreateDescriptorSetLayout(
+                m_device, &info, nullptr, &setLayout),
+                "Failed to create Vulkan GI descriptor set layout.");
             return setLayout;
         }
 
@@ -737,7 +820,7 @@ namespace ic
 
         if (layout == PipelineBindingLayoutKind::ClusteredForward)
         {
-            VkDescriptorSetLayoutBinding bindings[15]{};
+            VkDescriptorSetLayoutBinding bindings[16]{};
             bindings[0] = { 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
                 VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[1] = { 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
@@ -768,6 +851,9 @@ namespace ic
                 VK_SHADER_STAGE_COMPUTE_BIT, nullptr };
             bindings[14] = { 25, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1,
                 VK_SHADER_STAGE_VERTEX_BIT, nullptr };
+            bindings[15] = { MaxBindlessTextures + 5,
+                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1,
+                VK_SHADER_STAGE_FRAGMENT_BIT, nullptr };
 
             VkDescriptorSetLayoutCreateInfo layoutInfo{};
             layoutInfo.sType =
@@ -951,6 +1037,8 @@ namespace ic
             return VK_COMPARE_OP_LESS_OR_EQUAL;
         case CompareOp::Greater:
             return VK_COMPARE_OP_GREATER;
+        case CompareOp::GreaterEqual:
+            return VK_COMPARE_OP_GREATER_OR_EQUAL;
         case CompareOp::Always:
             return VK_COMPARE_OP_ALWAYS;
         }

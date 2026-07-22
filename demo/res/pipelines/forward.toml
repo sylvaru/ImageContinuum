@@ -11,7 +11,7 @@ depthClip = true
 [pipelines.forward_bindless.depth]
 enabled = true
 write = true
-compare = "LessEqual"
+compare = "GreaterEqual"
 format = "D32_Float"
 
 [pipelines.forward_bindless.blend]
@@ -41,7 +41,7 @@ depthClip = true
 [pipelines.depth_prepass.depth]
 enabled = true
 write = true
-compare = "LessEqual"
+compare = "GreaterEqual"
 format = "D32_Float"
 
 [pipelines.depth_prepass.shaders.dx12]
@@ -103,7 +103,7 @@ cullMode = "None"
 [pipelines.skybox.depth]
 enabled = true
 write = false
-compare = "LessEqual"
+compare = "GreaterEqual"
 format = "D32_Float"
 
 [pipelines.skybox.color]

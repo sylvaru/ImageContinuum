@@ -41,6 +41,28 @@ float3 fresnelSchlickRoughness(float cosTheta, float3 f0, float roughness)
         pow(saturate(1.0f - cosTheta), 5.0f);
 }
 
+// Convert normal variation inside the pixel footprint into a matching GGX
+// roughness. Screen-space derivatives catch subpixel geometric detail, while
+// the length of a filtered tangent-space normal retains variance that was
+// already averaged away by normal-map mip filtering.
+float specularAntiAliasedRoughness(
+    float roughness,
+    float3 shadingNormal,
+    float tangentNormalLength)
+{
+    const float3 normalDx = ddx(shadingNormal);
+    const float3 normalDy = ddy(shadingNormal);
+    const float geometricVariance =
+        dot(normalDx, normalDx) + dot(normalDy, normalDy);
+    const float geometricKernel = min(2.0f * geometricVariance, 0.18f);
+    const float normalMapKernel = min(
+        saturate(1.0f - tangentNormalLength),
+        0.25f);
+
+    return sqrt(saturate(
+        roughness * roughness + geometricKernel + normalMapKernel));
+}
+
 float3 pbrDirectLighting(
     float3 baseColor,
     float metallic,

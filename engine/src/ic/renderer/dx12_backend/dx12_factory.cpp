@@ -4,6 +4,7 @@
 #include <dxgidebug.h>
 #include <spdlog/spdlog.h>
 
+#include <cstdlib>
 #include <stdexcept>
 
 namespace
@@ -47,6 +48,30 @@ namespace ic
             if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debug))))
             {
                 debug->EnableDebugLayer();
+                char* gpuValidation = nullptr;
+                size_t gpuValidationLength = 0;
+                (void)_dupenv_s(&gpuValidation, &gpuValidationLength,
+                    "IC_DX12_GPU_VALIDATION");
+                const bool enableGpuValidation = gpuValidation &&
+                    gpuValidationLength == 2 && gpuValidation[0] == '1';
+                std::free(gpuValidation);
+                if (enableGpuValidation)
+                {
+                    Microsoft::WRL::ComPtr<ID3D12Debug1> debug1;
+                    if (SUCCEEDED(debug.As(&debug1)))
+                    {
+                        debug1->SetEnableGPUBasedValidation(TRUE);
+                        debug1->SetEnableSynchronizedCommandQueueValidation(
+                            TRUE);
+                        spdlog::info(
+                            "[DX12Factory] GPU-based validation enabled.");
+                    }
+                    else
+                    {
+                        spdlog::warn(
+                            "[DX12Factory] GPU-based validation requested but unavailable.");
+                    }
+                }
                 factoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
                 m_validationEnabled = true;
                 spdlog::info("[DX12Factory] D3D12 debug layer enabled.");

@@ -15,6 +15,8 @@
 #include "ic/renderer/frame_graph/compiled_graph_plan.h"
 #include "ic/renderer/pipeline_library.h"
 #include "ic/renderer/renderer_diagnostics.h"
+#include "ic/renderer/global_illumination/global_illumination.h"
+#include "ic/renderer/ray_tracing/ray_tracing_scene.h"
 #include "ic/scene/scene_render_view.h"
 
 #include <spdlog/spdlog.h>
@@ -62,6 +64,13 @@ namespace ic
         Scope<RendererPath> path;
         PipelineLibrary pipelineLibrary;
         IBLBaker iblBaker;
+        RayTracingSceneService rayTracingScene;
+        GlobalIlluminationSystem globalIllumination;
+        GlobalIlluminationConfiguration compiledGiConfiguration{};
+        RayTracingCapabilities rayTracingCapabilities{};
+        bool rayTracingAllowed = true;
+        GlobalIlluminationQuality lastEnabledGiQuality =
+            GlobalIlluminationQuality::High;
 
         FrameGraphBuilder builder;
         FrameGraphCompiler compiler;
@@ -102,6 +111,11 @@ namespace ic
         std::vector<uint8_t> executeNodes;
         uint64_t lastSceneVersion = UINT64_MAX;
         uint64_t lastEnvironmentVersion = UINT64_MAX;
+        glm::vec3 lastGiCameraPosition = glm::vec3(0.0f);
+        glm::vec3 lastGiCameraForward = glm::vec3(0.0f, 0.0f, -1.0f);
+        float lastGiCameraFov = 0.0f;
+        entt::entity lastGiCameraEntity = entt::null;
+        bool giCameraHistoryValid = false;
         float lastNearPlane = 0.0f;
         float lastFarPlane = 0.0f;
         float lastVerticalFov = 0.0f;
@@ -128,6 +142,16 @@ namespace ic
             createPath(spec.pathType)
         );
         m_runtime->pathType = spec.pathType;
+        m_runtime->globalIllumination.configure(
+            spec.settings.globalIllumination);
+        if (spec.settings.globalIllumination.quality !=
+                GlobalIlluminationQuality::Off &&
+            spec.settings.globalIllumination.quality !=
+                GlobalIlluminationQuality::Custom)
+        {
+            m_runtime->lastEnabledGiQuality =
+                spec.settings.globalIllumination.quality;
+        }
     }
     Renderer::~Renderer()
     {}
@@ -149,6 +173,46 @@ namespace ic
             m_runtime->pipelineLibrary,
             window,
             workerCount);
+        m_runtime->backend->setRayTracingSceneService(
+            &m_runtime->rayTracingScene);
+        m_runtime->rayTracingAllowed = spec.settings.rayTracing;
+        updateRayTracingDemand();
+        GlobalIlluminationCapabilities giCapabilities{};
+        giCapabilities.rayTracing =
+            m_runtime->backend->rayTracingCapabilities();
+        m_runtime->rayTracingCapabilities = giCapabilities.rayTracing;
+        giCapabilities.asyncCompute =
+            m_runtime->backend->supportsAsyncCompute() &&
+            giCapabilities.rayTracing.asyncComputeQueries;
+        giCapabilities.indirectDispatch =
+            giCapabilities.rayTracing.indirectDispatch;
+        m_runtime->globalIllumination.setCapabilities(giCapabilities);
+        if (m_runtime->globalIllumination.requested() &&
+            (!giCapabilities.rayTracing.accelerationStructures ||
+             !giCapabilities.rayTracing.inlineRayQueries ||
+             !giCapabilities.indirectDispatch))
+        {
+            auto fallback = globalIlluminationPreset(
+                GlobalIlluminationQuality::Off,
+                m_runtime->globalIllumination.configuration());
+            m_runtime->globalIllumination.configure(fallback);
+            updateRayTracingDemand();
+            spdlog::warn(
+                "[Renderer] Diffuse GI requested but inline RT is unsupported; "
+                "selected Off and retained clustered-forward fallback lighting.");
+        }
+        const auto& activeGiConfiguration =
+            m_runtime->globalIllumination.configuration();
+        m_runtime->backend->setGlobalIlluminationDisplay(
+            static_cast<uint32_t>(
+                activeGiConfiguration.debugView),
+            activeGiConfiguration.diagnosticIntensity,
+            activeGiConfiguration.debugExposure);
+        m_runtime->backend->setGlobalIlluminationRuntimeSettings(
+            activeGiConfiguration.limits.maxSurfelUpdates,
+            activeGiConfiguration.limits.maxProbeUpdates,
+            activeGiConfiguration.limits.rayBudget,
+            activeGiConfiguration.freezeAfterFrames);
         m_runtime->backend->setGpuOcclusionEnabled(
             spec.settings.gpuOcclusion);
         m_runtime->gpuCullDebugMode =
@@ -209,6 +273,7 @@ namespace ic
             runtime.graphDirty = true;
             runtime.rebuildReason = FrameGraphBuildReason::Resize;
             runtime.pendingInvalidation |= PassInvalidation::Resize;
+            runtime.globalIllumination.invalidateHistory();
         }
 
         // Runs before the rebuild check so a decision change this frame is
@@ -247,7 +312,48 @@ namespace ic
         {
             runtime.lastSceneVersion = scene.sceneVersion;
             runtime.pendingInvalidation |= PassInvalidation::Scene;
+            runtime.globalIllumination.invalidateHistory();
         }
+
+        const RayTracingCapabilities currentRt =
+            runtime.backend->rayTracingCapabilities();
+        if (currentRt.sharedAccelerationStructures !=
+                runtime.rayTracingCapabilities.sharedAccelerationStructures ||
+            currentRt.accelerationStructures !=
+                runtime.rayTracingCapabilities.accelerationStructures ||
+            currentRt.inlineRayQueries !=
+                runtime.rayTracingCapabilities.inlineRayQueries)
+        {
+            runtime.rayTracingCapabilities = currentRt;
+            GlobalIlluminationCapabilities capabilities =
+                runtime.globalIllumination.capabilities();
+            capabilities.rayTracing = currentRt;
+            runtime.globalIllumination.setCapabilities(capabilities);
+            runtime.graphDirty = true;
+            runtime.rebuildReason = FrameGraphBuildReason::Explicit;
+            runtime.pendingInvalidation |= PassInvalidation::Configuration;
+        }
+        const glm::vec3 cameraForward = glm::normalize(-glm::vec3(
+            scene.camera.view[0][2],
+            scene.camera.view[1][2],
+            scene.camera.view[2][2]));
+        const bool cameraCut = runtime.giCameraHistoryValid &&
+            (runtime.lastGiCameraEntity != scene.camera.entity ||
+             glm::distance(runtime.lastGiCameraPosition,
+                 scene.camera.position) > 5.0f ||
+             glm::dot(runtime.lastGiCameraForward, cameraForward) < 0.5f ||
+             std::abs(runtime.lastGiCameraFov -
+                 scene.camera.verticalFovRadians) > glm::radians(10.0f));
+        if (cameraCut)
+        {
+            runtime.globalIllumination.invalidateHistory();
+            runtime.pendingInvalidation |= PassInvalidation::Camera;
+        }
+        runtime.lastGiCameraPosition = scene.camera.position;
+        runtime.lastGiCameraForward = cameraForward;
+        runtime.lastGiCameraFov = scene.camera.verticalFovRadians;
+        runtime.lastGiCameraEntity = scene.camera.entity;
+        runtime.giCameraHistoryValid = scene.camera.valid != 0u;
         if (runtime.lastEnvironmentVersion != scene.environment.version)
         {
             runtime.lastEnvironmentVersion = scene.environment.version;
@@ -263,6 +369,7 @@ namespace ic
             runtime.lastVerticalFov = scene.camera.verticalFovRadians;
             runtime.lastAspectRatio = scene.camera.aspectRatio;
             runtime.pendingInvalidation |= PassInvalidation::Configuration;
+            runtime.globalIllumination.invalidateHistory();
         }
 
         if (scene.camera.valid == 0u)
@@ -371,6 +478,26 @@ namespace ic
             rt.backend && rt.backend->supportsAsyncCompute();
         rctx.occlusionDiagnosticsEnabled =
             rt.gpuCullDebugMode != GpuCullDebugMode::Off;
+        rctx.globalIllumination = &rt.globalIllumination;
+
+        if (rt.backend->rayTracingEnabled() &&
+            rt.rayTracingCapabilities.accelerationStructures)
+        {
+            BufferDesc tokenDesc{};
+            tokenDesc.size = 16;
+            tokenDesc.usage = BufferUsageFlags::Storage;
+            tokenDesc.memoryUsage = ResourceMemoryUsage::GpuOnly;
+            tokenDesc.debugName = "RayTracing.SceneBuildToken";
+            rctx.rayTracingSceneToken =
+                rt.builder.createPersistentBuffer(tokenDesc);
+            rt.builder.setResourceSemantic(rctx.rayTracingSceneToken,
+                GraphResourceSemantic::RayTracingSceneToken);
+            const GraphNodeId buildNode = rt.builder.addGraphNode(
+                AccelerationStructureBuildPassData{},
+                GraphNodeType::Compute, QueueType::Graphics);
+            rt.builder.write(buildNode, rctx.rayTracingSceneToken,
+                ResourceUsage::StorageBuffer);
+        }
 
         rt.path->buildFrameGraph(rctx, rt.builder);
 
@@ -381,6 +508,8 @@ namespace ic
         rt.pendingInvalidation |= PassInvalidation::GraphRebuild;
 
         rt.graphDirty = false;
+        rt.compiledGiConfiguration =
+            rt.globalIllumination.configuration();
         rt.rebuildReason = FrameGraphBuildReason::Explicit;
     }
 
@@ -790,6 +919,250 @@ namespace ic
             samples,
             rt.graphicsTimelineScratch,
             rt.computeTimelineScratch);
+    }
+
+    bool Renderer::globalIlluminationEnabled() const
+    {
+        return m_runtime && m_runtime->globalIllumination.active();
+    }
+
+    void Renderer::setGlobalIlluminationEnabled(bool enabled)
+    {
+        if (!m_runtime)
+            return;
+        if (enabled)
+            setGlobalIlluminationQuality(m_runtime->lastEnabledGiQuality);
+        else
+            setGlobalIlluminationQuality(GlobalIlluminationQuality::Off);
+    }
+
+    GlobalIlluminationQuality Renderer::globalIlluminationQuality() const
+    {
+        return m_runtime
+            ? m_runtime->globalIllumination.configuration().quality
+            : GlobalIlluminationQuality::Off;
+    }
+
+    void Renderer::setGlobalIlluminationQuality(
+        GlobalIlluminationQuality quality)
+    {
+        if (!m_runtime || quality == GlobalIlluminationQuality::Count)
+            return;
+        if (quality != GlobalIlluminationQuality::Off &&
+            quality != GlobalIlluminationQuality::Custom)
+            m_runtime->lastEnabledGiQuality = quality;
+        auto configuration = globalIlluminationPreset(
+            quality, m_runtime->globalIllumination.configuration());
+        if (quality == GlobalIlluminationQuality::Custom)
+        {
+            configuration.quality = quality;
+            configuration.enabled = true;
+        }
+        const RayTracingCapabilities capabilities =
+            m_runtime->backend ? m_runtime->backend->rayTracingCapabilities()
+                               : RayTracingCapabilities{};
+        if (configuration.enabled &&
+            (!m_runtime->rayTracingAllowed ||
+             !capabilities.accelerationStructures ||
+             !capabilities.inlineRayQueries))
+        {
+            configuration = globalIlluminationPreset(
+                GlobalIlluminationQuality::Off, configuration);
+        }
+        setGlobalIlluminationConfiguration(configuration);
+    }
+
+    GlobalIlluminationConfiguration
+        Renderer::globalIlluminationConfiguration() const
+    {
+        return m_runtime
+            ? m_runtime->globalIllumination.configuration()
+            : GlobalIlluminationConfiguration{};
+    }
+
+    void Renderer::setGlobalIlluminationConfiguration(
+        const GlobalIlluminationConfiguration& requested)
+    {
+        if (!m_runtime)
+            return;
+        const auto before = m_runtime->globalIllumination.configuration();
+        m_runtime->globalIllumination.configure(requested);
+        const auto after = m_runtime->globalIllumination.configuration();
+        if (m_runtime->backend)
+        {
+            m_runtime->backend->setGlobalIlluminationDisplay(
+                static_cast<uint32_t>(after.debugView),
+                after.diagnosticIntensity, after.debugExposure);
+            m_runtime->backend->setGlobalIlluminationRuntimeSettings(
+                after.limits.maxSurfelUpdates,
+                after.limits.maxProbeUpdates,
+                after.limits.rayBudget,
+                after.freezeAfterFrames);
+        }
+
+        const auto& built = m_runtime->compiledGiConfiguration;
+        const bool topologyChanged =
+            before.enabled != after.enabled ||
+            before.surfelDetail != after.surfelDetail ||
+            before.diagnosticsReadback != after.diagnosticsReadback ||
+            before.memoryLimitBytes != after.memoryLimitBytes ||
+            before.evaluationDivisor != after.evaluationDivisor ||
+            before.limits.maxSurfels != after.limits.maxSurfels ||
+            before.limits.hashBucketCount != after.limits.hashBucketCount ||
+            before.limits.probeClipmapCount != after.limits.probeClipmapCount ||
+            before.limits.probeResolution != after.limits.probeResolution ||
+            after.limits.maxProbeUpdates > built.limits.maxProbeUpdates ||
+            (after.surfelDetail &&
+             after.limits.maxSurfelUpdates > built.limits.maxSurfelUpdates);
+        updateRayTracingDemand();
+        if (topologyChanged)
+        {
+            m_runtime->globalIllumination.invalidateHistory();
+            m_runtime->graphDirty = true;
+            m_runtime->schedulingTransitionPending = true;
+            m_runtime->rebuildReason = FrameGraphBuildReason::Explicit;
+            m_runtime->pendingInvalidation |= PassInvalidation::GraphRebuild;
+        }
+        m_runtime->pendingInvalidation |= PassInvalidation::Configuration;
+    }
+
+    GlobalIlluminationDebugView Renderer::globalIlluminationDebugView() const
+    {
+        return m_runtime
+            ? m_runtime->globalIllumination.configuration().debugView
+            : GlobalIlluminationDebugView::None;
+    }
+
+    void Renderer::setGlobalIlluminationDebugView(
+        GlobalIlluminationDebugView view)
+    {
+        if (!m_runtime)
+            return;
+        auto config = m_runtime->globalIllumination.configuration();
+        if (config.debugView == view)
+            return;
+        config.debugView = view;
+        m_runtime->globalIllumination.configure(config);
+        if (m_runtime->backend)
+            m_runtime->backend->setGlobalIlluminationDisplay(
+                static_cast<uint32_t>(view), config.diagnosticIntensity,
+                config.debugExposure);
+        m_runtime->pendingInvalidation |= PassInvalidation::Configuration;
+    }
+
+    float Renderer::globalIlluminationDiagnosticIntensity() const
+    {
+        return m_runtime
+            ? m_runtime->globalIllumination.configuration().diagnosticIntensity
+            : 1.0f;
+    }
+
+    void Renderer::setGlobalIlluminationDiagnosticIntensity(float intensity)
+    {
+        if (!m_runtime)
+            return;
+        auto config = m_runtime->globalIllumination.configuration();
+        config.diagnosticIntensity = std::clamp(intensity, 0.0f, 16.0f);
+        m_runtime->globalIllumination.configure(config);
+        if (m_runtime->backend)
+            m_runtime->backend->setGlobalIlluminationDisplay(
+                static_cast<uint32_t>(config.debugView),
+                config.diagnosticIntensity, config.debugExposure);
+    }
+
+    float Renderer::globalIlluminationDebugExposure() const
+    {
+        return m_runtime
+            ? m_runtime->globalIllumination.configuration().debugExposure
+            : 1.0f;
+    }
+
+    void Renderer::setGlobalIlluminationDebugExposure(float exposure)
+    {
+        if (!m_runtime)
+            return;
+        auto config = m_runtime->globalIllumination.configuration();
+        config.debugExposure = std::clamp(exposure, 0.03125f, 32.0f);
+        m_runtime->globalIllumination.configure(config);
+        if (m_runtime->backend)
+            m_runtime->backend->setGlobalIlluminationDisplay(
+                static_cast<uint32_t>(config.debugView),
+                config.diagnosticIntensity, config.debugExposure);
+    }
+
+    GlobalIlluminationRuntimeStatistics
+        Renderer::globalIlluminationStatistics() const
+    {
+        if (!m_runtime)
+            return {};
+        GlobalIlluminationRuntimeStatistics statistics =
+            m_runtime->globalIllumination.statistics();
+        const auto& passes = m_runtime->globalIllumination.passes();
+        const std::array<GraphNodeId, 8> nodes = {
+            passes.surfacePreparation,
+            passes.surfelAllocation,
+            passes.prioritizeUpdates,
+            passes.traceSurfelUpdates,
+            passes.preserveProbes,
+            passes.updateProbes,
+            passes.evaluate,
+            passes.temporalReconstruction };
+        if (m_runtime->backend)
+        {
+            (void)m_runtime->backend->globalIlluminationDiagnostics(
+                statistics.counters);
+        for (const GpuPassSample& sample :
+                 m_runtime->backend->gpuPassSamples())
+            {
+                for (size_t i = 0; i < nodes.size(); ++i)
+                {
+                    if (sample.node == nodes[i])
+                    {
+                        statistics.passGpuMilliseconds[i] =
+                            std::max(0.0, sample.endMs - sample.beginMs);
+                    }
+                }
+            }
+        }
+        for (double milliseconds : statistics.passGpuMilliseconds)
+            statistics.inclusiveGpuMilliseconds += milliseconds;
+        return statistics;
+    }
+
+    bool Renderer::rayTracingEnabled() const
+    {
+        return m_runtime && m_runtime->rayTracingAllowed;
+    }
+
+    void Renderer::setRayTracingEnabled(bool enabled)
+    {
+        if (!m_runtime || !m_runtime->backend ||
+            m_runtime->rayTracingAllowed == enabled)
+            return;
+        m_runtime->rayTracingAllowed = enabled;
+        if (!enabled && m_runtime->globalIllumination.configuration().enabled)
+        {
+            auto off = globalIlluminationPreset(GlobalIlluminationQuality::Off,
+                m_runtime->globalIllumination.configuration());
+            m_runtime->globalIllumination.configure(off);
+        }
+        updateRayTracingDemand();
+        m_runtime->rayTracingScene.invalidate();
+        m_runtime->globalIllumination.invalidateHistory();
+        m_runtime->graphDirty = true;
+        m_runtime->schedulingTransitionPending = true;
+        m_runtime->rebuildReason = FrameGraphBuildReason::Explicit;
+        m_runtime->pendingInvalidation |= PassInvalidation::Configuration;
+    }
+
+    void Renderer::updateRayTracingDemand()
+    {
+        if (!m_runtime || !m_runtime->backend)
+            return;
+        const bool needed = m_runtime->rayTracingAllowed &&
+            (m_runtime->pathType == RenderPathType::PathTraced ||
+             m_runtime->globalIllumination.requested());
+        m_runtime->backend->setRayTracingEnabled(needed);
     }
 
     RenderPathType Renderer::renderPathType() const

@@ -12,6 +12,8 @@
 #include "ic/interface/window.h"
 #include "ic/core/frame_context.h"
 #include "ic/renderer/frame_graph/frame_graph_executor.h"
+#include "ic/renderer/global_illumination/global_illumination_bindings.h"
+#include "ic/renderer/global_illumination/global_illumination.h"
 #include "ic/scene/scene_render_view.h"
 
 #include <glm/ext/matrix_clip_space.hpp>
@@ -88,6 +90,21 @@ namespace ic
 		Window& window,
 		uint32_t workerCount)
 	{
+        m_giDebugView = static_cast<uint32_t>(
+            spec.settings.globalIllumination.debugView);
+        std::memcpy(&m_giDiagnosticIntensityBits,
+            &spec.settings.globalIllumination.diagnosticIntensity,
+            sizeof(m_giDiagnosticIntensityBits));
+        std::memcpy(&m_giDebugExposureBits,
+            &spec.settings.globalIllumination.debugExposure,
+            sizeof(m_giDebugExposureBits));
+        m_giFreezeAfterFrames =
+            spec.settings.globalIllumination.freezeAfterFrames;
+        m_giMaxSurfelUpdates =
+            spec.settings.globalIllumination.limits.maxSurfelUpdates;
+        m_giMaxProbeUpdates =
+            spec.settings.globalIllumination.limits.maxProbeUpdates;
+        m_giRayBudget = spec.settings.globalIllumination.limits.rayBudget;
 #ifdef IC_DEBUG
         constexpr bool validationAvailable = true;
 #else
@@ -206,6 +223,8 @@ namespace ic
 
         m_retirementQueue.init(
             m_device.device(), m_resourceAllocator, framesInFlight);
+        m_accelerationStructures.init(
+            m_device, m_resourceAllocator, m_retirementQueue, framesInFlight);
 
         m_uploadScheduler.init(
             m_device, framesInFlight);
@@ -242,6 +261,7 @@ namespace ic
             m_gpuCullTimestampPool = VK_NULL_HANDLE;
         }
         m_uploadScheduler.shutdown();
+        m_accelerationStructures.shutdown();
         m_retirementQueue.drain();
         m_graphResourceRegistry.shutdown();
         m_pipelineManager.shutdown();
@@ -409,6 +429,93 @@ namespace ic
             graphExtent.width,
             graphExtent.height,
             graphImports);
+        const GraphResourceId giReadbackId = findResourceBySemantic(
+            plan, GraphResourceSemantic::GiDiagnosticsReadback);
+        m_giDiagnosticsReadbackActive =
+            giReadbackId != InvalidGraphResourceId;
+        if (giReadbackId != InvalidGraphResourceId)
+        {
+            const bool freezeReportReady = m_giFreezeAfterFrames == 0u ||
+                ctx.frameIndex >= m_giCacheInitializationFrame +
+                    m_giFreezeAfterFrames + 10u;
+            if (freezeReportReady && m_giDiagnosticFrames >=
+                m_frameExecutor.framesInFlight() + 120u)
+            {
+                VulkanGraphResourceEntry* readback =
+                    m_graphResourceRegistry.entry(giReadbackId);
+                if (readback && readback->buffer.mapped)
+                {
+                    m_resourceAllocator.invalidate(
+                        readback->buffer, 0, sizeof(GpuGiDiagnostics));
+                    std::memcpy(m_giDiagnosticWords.data(),
+                        readback->buffer.mapped, sizeof(GpuGiDiagnostics));
+                    GpuGiDiagnostics diagnostics{};
+                    std::memcpy(&diagnostics, m_giDiagnosticWords.data(),
+                        sizeof(diagnostics));
+                    if (!m_loggedGiDiagnostics &&
+                        (diagnostics.tracedRays != 0u ||
+                         diagnostics.validPixelCount != 0u ||
+                         diagnostics.surfelOccupancy != 0u ||
+                         diagnostics.allocationFailures != 0u ||
+                         diagnostics.rejectedGathers != 0u))
+                    {
+                        float maxIrradiance = 0.0f;
+                        std::memcpy(&maxIrradiance,
+                            &diagnostics.maxIrradianceBits, sizeof(float));
+                        const float averageIrradiance = diagnostics.validPixelCount
+                            ? static_cast<float>(diagnostics.irradianceLuminanceFixed) /
+                                (256.0f * diagnostics.validPixelCount) : 0.0f;
+                        const uint32_t evaluatedPixels =
+                            diagnostics.validPixelCount + diagnostics.rejectedGathers;
+                        const float validCoverage = evaluatedPixels
+                            ? 100.0f * diagnostics.validPixelCount / evaluatedPixels : 0.0f;
+                        const float averageConfidence = diagnostics.validPixelCount
+                            ? static_cast<float>(diagnostics.coverageFixed) /
+                                (4096.0f * diagnostics.validPixelCount) : 0.0f;
+                        const float averageReferenceError = diagnostics.referenceCount
+                            ? static_cast<float>(diagnostics.referenceErrorFixed) /
+                                (4096.0f * diagnostics.referenceCount) : 0.0f;
+                        const float channelDenominator = diagnostics.validPixelCount
+                            ? 256.0f * diagnostics.validPixelCount : 1.0f;
+                        const glm::vec3 averageIrradianceRgb{
+                            diagnostics.irradianceRedFixed / channelDenominator,
+                            diagnostics.irradianceGreenFixed / channelDenominator,
+                            diagnostics.irradianceBlueFixed / channelDenominator };
+                        spdlog::info(
+                            "[Vulkan GI] surfels={} probes={} probeUpdates={} feedbackSamples={} probeFallbackPixels={} allocationFailures={} rejectedGathers={} rays={} hits={} misses={} alphaRejects={} stale={} invalid={} selfRejects={} updates={} avgIrradiance={} avgIrradianceRgb=({},{},{}) maxIrradiance={} validCoveragePct={} avgConfidence={} unitDiffuseInjectedLuma={} temporalRejected={} referenceSamples={} avgShReferenceError={}",
+                            diagnostics.surfelOccupancy,
+                            diagnostics.probeOccupancy,
+                            diagnostics.probeUpdateCount,
+                            diagnostics.feedbackSamples,
+                            diagnostics.probeFallbackPixels,
+                            diagnostics.allocationFailures,
+                            diagnostics.rejectedGathers,
+                            diagnostics.tracedRays,
+                            diagnostics.hits,
+                            diagnostics.misses,
+                            diagnostics.alphaRejections,
+                            diagnostics.staleSurfels,
+                            diagnostics.invalidMappings,
+                            diagnostics.selfHitRejections,
+                            diagnostics.surfelUpdateCount,
+                            averageIrradiance, averageIrradianceRgb.r,
+                            averageIrradianceRgb.g, averageIrradianceRgb.b,
+                            maxIrradiance, validCoverage,
+                            averageConfidence, averageIrradiance / 3.14159265359f,
+                            diagnostics.temporalRejectedPixels,
+                            diagnostics.referenceCount, averageReferenceError);
+                        m_loggedGiDiagnostics = true;
+                    }
+                }
+            }
+            ++m_giDiagnosticFrames;
+        }
+        else
+        {
+            m_giDiagnosticFrames = 0;
+            m_loggedGiDiagnostics = false;
+            m_giDiagnosticWords.fill(0u);
+        }
         const GraphResourceId statsReadbackId = findResourceBySemantic(
             plan, GraphResourceSemantic::GpuDrivenCullStatsReadback);
         if (statsReadbackId != InvalidGraphResourceId &&
@@ -503,6 +610,8 @@ namespace ic
     {
         // Resolve lazy pipeline/resource state before worker threads begin.
         // Recording jobs may only read this shared renderer state.
+        m_resolvedDiffuseGi = findResourceBySemantic(
+            plan, GraphResourceSemantic::GiResolvedIrradiance);
         ensureDepthTarget();
         ensureClusteredForwardResources();
         // Resolve the graph-owned GPU-driven + cluster buffer handles before any
@@ -527,13 +636,41 @@ namespace ic
             }
             else if (node.type == GraphNodeType::Compute)
             {
-                (void)computePipelineForNode(plan, node);
+                const bool nativeAsPass = node.payloadIndex < plan.payloads.size() &&
+                    std::holds_alternative<AccelerationStructureBuildPassData>(
+                        plan.payloads[node.payloadIndex]);
+                if (nativeAsPass)
+                    (void)prepareSceneResources(ctx, scene, {}, false);
+                else
+                    (void)computePipelineForNode(plan, node);
             }
         }
 
         // Prepared scene data now exists; push the cull inputs into the
         // graph-owned per-frame-slot buffers before any worker records the cull.
         uploadGpuDrivenInputs();
+        if (m_resolvedDiffuseGi != InvalidGraphResourceId)
+            (void)prepareGiRayQueryResources(ctx);
+
+        m_recordingInitialLayouts.assign(
+            plan.resources.size(), VK_IMAGE_LAYOUT_UNDEFINED);
+        m_recordingPreviousInitialLayouts.assign(
+            plan.resources.size(), VK_IMAGE_LAYOUT_UNDEFINED);
+        for (GraphResourceId resource = 0;
+             resource < plan.resources.size(); ++resource)
+        {
+            if (plan.resources[resource].type != GraphResourceType::Texture ||
+                plan.resources[resource].ownership ==
+                    ResourceOwnership::Imported)
+                continue;
+            if (const VulkanGraphResourceEntry* entry =
+                    m_graphResourceRegistry.entry(resource))
+                m_recordingInitialLayouts[resource] = entry->layout;
+            if (const VulkanGraphResourceEntry* previous =
+                    m_graphResourceRegistry.previousEntry(resource))
+                m_recordingPreviousInitialLayouts[resource] =
+                    previous->layout;
+        }
 
         auto recordNode =
             [&](GraphNodeId nodeId, uint32_t workerIndex)
@@ -627,6 +764,32 @@ namespace ic
             m_workerSlots,
             recordNode,
             commandBuffers);
+
+        // Command recording is parallel, so workers must never communicate
+        // ordering by mutating registry layout state. Publish the deterministic
+        // final state in compiled execution order after every worker is done.
+        for (const GraphNodeId nodeId : plan.executionOrder)
+        {
+            if (nodeId >= plan.nodes.size())
+                continue;
+            const ExecutionNode& node = plan.nodes[nodeId];
+            const auto accesses = plan.resourceAccesses.subspan(
+                node.firstResourceAccess, node.resourceAccessCount);
+            for (const ResourceAccess& access : accesses)
+            {
+                if (access.resource >= plan.resources.size() ||
+                    plan.resources[access.resource].type !=
+                        GraphResourceType::Texture ||
+                    plan.resources[access.resource].ownership ==
+                        ResourceOwnership::Imported)
+                    continue;
+                VulkanGraphResourceEntry* entry = access.previousVersion
+                    ? m_graphResourceRegistry.previousEntry(access.resource)
+                    : m_graphResourceRegistry.entry(access.resource);
+                if (entry)
+                    entry->layout = usageToLayout(access.usage);
+            }
+        }
     }
 
     void VulkanBackend::applyBarriers(
@@ -772,9 +935,18 @@ namespace ic
                 pipelineStageFor(barrier.newUsage, barrier.toAccess);
             if (commandQueue == QueueType::Compute)
             {
+                const auto computeQueueStage = [](ResourceUsage usage)
+                {
+                    if (usage == ResourceUsage::IndirectArgument)
+                        return VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+                    if (usage == ResourceUsage::TransferSrc ||
+                        usage == ResourceUsage::TransferDst)
+                        return VK_PIPELINE_STAGE_TRANSFER_BIT;
+                    return VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                };
                 srcStage = crossQueueAcquire ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
-                    : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-                dstStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                    : computeQueueStage(barrier.oldUsage);
+                dstStage = computeQueueStage(barrier.newUsage);
             }
             else if (commandQueue == QueueType::Transfer)
             {
@@ -835,8 +1007,14 @@ namespace ic
         const bool isExternalFirstUse =
             barrier.firstUse && !trackedEntry;
 
-        vkBarrier.oldLayout = trackedEntry
-            ? trackedEntry->layout
+        const auto& initialLayouts = barrier.previousVersion
+            ? m_recordingPreviousInitialLayouts
+            : m_recordingInitialLayouts;
+        vkBarrier.oldLayout = trackedEntry && barrier.firstUse &&
+                barrier.resource < initialLayouts.size()
+            ? initialLayouts[barrier.resource]
+            : trackedEntry
+            ? usageToLayout(barrier.oldUsage)
             : isExternalFirstUse
             ? (isSwapchainImage
                 ? swapchainInitialLayout
@@ -925,11 +1103,6 @@ namespace ic
             0, nullptr,
             0, nullptr,
             1, &vkBarrier);
-
-        if (trackedEntry)
-        {
-            trackedEntry->layout = vkBarrier.newLayout;
-        }
 
     }
 
@@ -1034,6 +1207,19 @@ namespace ic
         VkCommandBuffer cmd, VkImage swapchainImage)
     {
         executeTransferNode(plan, node, ctx, cmd, swapchainImage);
+    }
+
+    void VulkanBackend::recordPassPayload(
+        const AccelerationStructureBuildPassData&,
+        const CompiledGraphPlan&, const ExecutionNode&,
+        const FrameContext& ctx, const SceneRenderView&,
+        VkCommandBuffer cmd, VkImage)
+    {
+        if (!m_rayTracingSceneService) return;
+        m_accelerationStructures.recordBuild(
+            cmd, *m_rayTracingSceneService, m_uploadedModels,
+            static_cast<uint32_t>(ctx.frameIndex %
+                m_frameExecutor.framesInFlight()));
     }
 
     void VulkanBackend::executeGraphicsNode(
@@ -1141,7 +1327,7 @@ namespace ic
         colorAttachment.clearValue = clear;
 
         VkClearValue depthClear{};
-        depthClear.depthStencil = { 1.0f, 0 };
+        depthClear.depthStencil = { 0.0f, 0 };
 
         VkRenderingAttachmentInfo depthAttachment{};
         depthAttachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -1284,6 +1470,459 @@ namespace ic
             return;
         }
         else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::GlobalIllumination)
+        {
+            // Vulkan initializes the persistent cache with native transfer
+            // fills. This avoids binding the full GI descriptor schema before
+            // streamed scene descriptors exist and gives deterministic initial
+            // contents without CPU work or a readback/stall.
+            if (pass->name == "GI.CacheInitialization")
+            {
+                m_giCacheInitializationFrame = ctx.frameIndex;
+                m_giDiagnosticFrames = 0;
+                m_loggedGiDiagnostics = false;
+                VulkanGraphResourceEntry* hash =
+                    m_graphResourceRegistry.entry(findResourceBySemantic(
+                        plan, GraphResourceSemantic::GiHashBuckets));
+                VulkanGraphResourceEntry* residual =
+                    m_graphResourceRegistry.entry(findResourceBySemantic(
+                        plan, GraphResourceSemantic::GiResidualInterface));
+                VulkanGraphResourceEntry* probes =
+                    m_graphResourceRegistry.entry(findResourceBySemantic(
+                        plan, GraphResourceSemantic::GiProbes));
+                VulkanGraphResourceEntry* probeStaging =
+                    m_graphResourceRegistry.entry(findResourceBySemantic(
+                        plan, GraphResourceSemantic::GiProbeStaging));
+                if (!hash || !hash->buffer || !residual || !residual->buffer ||
+                    !probes || !probes->buffer || !probeStaging ||
+                    !probeStaging->buffer)
+                    return;
+                vkCmdFillBuffer(cmd, hash->buffer.buffer, 0,
+                    hash->buffer.size, UINT32_MAX);
+                vkCmdFillBuffer(cmd, residual->buffer.buffer, 0,
+                    residual->buffer.size, 0u);
+                vkCmdFillBuffer(cmd, probes->buffer.buffer, 0,
+                    probes->buffer.size, 0u);
+                vkCmdFillBuffer(cmd, probeStaging->buffer.buffer, 0,
+                    probeStaging->buffer.size, 0u);
+                return;
+            }
+            if (m_gpuScene.frameSlotCount() == 0)
+                return;
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_gpuScene.frameSlotCount());
+            VulkanGpuSceneFrameResources& frameResources =
+                m_gpuScene.frameResources(frameSlot);
+            if (frameResources.giDescriptorPool == VK_NULL_HANDLE)
+            {
+                const VkDescriptorPoolSize sizes[] = {
+                    { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                        (GiBufferBindingCount + 3u +
+                            GiMaxGeometryBufferCount * 2u) * 8u },
+                    { VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                        (6u + MaxBindlessTextures + 1u) * 8u },
+                    { VK_DESCRIPTOR_TYPE_SAMPLER,
+                        (MaxBindlessSamplers + 1u) * 8u },
+                    { VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 8u },
+                    { VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR, 8u },
+                    { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 8u } };
+                VkDescriptorPoolCreateInfo pool{};
+                pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+                pool.maxSets = 8u;
+                pool.poolSizeCount = static_cast<uint32_t>(std::size(sizes));
+                pool.pPoolSizes = sizes;
+                if (vkCreateDescriptorPool(
+                        m_device.device(), &pool, nullptr,
+                        &frameResources.giDescriptorPool) != VK_SUCCESS)
+                    return;
+                std::array<VkDescriptorSetLayout, 8> layouts{};
+                layouts.fill(pipeline->descriptorSetLayout);
+                VkDescriptorSetAllocateInfo allocate{};
+                allocate.sType =
+                    VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                allocate.descriptorPool = frameResources.giDescriptorPool;
+                allocate.descriptorSetCount =
+                    static_cast<uint32_t>(layouts.size());
+                allocate.pSetLayouts = layouts.data();
+                if (vkAllocateDescriptorSets(
+                        m_device.device(),
+                        &allocate,
+                        frameResources.giDescriptorSets.data()) != VK_SUCCESS)
+                    return;
+            }
+
+            constexpr std::array<std::string_view, 8> passNames = {
+                "GI.SurfacePreparation",
+                "GI.SurfelAllocation",
+                "GI.PrioritizeUpdates",
+                "GI.TraceSurfelUpdates",
+                "GI.PreserveProbes",
+                "GI.UpdateProbes",
+                "GI.EvaluateDiffuse",
+                "GI.TemporalReconstruction" };
+            const auto passIt = std::ranges::find(passNames, pass->name);
+            if (passIt == passNames.end())
+                return;
+            const VkDescriptorSet set = frameResources.giDescriptorSets[
+                static_cast<size_t>(std::distance(passNames.begin(), passIt))];
+
+            std::array<VkDescriptorBufferInfo, GiBufferBindingCount> infos{};
+            std::array<VkWriteDescriptorSet, GiBufferBindingCount + 18u> writes{};
+            uint32_t writeCount = 0;
+            for (uint32_t i = 0; i < GiBufferBindingCount; ++i)
+            {
+                const GraphResourceId id =
+                    findResourceBySemantic(plan, GiBufferSemantics[i]);
+                VulkanGraphResourceEntry* entry =
+                    m_graphResourceRegistry.entry(id);
+                if (!entry || !entry->buffer)
+                    return;
+                infos[i] = { entry->buffer.buffer, 0, entry->buffer.size };
+                VkWriteDescriptorSet& write = writes[writeCount++];
+                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet = set;
+                write.dstBinding = i;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                write.pBufferInfo = &infos[i];
+            }
+
+            std::array<VkDescriptorImageInfo, 7> imageInfos{};
+            const auto addImage = [&](uint32_t binding,
+                VkDescriptorType type, VulkanGraphResourceEntry* entry)
+            {
+                if (!entry || entry->view == VK_NULL_HANDLE)
+                    return;
+                const uint32_t index = writeCount - GiBufferBindingCount;
+                imageInfos[index].imageView = entry->view;
+                // The declared descriptor layout must be a legal layout for the
+                // descriptor class and match what the frame graph transitions the
+                // resource into for this usage (see usageToLayout). entry->layout
+                // still reflects the producing pass (e.g. depth-attachment) at the
+                // time the set is written, so deriving it here — as the Hi-Z
+                // recorder does — keeps sampled depth out of an attachment layout.
+                imageInfos[index].imageLayout =
+                    type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE
+                        ? VK_IMAGE_LAYOUT_GENERAL
+                        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                VkWriteDescriptorSet& write = writes[writeCount++];
+                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet = set;
+                write.dstBinding = binding;
+                write.descriptorCount = 1;
+                write.descriptorType = type;
+                write.pImageInfo = &imageInfos[index];
+            };
+
+            const GraphResourceId primaryId =
+                findNodeResource(plan, node, ResourceUsage::SampledTexture);
+            if (primaryId != InvalidGraphResourceId)
+                addImage(GiPrimaryInputBinding,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    m_graphResourceRegistry.entry(primaryId));
+            const GraphResourceId historyId = findPreviousNodeResource(
+                plan, node, ResourceUsage::SampledTexture);
+            if (historyId != InvalidGraphResourceId)
+                addImage(GiHistoryInputBinding,
+                    VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                    m_graphResourceRegistry.previousEntry(historyId));
+            const GraphResourceId sceneDepthId = findResourceBySemantic(
+                plan, GraphResourceSemantic::GiSceneDepth);
+            const GraphResourceId surfaceAttributesId = findResourceBySemantic(
+                plan, GraphResourceSemantic::GiSurfaceAttributes);
+            addImage(GiSceneDepthBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                m_graphResourceRegistry.entry(sceneDepthId));
+            addImage(GiSurfaceAttributesBinding,
+                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                m_graphResourceRegistry.entry(surfaceAttributesId));
+            addImage(GiPreviousSceneDepthBinding,
+                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                m_graphResourceRegistry.previousEntry(sceneDepthId));
+            addImage(GiPreviousSurfaceAttributesBinding,
+                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,
+                m_graphResourceRegistry.previousEntry(surfaceAttributesId));
+            const GraphResourceId outputId =
+                findNodeResource(plan, node, ResourceUsage::StorageTexture);
+            if (outputId != InvalidGraphResourceId)
+                addImage(GiOutputBinding, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    m_graphResourceRegistry.entry(outputId));
+
+            const VkAccelerationStructureKHR tlas =
+                m_accelerationStructures.nativeTlas();
+            if (tlas == VK_NULL_HANDLE) return;
+            VkWriteDescriptorSetAccelerationStructureKHR asInfo{
+                VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET_ACCELERATION_STRUCTURE_KHR };
+            asInfo.accelerationStructureCount = 1;
+            asInfo.pAccelerationStructures = &tlas;
+            VkWriteDescriptorSet& asWrite = writes[writeCount++];
+            asWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            asWrite.pNext = &asInfo;
+            asWrite.dstSet = set;
+            asWrite.dstBinding = GiTlasBinding;
+            asWrite.descriptorCount = 1;
+            asWrite.descriptorType =
+                VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+
+            if (!frameResources.giRtGeometries ||
+                !frameResources.giRtInstances ||
+                !frameResources.materials ||
+                !m_rayTracingSceneService)
+                return;
+            std::array<VkDescriptorBufferInfo, 3> rtTableInfos{{
+                { frameResources.giRtGeometries.buffer, 0,
+                    frameResources.giRtGeometries.size },
+                { frameResources.giRtInstances.buffer, 0,
+                    frameResources.giRtInstances.size },
+                { frameResources.materials.buffer, 0,
+                    frameResources.materials.size }
+            }};
+            for (uint32_t i = 0; i < 3u; ++i)
+            {
+                VkWriteDescriptorSet& write = writes[writeCount++];
+                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet = set;
+                write.dstBinding = GiGeometryTableBinding + i;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                write.pBufferInfo = &rtTableInfos[i];
+            }
+
+            std::array<const VulkanUploadedModel*, GiMaxGeometryBufferCount>
+                models{};
+            const VulkanUploadedModel* fallbackModel = nullptr;
+            for (const RayTracingGeometryRecord& geometry :
+                m_rayTracingSceneService->geometries())
+            {
+                if (geometry.modelBufferIndex >= GiMaxGeometryBufferCount)
+                    return;
+                const auto found = m_uploadedModels.find(geometry.model);
+                if (found == m_uploadedModels.end() || !found->second.uploaded)
+                    return;
+                models[geometry.modelBufferIndex] = &found->second;
+                if (!fallbackModel) fallbackModel = &found->second;
+            }
+            if (!fallbackModel) return;
+            std::array<VkDescriptorBufferInfo, GiMaxGeometryBufferCount>
+                vertexInfos{};
+            std::array<VkDescriptorBufferInfo, GiMaxGeometryBufferCount>
+                indexInfos{};
+            for (uint32_t i = 0; i < GiMaxGeometryBufferCount; ++i)
+            {
+                const VulkanUploadedModel* model = models[i]
+                    ? models[i] : fallbackModel;
+                vertexInfos[i] = { model->vertexBuffer.buffer, 0,
+                    model->vertexBuffer.size };
+                indexInfos[i] = { model->indexBuffer.buffer, 0,
+                    model->indexBuffer.size };
+            }
+            VkWriteDescriptorSet& vertexWrite = writes[writeCount++];
+            vertexWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            vertexWrite.dstSet = set;
+            vertexWrite.dstBinding = GiVkVertexBuffersBinding;
+            vertexWrite.descriptorCount = GiMaxGeometryBufferCount;
+            vertexWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            vertexWrite.pBufferInfo = vertexInfos.data();
+            VkWriteDescriptorSet& indexWrite = writes[writeCount++];
+            indexWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            indexWrite.dstSet = set;
+            indexWrite.dstBinding = GiVkIndexBuffersBinding;
+            indexWrite.descriptorCount = GiMaxGeometryBufferCount;
+            indexWrite.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            indexWrite.pBufferInfo = indexInfos.data();
+
+            VkDescriptorImageInfo fallbackTexture{};
+            for (const auto& [key, texture] : m_uploadedTextures)
+            {
+                if (texture.view != VK_NULL_HANDLE)
+                {
+                    fallbackTexture.imageView = texture.view;
+                    fallbackTexture.imageLayout =
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    break;
+                }
+            }
+            VkDescriptorImageInfo fallbackSampler{};
+            for (const auto& [key, sampler] : m_uploadedSamplers)
+            {
+                if (sampler.sampler != VK_NULL_HANDLE)
+                {
+                    fallbackSampler.sampler = sampler.sampler;
+                    break;
+                }
+            }
+            if (fallbackTexture.imageView == VK_NULL_HANDLE ||
+                fallbackSampler.sampler == VK_NULL_HANDLE)
+                return;
+            std::array<VkDescriptorImageInfo, MaxBindlessTextures>
+                textureInfos{};
+            textureInfos.fill(fallbackTexture);
+            for (const auto& [key, texture] : m_uploadedTextures)
+            {
+                if (texture.descriptorIndex < textureInfos.size())
+                    textureInfos[texture.descriptorIndex] = {
+                        VK_NULL_HANDLE, texture.view,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            }
+            std::array<VkDescriptorImageInfo, MaxBindlessSamplers>
+                samplerInfos{};
+            samplerInfos.fill(fallbackSampler);
+            for (const auto& [key, sampler] : m_uploadedSamplers)
+            {
+                if (sampler.descriptorIndex < samplerInfos.size())
+                    samplerInfos[sampler.descriptorIndex].sampler =
+                        sampler.sampler;
+            }
+            VkWriteDescriptorSet& texturesWrite = writes[writeCount++];
+            texturesWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            texturesWrite.dstSet = set;
+            texturesWrite.dstBinding = GiVkBindlessTexturesBinding;
+            texturesWrite.descriptorCount = MaxBindlessTextures;
+            texturesWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            texturesWrite.pImageInfo = textureInfos.data();
+            VkWriteDescriptorSet& samplersWrite = writes[writeCount++];
+            samplersWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            samplersWrite.dstSet = set;
+            samplersWrite.dstBinding = GiVkBindlessSamplersBinding;
+            samplersWrite.descriptorCount = MaxBindlessSamplers;
+            samplersWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            samplersWrite.pImageInfo = samplerInfos.data();
+
+            VkDescriptorImageInfo environmentInfo{};
+            // GI misses are black, so the environment is optional. Keep the
+            // statically declared descriptor valid even when no cubemap was
+            // converted; returning here previously skipped every GI dispatch
+            // and left the resolved history uninitialized.
+            environmentInfo.imageView =
+                m_environmentResources.cubemapView != VK_NULL_HANDLE
+                    ? m_environmentResources.cubemapView
+                    : fallbackTexture.imageView;
+            environmentInfo.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkWriteDescriptorSet& environmentWrite = writes[writeCount++];
+            environmentWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            environmentWrite.dstSet = set;
+            environmentWrite.dstBinding = GiVkEnvironmentBinding;
+            environmentWrite.descriptorCount = 1;
+            environmentWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            environmentWrite.pImageInfo = &environmentInfo;
+            VkDescriptorImageInfo environmentSamplerInfo{};
+            environmentSamplerInfo.sampler =
+                m_environmentResources.sampler != VK_NULL_HANDLE
+                    ? m_environmentResources.sampler
+                    : fallbackSampler.sampler;
+            VkWriteDescriptorSet& environmentSamplerWrite = writes[writeCount++];
+            environmentSamplerWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            environmentSamplerWrite.dstSet = set;
+            environmentSamplerWrite.dstBinding = GiVkEnvironmentSamplerBinding;
+            environmentSamplerWrite.descriptorCount = 1;
+            environmentSamplerWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+            environmentSamplerWrite.pImageInfo = &environmentSamplerInfo;
+
+            // Shared frame constants (camera + lights) for world reconstruction
+            // and direct lighting at surfel-ray hits.
+            if (!frameResources.frameConstants) return;
+            VkDescriptorBufferInfo frameConstantsInfo{};
+            frameConstantsInfo.buffer = frameResources.frameConstants.buffer;
+            frameConstantsInfo.offset = 0;
+            frameConstantsInfo.range = VK_WHOLE_SIZE;
+            VkWriteDescriptorSet& frameConstantsWrite = writes[writeCount++];
+            frameConstantsWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            frameConstantsWrite.dstSet = set;
+            frameConstantsWrite.dstBinding = GiVkFrameConstantsBinding;
+            frameConstantsWrite.descriptorCount = 1;
+            frameConstantsWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            frameConstantsWrite.pBufferInfo = &frameConstantsInfo;
+
+            vkUpdateDescriptorSets(
+                m_device.device(), writeCount, writes.data(), 0, nullptr);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                pipeline->pipelineLayout, 0, 1, &set, 0, nullptr);
+            const auto& rtStats = m_rayTracingSceneService->statistics();
+            float cellSize = 0.25f;
+            std::memcpy(&cellSize, &pass->userData[6], sizeof(float));
+            cellSize = std::max(cellSize, 1.0e-3f);
+            const uint32_t hierarchyBits = pass->userData[7];
+            const uint32_t evaluationDivisor = std::max(
+                hierarchyBits & 0xfu, 1u);
+            const uint32_t clipmapCount = std::clamp(
+                (hierarchyBits >> 4u) & 0xfu, 1u, 8u);
+            const uint32_t probeResolution = std::clamp(
+                (hierarchyBits >> 8u) & 0x7fu, 2u, 64u);
+            const GpuGiTraceConstants constants{
+                .frameIndex = static_cast<uint32_t>(ctx.frameIndex),
+                .sceneGeneration = static_cast<uint32_t>(rtStats.generation),
+                .geometryCount = static_cast<uint32_t>(
+                    m_rayTracingSceneService->gpuGeometries().size()),
+                .instanceCount = static_cast<uint32_t>(
+                    m_rayTracingSceneService->gpuInstances().size()),
+                .materialCount = frameResources.materialCapacity,
+                .textureCount = MaxBindlessTextures,
+                .samplerCount = MaxBindlessSamplers,
+                .maxUpdates = m_giMaxSurfelUpdates,
+                .rayBudget = m_giRayBudget,
+                .raysPerSurfel = std::max(pass->userData[2], 1u),
+                .debugView = m_giDebugView,
+                .environmentEnabled =
+                    m_environmentResources.converted &&
+                    m_environmentResources.cubemapView != VK_NULL_HANDLE
+                        ? 1u : 0u,
+                // Drive the probe-transport sky from the scene so it is
+                // controllable and consistent with the forward/PT paths. It was
+                // defaulting to 1.0 (never set), so the probe field ignored the
+                // scene environment intensity entirely.
+                .environmentIntensity =
+                    scene.environment.settings.intensity,
+                .maxSurfels = pass->userData[4],
+                .cellSize = cellSize,
+                .invCellSize = 1.0f / cellSize,
+                .hashBucketCount = pass->userData[5],
+                .candidatesPerCell = 4u,
+                .gatherRadiusScale = 1.5f,
+                .normalThreshold = 0.85f,
+                .planeThreshold = 0.6f * cellSize,
+                .maxSurfelAge = 256u,
+                .reducedWidth = (m_swapchain.extent().width +
+                    evaluationDivisor - 1u) / evaluationDivisor,
+                .reducedHeight = (m_swapchain.extent().height +
+                    evaluationDivisor - 1u) / evaluationDivisor,
+                .evaluationDivisor = evaluationDivisor,
+                .feedbackEnabled = (hierarchyBits >> 15u) & 1u,
+                .confidenceBlend = static_cast<float>(m_giMaxProbeUpdates),
+                .emissiveInstanceIndex =
+                    rtStats.firstEmissiveInstanceIndex,
+                .giFlags = (m_giDiagnosticsReadbackActive ? 1u : 0u) |
+                    (clipmapCount << 4u) |
+                    (probeResolution << 8u) |
+                    ((hierarchyBits & (1u << 16u)) != 0u
+                        ? (1u << 20u) : 0u) |
+                    ((hierarchyBits & (1u << 17u)) != 0u
+                        ? (1u << 21u) : 0u),
+                .freezeAfterFrame = m_giFreezeAfterFrames == 0u ? 0u :
+                    static_cast<uint32_t>(m_giCacheInitializationFrame +
+                        m_giFreezeAfterFrames) };
+            vkCmdPushConstants(cmd, pipeline->pipelineLayout,
+                VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
+            if (pass->indirectArguments != InvalidGraphResourceId)
+            {
+                VulkanGraphResourceEntry* arguments =
+                    m_graphResourceRegistry.entry(pass->indirectArguments);
+                if (!arguments || !arguments->buffer)
+                {
+                    return;
+                }
+                vkCmdDispatchIndirect(
+                    cmd,
+                    arguments->buffer.buffer,
+                    pass->indirectArgumentOffset);
+            }
+            else
+            {
+                vkCmdDispatch(cmd, pass->groupCountX,
+                    pass->groupCountY, pass->groupCountZ);
+            }
+            return;
+        }
+        else if (pipeline->desc.bindingLayout ==
             PipelineBindingLayoutKind::HiZDepthPyramid)
         {
             // Precondition: the forward pipeline must be resolvable and the
@@ -1390,7 +2029,8 @@ namespace ic
                     return;
                 }
                 cull.previousHiZ = previousHiZ->view;
-                cull.previousHiZLayout = previousHiZ->layout;
+                cull.previousHiZLayout =
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             }
 
             if (!recordGpuFrustumCull(passCtx, *pipeline, cull))
@@ -1445,7 +2085,8 @@ namespace ic
             validation.cullStatsSize =
                 m_gpuDrivenBuffers.cullStatsSize;
             validation.currentHiZ = hiZ->view;
-            validation.currentHiZLayout = hiZ->layout;
+            validation.currentHiZLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             if (!recordGpuOcclusionValidation(
                     passCtx, *pipeline, validation))
             {
@@ -2149,13 +2790,12 @@ namespace ic
 
         ensurePathTraceResources();
         ensurePathTraceSceneResources(ctx, scene);
-        const bool environmentResourcesAvailable =
+        const bool environmentRequested =
+            scene.environment.enabled != 0u &&
+            static_cast<bool>(scene.environment.equirectTexture);
+        const bool environmentResourcesAvailable = environmentRequested &&
             ensureEnvironmentResources(ctx, scene, cmd);
-        if (!environmentResourcesAvailable)
-        {
-            return;
-        }
-        if (!m_environmentResources.converted)
+        if (environmentResourcesAvailable && !m_environmentResources.converted)
         {
             if (VulkanComputePipeline* convertPipeline =
                     environmentConvertPipeline())
@@ -2167,7 +2807,8 @@ namespace ic
                     cmd));
             }
         }
-        const bool environmentReady = m_environmentResources.converted;
+        const bool environmentReady = environmentResourcesAvailable &&
+            m_environmentResources.converted;
 
         VulkanComputePipeline* pipeline =
             m_pipelineManager.computePipeline(pathTracePipelineHandle);
@@ -2269,6 +2910,8 @@ namespace ic
         inputs.sceneBvhNodeCount = m_pathTraceResources.sceneBvhNodeCount;
         inputs.firstEmissiveTriangleIndex =
             m_pathTraceResources.firstEmissiveTriangleIndex;
+        inputs.emissiveTriangleCount =
+            m_pathTraceResources.emissiveTriangleCount;
         inputs.environmentReady = environmentReady;
         inputs.environmentIntensity = scene.environment.settings.intensity;
         inputs.environmentExposure =
@@ -2766,10 +3409,7 @@ namespace ic
 
         m_pathTraceResources.lastSceneBuildFrame = ctx.frameIndex;
 
-        PathTraceSceneData sceneData =
-            buildPathTraceSceneData(
-                scene,
-                assets,
+        const PathTraceMaterialTextureResolver materialResolver =
                 [this, &assets](
                     AssetHandle modelHandle,
                     const MaterialTextureSlot& slot)
@@ -2812,14 +3452,29 @@ namespace ic
                             model->images[static_cast<size_t>(texture.imageIndex)],
                             slot.transfer);
                     return indices;
-                });
-        if (sceneData.triangles.empty() &&
+                };
+        PathTraceSceneData fallbackScene;
+        const PathTraceSceneData* sharedScene = nullptr;
+        if (m_rayTracingSceneService)
+        {
+            if (retryThisFrame)
+                m_rayTracingSceneService->invalidate();
+            (void)m_rayTracingSceneService->update(
+                scene, assets, materialResolver);
+            sharedScene = &m_rayTracingSceneService->sceneData();
+        }
+        else
+        {
+            fallbackScene = buildPathTraceSceneData(
+                scene, assets, materialResolver);
+            sharedScene = &fallbackScene;
+        }
+        if (sharedScene->triangles.empty() &&
             m_pathTraceResources.sceneVertices)
         {
             return;
         }
-
-        uploadPathTraceScene(sceneData);
+        uploadPathTraceScene(*sharedScene);
 
         m_pathTraceResources.sceneVersion = scene.sceneVersion;
         m_pathTraceResources.sceneHadPendingModels = hasPendingModels;
@@ -2832,16 +3487,23 @@ namespace ic
     {
         retirePathTraceSceneResources();
 
+        std::vector<PathTraceTriangle> uploadTriangles = sceneData.triangles;
+        uploadTriangles.insert(uploadTriangles.end(),
+            sceneData.emissiveTriangles.begin(),
+            sceneData.emissiveTriangles.end());
+
         m_pathTraceResources.sceneVertexCount =
             static_cast<uint32_t>(sceneData.vertices.size());
         m_pathTraceResources.sceneMaterialCount =
             static_cast<uint32_t>(sceneData.materials.size());
         m_pathTraceResources.sceneTriangleCount =
-            static_cast<uint32_t>(sceneData.triangles.size());
+            static_cast<uint32_t>(uploadTriangles.size());
         m_pathTraceResources.sceneBvhNodeCount =
             static_cast<uint32_t>(sceneData.bvhNodes.size());
         m_pathTraceResources.firstEmissiveTriangleIndex =
             sceneData.firstEmissiveTriangleIndex;
+        m_pathTraceResources.emissiveTriangleCount =
+            static_cast<uint32_t>(sceneData.emissiveTriangles.size());
 
         spdlog::info(
             "[Vulkan] Path trace scene upload: vertices={} materials={} triangles={} bvhNodes={} firstEmissiveTriangle={}",
@@ -2927,7 +3589,7 @@ namespace ic
             createBuffer(
                 sizeof(PathTraceTriangle),
                 m_pathTraceResources.sceneTriangleCount,
-                sceneData.triangles.data(),
+                uploadTriangles.data(),
                 "Vulkan path trace scene triangles");
         m_pathTraceResources.sceneBvhNodes =
             createBuffer(
@@ -4501,7 +5163,10 @@ namespace ic
             uploadImage.srgb = transfer == TextureTransferFunction::SRGB;
         }
 
-        const uint64_t byteSize = imageByteSize(uploadImage);
+        const ImageMipChain mipChain = buildImageMipChain(uploadImage);
+        const uint32_t mipCount =
+            static_cast<uint32_t>(mipChain.levels.size());
+        const uint64_t byteSize = mipChain.pixels.size();
         VulkanBuffer staging =
             m_resourceAllocator.createBuffer({
                 .size = byteSize,
@@ -4513,7 +5178,7 @@ namespace ic
 
         std::memcpy(
             staging.mapped,
-            uploadImage.pixels.data(),
+            mipChain.pixels.data(),
             static_cast<size_t>(byteSize));
         m_resourceAllocator.flush(staging, 0, byteSize);
 
@@ -4528,7 +5193,8 @@ namespace ic
             m_resourceAllocator.createTexture(
                 uploadImage,
                 TextureUsageFlags::Sampled | TextureUsageFlags::TransferDst,
-                "Vulkan bindless model texture");
+                "Vulkan bindless model texture",
+                mipCount);
 
         auto recordUpload = [&](VkCommandBuffer cmd)
             {
@@ -4540,22 +5206,31 @@ namespace ic
                     0,
                     VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    0,
+                    mipCount);
 
-                VkBufferImageCopy copy{};
-                copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                copy.imageSubresource.mipLevel = 0;
-                copy.imageSubresource.baseArrayLayer = 0;
-                copy.imageSubresource.layerCount = 1;
-                copy.imageExtent = uploaded.texture.extent;
+                std::vector<VkBufferImageCopy> copies(mipCount);
+                for (uint32_t mip = 0; mip < mipCount; ++mip)
+                {
+                    copies[mip].bufferOffset = mipChain.levels[mip].offset;
+                    copies[mip].imageSubresource.aspectMask =
+                        VK_IMAGE_ASPECT_COLOR_BIT;
+                    copies[mip].imageSubresource.mipLevel = mip;
+                    copies[mip].imageSubresource.layerCount = 1;
+                    copies[mip].imageExtent = {
+                        mipChain.levels[mip].width,
+                        mipChain.levels[mip].height,
+                        1u };
+                }
 
                 vkCmdCopyBufferToImage(
                     cmd,
                     staging.buffer,
                     uploaded.texture.image,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                    1,
-                    &copy);
+                    mipCount,
+                    copies.data());
 
                 transitionImage(
                     cmd,
@@ -4568,7 +5243,9 @@ namespace ic
                     asynchronous
                         ? VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT
                         : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    0,
+                    mipCount);
             };
         if (asynchronous)
         {
@@ -4588,7 +5265,7 @@ namespace ic
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
         viewInfo.format = uploaded.texture.format;
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        viewInfo.subresourceRange.levelCount = 1;
+        viewInfo.subresourceRange.levelCount = mipCount;
         viewInfo.subresourceRange.layerCount = 1;
 
         throwIfFailed(
@@ -4660,6 +5337,15 @@ namespace ic
         info.addressModeV = sampler ? toAddress(sampler->wrapV) : VK_SAMPLER_ADDRESS_MODE_REPEAT;
         info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         info.maxLod = VK_LOD_CLAMP_NONE;
+        const bool linearSampling = !sampler ||
+            (info.minFilter == VK_FILTER_LINEAR &&
+             info.magFilter == VK_FILTER_LINEAR);
+        if (linearSampling && m_adapter.info().features.features.samplerAnisotropy)
+        {
+            info.anisotropyEnable = VK_TRUE;
+            info.maxAnisotropy = std::min(8.0f,
+                m_adapter.info().properties.limits.maxSamplerAnisotropy);
+        }
 
         throwIfFailed(
             vkCreateSampler(
@@ -4747,6 +5433,9 @@ namespace ic
                 .size = vertexBytes,
                 .usage =
                     BufferUsageFlags::Vertex |
+                    BufferUsageFlags::Storage |
+                    BufferUsageFlags::AccelerationStructureBuildInput |
+                    BufferUsageFlags::ShaderDeviceAddress |
                     BufferUsageFlags::TransferDst,
                 .memoryUsage = ResourceMemoryUsage::GpuOnly,
                 .mappedAtCreation = false,
@@ -4758,6 +5447,9 @@ namespace ic
                 .size = indexBytes,
                 .usage =
                     BufferUsageFlags::Index |
+                    BufferUsageFlags::Storage |
+                    BufferUsageFlags::AccelerationStructureBuildInput |
+                    BufferUsageFlags::ShaderDeviceAddress |
                     BufferUsageFlags::TransferDst,
                 .memoryUsage = ResourceMemoryUsage::GpuOnly,
                 .mappedAtCreation = false,
@@ -4962,6 +5654,61 @@ namespace ic
         return &uploaded;
     }
 
+    bool VulkanBackend::prepareGiRayQueryResources(const FrameContext& ctx)
+    {
+        if (!m_rayTracingSceneService ||
+            !m_rayTracingSceneService->statistics().valid ||
+            m_gpuScene.frameSlotCount() == 0)
+            return false;
+        const auto geometries = m_rayTracingSceneService->gpuGeometries();
+        const auto instances = m_rayTracingSceneService->gpuInstances();
+        if (geometries.empty() || instances.empty())
+            return false;
+        for (const auto& geometry : geometries)
+            if (geometry.mapping.x >= GiMaxGeometryBufferCount)
+                return false;
+
+        const uint32_t frameSlot = static_cast<uint32_t>(
+            ctx.frameIndex % m_gpuScene.frameSlotCount());
+        VulkanGpuSceneFrameResources& frame =
+            m_gpuScene.frameResources(frameSlot);
+        const auto ensureBuffer = [&](VulkanBuffer& buffer, uint32_t& capacity,
+            uint32_t required, uint32_t stride, const char* name)
+        {
+            if (required <= capacity && buffer)
+                return;
+            m_resourceAllocator.destroyBuffer(buffer);
+            buffer = m_resourceAllocator.createBuffer({
+                .size = static_cast<uint64_t>(required) * stride,
+                .usage = BufferUsageFlags::Storage,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = name });
+            capacity = required;
+            frame.giRayQueryGeneration = UINT64_MAX;
+        };
+        ensureBuffer(frame.giRtGeometries, frame.giGeometryCapacity,
+            static_cast<uint32_t>(geometries.size()),
+            sizeof(GpuRayTracingGeometryRecord), "Vulkan GI RT geometry table");
+        ensureBuffer(frame.giRtInstances, frame.giInstanceCapacity,
+            static_cast<uint32_t>(instances.size()),
+            sizeof(GpuRayTracingInstanceRecord), "Vulkan GI RT instance table");
+        const uint64_t generation =
+            m_rayTracingSceneService->statistics().generation;
+        if (frame.giRayQueryGeneration == generation)
+            return true;
+        std::memcpy(frame.giRtGeometries.mapped, geometries.data(),
+            geometries.size_bytes());
+        std::memcpy(frame.giRtInstances.mapped, instances.data(),
+            instances.size_bytes());
+        m_resourceAllocator.flush(frame.giRtGeometries, 0,
+            geometries.size_bytes());
+        m_resourceAllocator.flush(frame.giRtInstances, 0,
+            instances.size_bytes());
+        frame.giRayQueryGeneration = generation;
+        return true;
+    }
+
     bool VulkanBackend::prepareSceneResources(
         const FrameContext& ctx,
         const SceneRenderView& scene,
@@ -5010,11 +5757,14 @@ namespace ic
 
                 GpuFrameData frameData{};
                 frameData.view = scene.camera.view;
+                // Swap finite near/far inputs to map near->1 and far->0. D32
+                // floating-point precision then follows view-space distance
+                // instead of collapsing at the far end of the scene.
                 frameData.projection = glm::perspectiveRH_ZO(
                     scene.camera.verticalFovRadians,
                     scene.camera.aspectRatio,
-                    scene.camera.nearPlane,
-                    scene.camera.farPlane);
+                    scene.camera.farPlane,
+                    scene.camera.nearPlane);
                 frameData.projection[1][1] *= -1.0f;
                 frameData.viewProjection = frameData.projection * frameData.view;
                 const bool occlusionHistoryReliable =
@@ -5035,7 +5785,11 @@ namespace ic
                 frameData.environmentIntensity =
                     scene.environment.settings.intensity;
                 frameData.environmentExposure =
-                    scene.environment.settings.skyboxExposure;
+                    m_resolvedDiffuseGi != InvalidGraphResourceId
+                        ? scene.environment.settings.pathTraceExposure
+                        : scene.environment.settings.skyboxExposure;
+                frameData.environmentTransportExposure =
+                    scene.environment.settings.pathTraceExposure;
 
                 for (const SceneLightRenderItem& light : scene.lights)
                 {
@@ -5078,7 +5832,7 @@ namespace ic
                     m_clusteredForwardResources.width,
                     m_clusteredForwardResources.height,
                     m_clusteredForwardResources.hiZMipCount,
-                    0u);
+                    1u);
                 frameData.cullingConfig = glm::uvec4(
                     std::min<uint32_t>(
                         instanceBoundsCount, ClusteredForwardMaxGpuCullInstances),
@@ -5092,12 +5846,25 @@ namespace ic
                     m_gpuCullDebugMode != GpuCullDebugMode::Off ? 1u : 0u,
                     m_gpuOcclusionEnabled ? 1u : 0u,
                     0u);
+                frameData.globalIlluminationConfig.x =
+                    m_resolvedDiffuseGi != InvalidGraphResourceId ? 1u : 0u;
+                frameData.globalIlluminationConfig.y = m_giDebugView;
+                frameData.globalIlluminationConfig.z =
+                    m_giDiagnosticIntensityBits;
+                frameData.globalIlluminationConfig.w =
+                    m_giDebugExposureBits;
                 return frameData;
             });
 
         if (!result.hasData)
         {
             return false;
+        }
+        if (m_rayTracingSceneService)
+        {
+            m_rayTracingSceneService->updateGeometry(scene, assets);
+            m_accelerationStructures.prepare(
+                *m_rayTracingSceneService, m_uploadedModels);
         }
 
         VulkanGpuSceneFrameResources& frameResources =
@@ -5114,6 +5881,7 @@ namespace ic
             frameResources.bindlessTextureCount != m_uploadedTextures.size() ||
             frameResources.bindlessSamplerCount != m_uploadedSamplers.size() ||
             frameResources.environmentVersion != scene.environment.version ||
+            frameResources.diffuseGiResource != m_resolvedDiffuseGi ||
             frameResources.iblBaked != m_environmentResources.iblBaked))
         {
             updateFrameDescriptors(frameResources, pipelineHandle);
@@ -5155,7 +5923,7 @@ namespace ic
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         poolSizes[1].descriptorCount = clusteredLayout ? 8u : 3u;
         poolSizes[2].type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
-        poolSizes[2].descriptorCount = MaxBindlessTextures + 3u;
+        poolSizes[2].descriptorCount = MaxBindlessTextures + 4u;
         poolSizes[3].type = VK_DESCRIPTOR_TYPE_SAMPLER;
         poolSizes[3].descriptorCount = MaxBindlessSamplers + 1u;
 
@@ -5217,7 +5985,8 @@ namespace ic
             }
 
             textureInfos[texture.descriptorIndex].imageView = texture.view;
-            textureInfos[texture.descriptorIndex].imageLayout = texture.layout;
+            textureInfos[texture.descriptorIndex].imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
 
         std::vector<VkDescriptorImageInfo> samplerInfos(
@@ -5233,7 +6002,7 @@ namespace ic
         }
 
         std::vector<VkWriteDescriptorSet> writes;
-        writes.reserve(clusteredLayout ? 10u : 5u);
+        writes.reserve(clusteredLayout ? 16u : 5u);
         writes.resize(3);
         writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet = resources.descriptorSet;
@@ -5333,29 +6102,30 @@ namespace ic
             writes.push_back(write);
         }
 
+        // These infos must outlive every VkWriteDescriptorSet that points at
+        // them.  vkUpdateDescriptorSets is intentionally batched below, after
+        // the conditional write construction.
+        VkDescriptorImageInfo irradianceInfo{};
+        VkDescriptorImageInfo prefilteredInfo{};
+        VkDescriptorImageInfo brdfLutInfo{};
+        VkDescriptorImageInfo iblSamplerInfo{};
+
         if (m_environmentResources.iblBaked &&
             m_environmentResources.irradianceView != VK_NULL_HANDLE &&
             m_environmentResources.prefilteredView != VK_NULL_HANDLE &&
-            m_environmentResources.brdfLutView != VK_NULL_HANDLE &&
-            m_environmentResources.sampler != VK_NULL_HANDLE)
+            m_environmentResources.brdfLutView != VK_NULL_HANDLE)
         {
-            VkDescriptorImageInfo irradianceInfo{};
             irradianceInfo.imageView = m_environmentResources.irradianceView;
             irradianceInfo.imageLayout =
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            VkDescriptorImageInfo prefilteredInfo{};
             prefilteredInfo.imageView = m_environmentResources.prefilteredView;
             prefilteredInfo.imageLayout =
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            VkDescriptorImageInfo brdfLutInfo{};
             brdfLutInfo.imageView = m_environmentResources.brdfLutView;
             brdfLutInfo.imageLayout =
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-            VkDescriptorImageInfo iblSamplerInfo{};
-            iblSamplerInfo.sampler = m_environmentResources.sampler;
 
             VkWriteDescriptorSet write{};
             write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -5375,6 +6145,14 @@ namespace ic
             write.pImageInfo = &brdfLutInfo;
             writes.push_back(write);
 
+        }
+
+        // Resolved diffuse GI shares the IBL sampler.  GI can become active
+        // before the asynchronous IBL bake completes, so initialize this
+        // binding as soon as the environment sampler exists.
+        if (m_environmentResources.sampler != VK_NULL_HANDLE)
+        {
+            iblSamplerInfo.sampler = m_environmentResources.sampler;
             VkWriteDescriptorSet samplerWrite{};
             samplerWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             samplerWrite.dstSet = resources.descriptorSet;
@@ -5383,6 +6161,33 @@ namespace ic
             samplerWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
             samplerWrite.pImageInfo = &iblSamplerInfo;
             writes.push_back(samplerWrite);
+        }
+
+        VkDescriptorImageInfo diffuseGiInfo{};
+        VulkanGraphResourceEntry* diffuseGi =
+            m_graphResourceRegistry.entry(m_resolvedDiffuseGi);
+        if (diffuseGi && diffuseGi->view != VK_NULL_HANDLE)
+        {
+            diffuseGiInfo.imageView = diffuseGi->view;
+            diffuseGiInfo.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+        else if (m_environmentResources.brdfLutView != VK_NULL_HANDLE)
+        {
+            diffuseGiInfo.imageView = m_environmentResources.brdfLutView;
+            diffuseGiInfo.imageLayout =
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+        if (clusteredLayout && diffuseGiInfo.imageView != VK_NULL_HANDLE)
+        {
+            VkWriteDescriptorSet giWrite{};
+            giWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            giWrite.dstSet = resources.descriptorSet;
+            giWrite.dstBinding = MaxBindlessTextures + 5u;
+            giWrite.descriptorCount = 1;
+            giWrite.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+            giWrite.pImageInfo = &diffuseGiInfo;
+            writes.push_back(giWrite);
         }
 
         vkUpdateDescriptorSets(
@@ -5397,6 +6202,7 @@ namespace ic
         resources.bindlessSamplerCount =
             static_cast<uint32_t>(m_uploadedSamplers.size());
         resources.environmentVersion = UINT64_MAX;
+        resources.diffuseGiResource = m_resolvedDiffuseGi;
         resources.iblBaked = m_environmentResources.iblBaked;
         resources.descriptorLayout = pipeline->desc.bindingLayout;
     }
@@ -6079,10 +6885,15 @@ namespace ic
         switch (usage)
         {
         case ResourceUsage::ColorAttachment:
-            return VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+            // Attachment passes may LOAD existing contents before writing;
+            // the graph's logical write access still has to cover that native
+            // attachment read at begin-rendering time.
+            return VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
         case ResourceUsage::DepthAttachment:
-            return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            return VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
         case ResourceUsage::StorageBuffer:
         case ResourceUsage::StorageTexture:
@@ -6114,7 +6925,12 @@ namespace ic
                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
 
         case ResourceUsage::SampledTexture:
-            return VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+            // Sampled resources are consumed by both graphics shaders and
+            // compute passes (GI surface/evaluate/temporal, Hi-Z consumers).
+            // Queue type alone cannot distinguish a compute dispatch recorded
+            // on the graphics queue, so cover both legal shader consumers.
+            return VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
 
         case ResourceUsage::StorageTexture:
         case ResourceUsage::StorageBuffer:
@@ -6173,6 +6989,33 @@ namespace ic
         m_frameExecutor.initSwapchainSync();
         m_pipelineManager.init(m_device.device());
         m_gpuScene.init(m_resourceAllocator, m_frameExecutor.framesInFlight());
+    }
+
+    bool VulkanBackend::globalIlluminationDiagnostics(
+        GpuGiDiagnostics& result) const
+    {
+        std::memcpy(&result, m_giDiagnosticWords.data(), sizeof(result));
+        return m_giDiagnosticFrames != 0;
+    }
+
+    void VulkanBackend::setGlobalIlluminationDisplay(
+        uint32_t debugView, float diagnosticIntensity, float debugExposure)
+    {
+        m_giDebugView = debugView;
+        std::memcpy(&m_giDiagnosticIntensityBits, &diagnosticIntensity,
+            sizeof(m_giDiagnosticIntensityBits));
+        std::memcpy(&m_giDebugExposureBits, &debugExposure,
+            sizeof(m_giDebugExposureBits));
+    }
+
+    void VulkanBackend::setGlobalIlluminationRuntimeSettings(
+        uint32_t maxSurfelUpdates, uint32_t maxProbeUpdates,
+        uint32_t rayBudget, uint32_t freezeAfterFrames)
+    {
+        m_giMaxSurfelUpdates = std::max(maxSurfelUpdates, 1u);
+        m_giMaxProbeUpdates = std::max(maxProbeUpdates, 64u);
+        m_giRayBudget = std::max(rayBudget, 1u);
+        m_giFreezeAfterFrames = freezeAfterFrames;
     }
 
     TextureFormat VulkanBackend::swapchainTextureFormat() const

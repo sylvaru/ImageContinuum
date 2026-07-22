@@ -7,6 +7,10 @@ add_executable(ImageContinuumTests
     "include/frame_graph_resource_tests.h"
     "src/pass_dispatch_tests.cpp"
     "include/pass_dispatch_tests.h"
+    "src/global_illumination_tests.cpp"
+    "include/global_illumination_tests.h"
+    "src/ray_tracing_scene_tests.cpp"
+    "include/ray_tracing_scene_tests.h"
 )
 
 # Set C++ standard to C++20 required

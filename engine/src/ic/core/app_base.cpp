@@ -17,351 +17,16 @@
 #include "ic/core/asset_manager.h"
 #include "ic/scene/scene_manager.h"
 #include "ic/core/debug_gui_layer.h"
+#include "ic/util/app_core_util.h"
+#include "ic/util/app_benchmark_utils.h"
 
-#include <algorithm>
-#include <cstdlib>
-#include <filesystem>
-#include <map>
+#include <chrono>
 #include <optional>
-#include <string>
-#include <thread>
-#include <vector>
 
 #include <spdlog/spdlog.h>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#endif
-
 namespace ic
 {
-    namespace
-    {
-        // Blocks the calling thread for `seconds` accurately and without
-        // busy-waiting. On Windows this uses a high-resolution waitable timer
-        // (Win10 1803+) so the wait is precise to well under a millisecond
-        // WITHOUT globally raising the system timer resolution (which would hurt
-        // power use); it falls back to std::this_thread::sleep_for otherwise.
-        void preciseSleepSeconds(double seconds)
-        {
-            if (seconds <= 0.0)
-            {
-                return;
-            }
-#ifdef _WIN32
-#ifdef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-            static HANDLE timer = CreateWaitableTimerExW(
-                nullptr, nullptr,
-                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                TIMER_ALL_ACCESS);
-            if (timer)
-            {
-                LARGE_INTEGER due{};
-                // Negative == relative, in 100 ns units.
-                due.QuadPart = -static_cast<LONGLONG>(seconds * 1.0e7);
-                if (SetWaitableTimerEx(
-                        timer, &due, 0, nullptr, nullptr, nullptr, 0))
-                {
-                    WaitForSingleObject(timer, INFINITE);
-                    return;
-                }
-            }
-#endif
-#endif
-            std::this_thread::sleep_for(
-                std::chrono::duration<double>(seconds));
-        }
-
-        std::optional<std::string> environmentValue(const char* name)
-        {
-#ifdef _WIN32
-            char* value = nullptr;
-            size_t size = 0;
-            if (_dupenv_s(&value, &size, name) != 0 || !value)
-            {
-                return std::nullopt;
-            }
-            std::string result(value);
-            free(value);
-            return result;
-#else
-            const char* value = std::getenv(name);
-            return value ? std::optional<std::string>(value) : std::nullopt;
-#endif
-        }
-
-        std::optional<long> environmentInteger(const char* name)
-        {
-            const std::optional<std::string> value = environmentValue(name);
-            if (!value || value->empty())
-            {
-                return std::nullopt;
-            }
-            try
-            {
-                return std::stol(*value);
-            }
-            catch (const std::exception&)
-            {
-                spdlog::warn(
-                    "[AppBase] Ignoring non-numeric {}='{}'.",
-                    name, *value);
-                return std::nullopt;
-            }
-        }
-
-        // Headless-ish measurement harness. The app still opens a window (the backends
-        // render through a swapchain), but it runs a fixed number of frames
-        // with no user input and prints one machine-readable summary line, so
-        // async-compute on/off can be compared without a human at the keyboard.
-        //
-        //   IC_BENCH_FRAMES   measured frames; 0/unset disables the harness
-        //   IC_BENCH_WARMUP   frames discarded first (PSO warm-up, swapchain
-        //                     settling); default 200
-        //   IC_BENCH_WARMUP_S seconds discarded first; default 6. This one is
-        //                     load-bearing: models stream in asynchronously, so
-        //                     an empty scene renders thousands of trivial frames
-        //                     per second and a frame-only warmup is consumed
-        //                     long before there is anything to draw. Both the
-        //                     frame and the time threshold must pass.
-        //   IC_BENCH_ASYNC    1/0 forces the async-compute toggle, unset leaves
-        //                     whatever the renderer defaults to
-        //   IC_BENCH_PROFILER 1/0 enables/disables GPU timestamp collection
-        //   IC_BENCH_DIAGNOSTICS bit mask for open diagnostics sections;
-        //                     0 closes the window, 255 opens all sections
-        //   IC_BENCH_GUI      1/0 creates or completely disables ImGui
-        //   IC_BENCH_TARGET_FPS CPU limiter target; 0 disables it
-        //   IC_BENCH_TAG      free-form label echoed into the summary line
-        struct BenchmarkConfig
-        {
-            uint32_t frames = 0;
-            uint32_t warmup = 200;
-            double warmupSeconds = 6.0;
-            int asyncOverride = -1;
-            int profilerOverride = -1;
-            int diagnosticsMask = -1;
-            float targetFps = 0.0f;
-            std::string tag;
-
-            [[nodiscard]] bool active() const { return frames > 0; }
-        };
-
-        BenchmarkConfig benchmarkConfigFromEnvironment()
-        {
-            BenchmarkConfig config{};
-            if (const std::optional<long> frames =
-                    environmentInteger("IC_BENCH_FRAMES");
-                frames && *frames > 0)
-            {
-                config.frames = static_cast<uint32_t>(*frames);
-            }
-            if (const std::optional<long> warmup =
-                    environmentInteger("IC_BENCH_WARMUP");
-                warmup && *warmup >= 0)
-            {
-                config.warmup = static_cast<uint32_t>(*warmup);
-            }
-            if (const std::optional<long> warmupSeconds =
-                    environmentInteger("IC_BENCH_WARMUP_S");
-                warmupSeconds && *warmupSeconds >= 0)
-            {
-                config.warmupSeconds = static_cast<double>(*warmupSeconds);
-            }
-            if (const std::optional<long> async =
-                    environmentInteger("IC_BENCH_ASYNC"))
-            {
-                config.asyncOverride = *async != 0 ? 1 : 0;
-            }
-            if (const std::optional<long> profiler =
-                    environmentInteger("IC_BENCH_PROFILER"))
-            {
-                config.profilerOverride = *profiler != 0 ? 1 : 0;
-            }
-            if (const std::optional<long> diagnostics =
-                    environmentInteger("IC_BENCH_DIAGNOSTICS"))
-            {
-                config.diagnosticsMask = static_cast<int>(
-                    std::clamp(*diagnostics, 0l, 255l));
-            }
-            if (const std::optional<long> targetFps =
-                    environmentInteger("IC_BENCH_TARGET_FPS");
-                targetFps && *targetFps >= 0)
-            {
-                config.targetFps = static_cast<float>(*targetFps);
-            }
-            if (const std::optional<std::string> tag =
-                    environmentValue("IC_BENCH_TAG"))
-            {
-                config.tag = *tag;
-            }
-            return config;
-        }
-
-        struct PassAccumulator
-        {
-            double totalMilliseconds = 0.0;
-            uint64_t frames = 0;
-            QueueType queue = QueueType::Graphics;
-        };
-
-        struct BenchmarkAccumulator
-        {
-            std::vector<double> frameMilliseconds;
-            double graphicsBusyMs = 0.0;
-            double computeBusyMs = 0.0;
-            double overlapMs = 0.0;
-            uint64_t timelineSamples = 0;
-            double uiBuildMs = 0.0;
-            double fullFramePeriodMs = 0.0;
-            RendererPerformanceCounters performance{};
-            std::map<GraphNodeId, PassAccumulator> passes;
-
-            void add(
-                double frameMs,
-                double framePeriodMs,
-                const GpuQueueTimelineStats& timeline,
-                std::span<const GpuPassSample> samples,
-                double frameUiBuildMs,
-                const RendererPerformanceCounters& counters)
-            {
-                frameMilliseconds.push_back(frameMs);
-                fullFramePeriodMs += framePeriodMs;
-                uiBuildMs += frameUiBuildMs;
-                performance.backendCpuMs += counters.backendCpuMs;
-                performance.frameSlotWaitMs += counters.frameSlotWaitMs;
-                performance.profilerReadbackMs += counters.profilerReadbackMs;
-                performance.graphRecordMs += counters.graphRecordMs;
-                performance.uiRecordMs += counters.uiRecordMs;
-                performance.validationMs += counters.validationMs;
-                performance.submitPresentMs += counters.submitPresentMs;
-                if (timeline.valid)
-                {
-                    graphicsBusyMs += timeline.graphicsBusyMs;
-                    computeBusyMs += timeline.computeBusyMs;
-                    overlapMs += timeline.overlapMs;
-                    ++timelineSamples;
-                }
-
-                for (const GpuPassSample& sample : samples)
-                {
-                    PassAccumulator& pass = passes[sample.node];
-                    pass.totalMilliseconds += sample.endMs - sample.beginMs;
-                    pass.queue = sample.queue;
-                    ++pass.frames;
-                }
-            }
-        };
-
-        double percentile(std::vector<double>& values, double fraction)
-        {
-            if (values.empty())
-            {
-                return 0.0;
-            }
-            const size_t index = std::min(
-                values.size() - 1,
-                static_cast<size_t>(fraction * (values.size() - 1)));
-            std::nth_element(
-                values.begin(), values.begin() + index, values.end());
-            return values[index];
-        }
-
-        void reportBenchmark(
-            const BenchmarkConfig& config,
-            BenchmarkAccumulator& stats,
-            const Renderer& renderer)
-        {
-            if (stats.frameMilliseconds.empty())
-            {
-                spdlog::warn("[Benchmark] No frames measured.");
-                return;
-            }
-
-            const size_t count = stats.frameMilliseconds.size();
-            double total = 0.0;
-            for (const double value : stats.frameMilliseconds)
-            {
-                total += value;
-            }
-            const double meanMs = total / static_cast<double>(count);
-            const double meanPeriodMs =
-                stats.fullFramePeriodMs / static_cast<double>(count);
-            const double medianMs = percentile(stats.frameMilliseconds, 0.50);
-            const double p95Ms = percentile(stats.frameMilliseconds, 0.95);
-
-            const double timelineCount =
-                stats.timelineSamples > 0
-                    ? static_cast<double>(stats.timelineSamples)
-                    : 1.0;
-            const double graphicsMs = stats.graphicsBusyMs / timelineCount;
-            const double computeMs = stats.computeBusyMs / timelineCount;
-            const double overlapMs = stats.overlapMs / timelineCount;
-
-            const FrameGraphTopology topology = renderer.frameGraphTopology();
-            spdlog::info(
-                "[Benchmark] RESULT tag='{}' async={} frames={} "
-                "workMean={:.3f}ms fullPeriod={:.3f}ms fullFps={:.1f} "
-                "median={:.3f}ms p95={:.3f}ms workFps={:.1f} "
-                "gpuGraphics={:.3f}ms gpuCompute={:.3f}ms overlap={:.3f}ms "
-                "overlapPctOfCompute={:.1f} timelineFrames={} "
-                "cpuBackend={:.3f}ms frameWait={:.3f}ms "
-                "profilerReadback={:.4f}ms graphRecord={:.3f}ms "
-                "uiBuild={:.3f}ms uiRecord={:.4f}ms validation={:.4f}ms "
-                "submitPresent={:.3f}ms levels={} batches={} "
-                "computeBatches={} crossQueueWaits={}",
-                config.tag,
-                renderer.asyncComputeEnabled() ? "on" : "off",
-                count,
-                meanMs,
-                meanPeriodMs,
-                meanPeriodMs > 0.0 ? 1000.0 / meanPeriodMs : 0.0,
-                medianMs,
-                p95Ms,
-                meanMs > 0.0 ? 1000.0 / meanMs : 0.0,
-                graphicsMs,
-                computeMs,
-                overlapMs,
-                computeMs > 0.0 ? 100.0 * overlapMs / computeMs : 0.0,
-                stats.timelineSamples,
-                stats.performance.backendCpuMs / static_cast<double>(count),
-                stats.performance.frameSlotWaitMs / static_cast<double>(count),
-                stats.performance.profilerReadbackMs / static_cast<double>(count),
-                stats.performance.graphRecordMs / static_cast<double>(count),
-                stats.uiBuildMs / static_cast<double>(count),
-                stats.performance.uiRecordMs / static_cast<double>(count),
-                stats.performance.validationMs / static_cast<double>(count),
-                stats.performance.submitPresentMs / static_cast<double>(count),
-                topology.levels,
-                topology.batches,
-                topology.computeBatches,
-                topology.crossQueueWaits);
-
-            for (const auto& [node, pass] : stats.passes)
-            {
-                if (pass.frames == 0)
-                {
-                    continue;
-                }
-                // Averaged over measured frames, not over frames the pass ran:
-                // a cadence-gated pass that executes rarely should show a small
-                // per-frame cost, because that is what it actually costs.
-                spdlog::info(
-                    "[Benchmark] PASS tag='{}' name='{}' queue={} "
-                    "meanMs={:.4f} executedFrames={}",
-                    config.tag,
-                    renderer.passName(node),
-                    pass.queue == QueueType::Compute ? "compute" : "graphics",
-                    pass.totalMilliseconds / static_cast<double>(count),
-                    pass.frames);
-            }
-        }
-    }
 
     struct AppBase::PlatformState
     {
@@ -375,26 +40,28 @@ namespace ic
         Scope<Input>                input;
         Scope<JobSystem>            jobs;
         Scope<EventQueue>           eventQueue;
-        Scope<FrameArenaManager<AppSpecification::kMaxFramesInFlight>> 
-                                    frameArenas;
+        Scope<FrameArenaManager<AppSpecification::kMaxFramesInFlight>>
+            frameArenas;
         Scope<AssetManager>         assetManager;
         Scope<SceneManager>         sceneManager;
         Scope<Renderer>             renderer;
-        
-        EventFrameBuffer<AppSpecification::kMaxFramesInFlight> 
-                                    eventBuffer;
+
+        EventFrameBuffer<AppSpecification::kMaxFramesInFlight>
+            eventBuffer;
         FramePipeline               framePipeline;
 
         AppRuntime(AppBase& app)
             : framePipeline(app)
             , eventQueue(std::make_unique<EventQueue>())
-        {}
+        {
+        }
     };
 
     AppBase::AppBase(AppSpecification spec)
         : m_spec(std::move(spec))
         , m_runtime(std::make_unique<AppRuntime>(*this))
-    {}
+    {
+    }
 
     AppBase::~AppBase() = default;
 
@@ -404,13 +71,13 @@ namespace ic
     {
 
         if (const std::optional<long> benchmarkGui =
-                environmentInteger("IC_BENCH_GUI");
+            benchmark::environmentInteger("IC_BENCH_GUI");
             benchmarkGui && *benchmarkGui == 0)
         {
             m_spec.rendererSpec.useDebugGui = false;
         }
         if (const std::optional<long> benchmarkValidation =
-                environmentInteger("IC_BENCH_VALIDATION"))
+            benchmark::environmentInteger("IC_BENCH_VALIDATION"))
         {
             m_spec.rendererSpec.enableValidation = *benchmarkValidation != 0;
         }
@@ -443,57 +110,23 @@ namespace ic
         [[maybe_unused]] int argc,
         [[maybe_unused]] char** argv)
     {
-        
         initAppBase(argc, argv);
-        onInit(); // Client app configuration happens here
-
+        onInit();
 
         m_clock.reset();
         m_frame.services = &m_services;
 
         auto& runtime = *m_runtime;
+        benchmark::BenchmarkManager benchmarkMgr;
 
-        const BenchmarkConfig benchmark = benchmarkConfigFromEnvironment();
-        BenchmarkAccumulator benchmarkStats{};
-        const auto benchmarkStart = std::chrono::steady_clock::now();
-        if (benchmark.active())
+        if (benchmarkMgr.isActive())
         {
-            // Throughput has to be measured against the GPU, not against a
-            // limiter: both the frame cap and vsync would clamp every variant
-            // to the same number and hide the effect under test.
-            m_spec.rendererSpec.settings.targetFps = benchmark.targetFps;
-            runtime.renderer->setVsyncEnabled(false);
-            if (benchmark.asyncOverride >= 0)
-            {
-                runtime.renderer->setAsyncComputeEnabled(
-                    benchmark.asyncOverride != 0);
-            }
-            if (benchmark.profilerOverride >= 0)
-            {
-                runtime.renderer->setGpuProfilingEnabled(
-                    benchmark.profilerOverride != 0);
-            }
-            if (benchmark.diagnosticsMask >= 0)
-            {
-                runtime.renderer->setDiagnosticsSectionMask(
-                    static_cast<uint32_t>(benchmark.diagnosticsMask));
-            }
-            spdlog::info(
-                "[Benchmark] tag='{}' frames={} warmup={}f/{}s async={} "
-                "profiler={} diagnosticsMask={} gui={} "
-                "(vsync off, targetFps={})",
-                benchmark.tag, benchmark.frames, benchmark.warmup,
-                benchmark.warmupSeconds,
-                runtime.renderer->asyncComputeEnabled() ? "on" : "off",
-                runtime.renderer->gpuProfilingEnabled() ? "on" : "off",
-                benchmark.diagnosticsMask,
-                m_spec.rendererSpec.useDebugGui ? "on" : "off",
-                benchmark.targetFps);
+            m_spec.rendererSpec.settings.targetFps = benchmarkMgr.getTargetFps();
+            benchmarkMgr.configureRenderer(*runtime.renderer);
         }
 
         spdlog::info("[AppBase] run... Entering main loop");
 
-        // Main Loop
         while (!m_runtime->window->shouldClose())
         {
             ZoneScopedN("Frame");
@@ -505,7 +138,7 @@ namespace ic
             m_frame.timeSinceStart = m_clock.getTimeSinceStart();
             m_frame.windowWidth = runtime.window->getWidth();
             m_frame.windowHeight = runtime.window->getHeight();
-            
+
             auto& arena = m_runtime->frameArenas->beginFrame(m_frame.frameIndex);
             arena.reset();
             m_frame.arena = &arena;
@@ -534,38 +167,29 @@ namespace ic
                 m_frame,
                 runtime.sceneManager->renderView());
 
-            if (benchmark.active())
+            if (benchmarkMgr.isActive())
             {
-                // Sampled before the pacing sleep so this is the real cost of
-                // producing a frame, not the limiter's period.
                 const auto now = std::chrono::steady_clock::now();
                 const double frameMs =
                     std::chrono::duration<double, std::milli>(
                         now - frameStart).count();
-                const double elapsedSeconds =
-                    std::chrono::duration<double>(now - benchmarkStart).count();
-                if (m_frame.frameIndex > benchmark.warmup &&
-                    elapsedSeconds >= benchmark.warmupSeconds)
+                benchmarkMgr.processFrame(
+                    *runtime.renderer,
+                    static_cast<uint32_t>(m_frame.frameIndex),
+                    m_frame.deltaTime * 1000.0,
+                    frameMs,
+                    runtime.renderer->gpuQueueTimeline(),
+                    runtime.renderer->gpuPassSamples(),
+                    uiBuildMs,
+                    runtime.renderer->performanceCounters());
+                if (benchmarkMgr.shouldExit())
                 {
-                    benchmarkStats.add(
-                        frameMs,
-                        m_frame.deltaTime * 1000.0,
-                        runtime.renderer->gpuQueueTimeline(),
-                        runtime.renderer->gpuPassSamples(),
-                        uiBuildMs,
-                        runtime.renderer->performanceCounters());
-                }
-                if (benchmarkStats.frameMilliseconds.size() >= benchmark.frames)
-                {
-                    reportBenchmark(
-                        benchmark, benchmarkStats, *runtime.renderer);
+                    benchmarkMgr.finish(*runtime.renderer);
                     break;
                 }
             }
 
-            // Frame pacing
             sleep(frameStart);
-
             FrameMark;
         }
 
@@ -772,4 +396,5 @@ namespace ic
 
         onShutdown(); // client (DemoApp)
     }
+
 }

@@ -136,8 +136,12 @@ float4 PSMain(VertexOutput input) : SV_Target0
             float4(1.0f, 1.0f, 0.0f, 1.0f));
     const float metallic =
         saturate(material.metallicFactor * metallicRoughnessSample.b);
-    const float roughness =
+    const float materialRoughness =
         clamp(material.roughnessFactor * metallicRoughnessSample.g, 0.04f, 1.0f);
+    const float roughness = specularAntiAliasedRoughness(
+        materialRoughness,
+        normal,
+        saturate(length(normalMap)));
 
     const float ao =
         lerp(

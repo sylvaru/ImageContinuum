@@ -15,6 +15,8 @@
 #include "ic/renderer/renderer_specification.h"
 #include "ic/renderer/path_tracing/path_trace_scene_builder.h"
 #include "ic/renderer/renderer_common/renderer_util.h"
+#include "ic/renderer/global_illumination/global_illumination_bindings.h"
+#include "ic/renderer/global_illumination/global_illumination.h"
 
 #include <glm/ext/matrix_clip_space.hpp>
 #include <glm/gtc/matrix_inverse.hpp>
@@ -65,6 +67,21 @@ namespace ic
 		uint32_t workerCount)
     {
         spdlog::info("[DX12Backend] Initializing...");
+        m_giDebugView = static_cast<uint32_t>(
+            spec.settings.globalIllumination.debugView);
+        std::memcpy(&m_giDiagnosticIntensityBits,
+            &spec.settings.globalIllumination.diagnosticIntensity,
+            sizeof(m_giDiagnosticIntensityBits));
+        std::memcpy(&m_giDebugExposureBits,
+            &spec.settings.globalIllumination.debugExposure,
+            sizeof(m_giDebugExposureBits));
+        m_giFreezeAfterFrames =
+            spec.settings.globalIllumination.freezeAfterFrames;
+        m_giMaxSurfelUpdates =
+            spec.settings.globalIllumination.limits.maxSurfelUpdates;
+        m_giMaxProbeUpdates =
+            spec.settings.globalIllumination.limits.maxProbeUpdates;
+        m_giRayBudget = spec.settings.globalIllumination.limits.rayBudget;
 
 #ifdef IC_DEBUG
         constexpr bool validationAvailable = true;
@@ -150,10 +167,24 @@ namespace ic
             m_resourceAllocator,
             m_descriptorSystem,
             framesInFlight);
+        D3D12_INDIRECT_ARGUMENT_DESC dispatchArgument{};
+        dispatchArgument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH;
+        D3D12_COMMAND_SIGNATURE_DESC dispatchSignature{};
+        dispatchSignature.ByteStride = sizeof(D3D12_DISPATCH_ARGUMENTS);
+        dispatchSignature.NumArgumentDescs = 1;
+        dispatchSignature.pArgumentDescs = &dispatchArgument;
+        throwIfFailed(
+            m_device.device()->CreateCommandSignature(
+                &dispatchSignature,
+                nullptr,
+                IID_PPV_ARGS(&m_dispatchIndirectSignature)),
+            "Failed to create DX12 dispatch-indirect command signature.");
         m_uploadScheduler.init(
             m_device, m_resourceAllocator, framesInFlight);
         m_retirementQueue.init(
             m_resourceAllocator, m_descriptorSystem, framesInFlight);
+        m_accelerationStructures.init(
+            m_device, m_resourceAllocator, m_retirementQueue, framesInFlight);
         m_pipelineManager.init(m_device);
         m_pipelineLibrary = &pipelineLibrary;
 
@@ -169,6 +200,7 @@ namespace ic
     {
         m_frameExecutor.waitForGpu();
         m_uploadScheduler.shutdown();
+        m_accelerationStructures.shutdown();
         m_retirementQueue.drain();
 
         shutdownImGui();
@@ -177,6 +209,7 @@ namespace ic
         destroyClusteredForwardResources();
         destroyPathTraceResources();
         m_gpuProfiler.shutdown();
+        m_dispatchIndirectSignature.Reset();
         m_gpuCullTimestampHeap.Reset();
         m_resourceAllocator.destroyBuffer(m_gpuCullTimestampReadback);
         m_graphResourceRegistry.shutdown();
@@ -314,6 +347,94 @@ namespace ic
             m_swapchain.width(),
             m_swapchain.height(),
             graphImports);
+        const GraphResourceId giReadbackId = findResourceBySemantic(
+            plan, GraphResourceSemantic::GiDiagnosticsReadback);
+        m_giDiagnosticsReadbackActive =
+            giReadbackId != InvalidGraphResourceId;
+        if (giReadbackId != InvalidGraphResourceId)
+        {
+            // Delay the one-shot report until the persistent cache has had a
+            // representative warm-up window instead of logging its first,
+            // deliberately sparse population frame.
+            const bool freezeReportReady = m_giFreezeAfterFrames == 0u ||
+                ctx.frameIndex >= m_giCacheInitializationFrame +
+                    m_giFreezeAfterFrames + 10u;
+            if (freezeReportReady && m_giDiagnosticFrames >=
+                m_frameExecutor.framesInFlight() + 120u)
+            {
+                DX12GraphResourceEntry* readback =
+                    m_graphResourceRegistry.entry(giReadbackId);
+                if (readback && readback->buffer.mapped)
+                {
+                    std::memcpy(m_giDiagnosticWords.data(),
+                        readback->buffer.mapped, sizeof(GpuGiDiagnostics));
+                    GpuGiDiagnostics diagnostics{};
+                    std::memcpy(&diagnostics, m_giDiagnosticWords.data(),
+                        sizeof(diagnostics));
+                    if (!m_loggedGiDiagnostics &&
+                        (diagnostics.tracedRays != 0u ||
+                         diagnostics.validPixelCount != 0u ||
+                         diagnostics.surfelOccupancy != 0u ||
+                         diagnostics.allocationFailures != 0u ||
+                         diagnostics.rejectedGathers != 0u))
+                    {
+                        float maxIrradiance = 0.0f;
+                        std::memcpy(&maxIrradiance,
+                            &diagnostics.maxIrradianceBits, sizeof(float));
+                        const float averageIrradiance = diagnostics.validPixelCount
+                            ? static_cast<float>(diagnostics.irradianceLuminanceFixed) /
+                                (256.0f * diagnostics.validPixelCount) : 0.0f;
+                        const uint32_t evaluatedPixels =
+                            diagnostics.validPixelCount + diagnostics.rejectedGathers;
+                        const float validCoverage = evaluatedPixels
+                            ? 100.0f * diagnostics.validPixelCount / evaluatedPixels : 0.0f;
+                        const float averageConfidence = diagnostics.validPixelCount
+                            ? static_cast<float>(diagnostics.coverageFixed) /
+                                (4096.0f * diagnostics.validPixelCount) : 0.0f;
+                        const float averageReferenceError = diagnostics.referenceCount
+                            ? static_cast<float>(diagnostics.referenceErrorFixed) /
+                                (4096.0f * diagnostics.referenceCount) : 0.0f;
+                        const float channelDenominator = diagnostics.validPixelCount
+                            ? 256.0f * diagnostics.validPixelCount : 1.0f;
+                        const glm::vec3 averageIrradianceRgb{
+                            diagnostics.irradianceRedFixed / channelDenominator,
+                            diagnostics.irradianceGreenFixed / channelDenominator,
+                            diagnostics.irradianceBlueFixed / channelDenominator };
+                        spdlog::info(
+                            "[DX12 GI] surfels={} probes={} probeUpdates={} feedbackSamples={} probeFallbackPixels={} allocationFailures={} rejectedGathers={} rays={} hits={} misses={} alphaRejects={} stale={} invalid={} selfRejects={} updates={} avgIrradiance={} avgIrradianceRgb=({},{},{}) maxIrradiance={} validCoveragePct={} avgConfidence={} unitDiffuseInjectedLuma={} temporalRejected={} referenceSamples={} avgShReferenceError={}",
+                            diagnostics.surfelOccupancy,
+                            diagnostics.probeOccupancy,
+                            diagnostics.probeUpdateCount,
+                            diagnostics.feedbackSamples,
+                            diagnostics.probeFallbackPixels,
+                            diagnostics.allocationFailures,
+                            diagnostics.rejectedGathers,
+                            diagnostics.tracedRays,
+                            diagnostics.hits,
+                            diagnostics.misses,
+                            diagnostics.alphaRejections,
+                            diagnostics.staleSurfels,
+                            diagnostics.invalidMappings,
+                            diagnostics.selfHitRejections,
+                            diagnostics.surfelUpdateCount,
+                            averageIrradiance, averageIrradianceRgb.r,
+                            averageIrradianceRgb.g, averageIrradianceRgb.b,
+                            maxIrradiance, validCoverage,
+                            averageConfidence, averageIrradiance / 3.14159265359f,
+                            diagnostics.temporalRejectedPixels,
+                            diagnostics.referenceCount, averageReferenceError);
+                        m_loggedGiDiagnostics = true;
+                    }
+                }
+            }
+            ++m_giDiagnosticFrames;
+        }
+        else
+        {
+            m_giDiagnosticFrames = 0;
+            m_loggedGiDiagnostics = false;
+            m_giDiagnosticWords.fill(0u);
+        }
         const GraphResourceId statsReadbackId = findResourceBySemantic(
             plan, GraphResourceSemantic::GpuDrivenCullStatsReadback);
         if (statsReadbackId != InvalidGraphResourceId &&
@@ -407,6 +528,8 @@ namespace ic
     {
         // Resolve lazy pipeline/resource state before worker threads begin.
         // Recording jobs may only read this shared renderer state.
+        m_resolvedDiffuseGi = findResourceBySemantic(
+            plan, GraphResourceSemantic::GiResolvedIrradiance);
         ensureDepthTarget();
         ensureClusteredForwardResources();
         for (const ExecutionNode& node : plan.nodes)
@@ -426,7 +549,13 @@ namespace ic
             }
             else if (node.type == GraphNodeType::Compute)
             {
-                (void)computePipelineForNode(plan, node);
+                const bool nativeAsPass = node.payloadIndex < plan.payloads.size() &&
+                    std::holds_alternative<AccelerationStructureBuildPassData>(
+                        plan.payloads[node.payloadIndex]);
+                if (nativeAsPass)
+                    (void)prepareSceneResources(ctx, scene);
+                else
+                    (void)computePipelineForNode(plan, node);
             }
         }
 
@@ -434,6 +563,8 @@ namespace ic
         // buffers before any worker records the cull dispatch. Serial, after
         // prepareSceneResources has populated the prepared scene above.
         uploadGpuDrivenInputs(plan, ctx);
+        if (m_resolvedDiffuseGi != InvalidGraphResourceId)
+            (void)prepareGiRayQueryResources(ctx);
 
         auto recordNode =
             [&](GraphNodeId nodeId, uint32_t workerIndex)
@@ -823,6 +954,19 @@ namespace ic
         executeTransferNode(plan, node, ctx, cmd, swapchainImage);
     }
 
+    void DX12Backend::recordPassPayload(
+        const AccelerationStructureBuildPassData&,
+        const CompiledGraphPlan&, const ExecutionNode&,
+        const FrameContext& ctx, const SceneRenderView&,
+        ID3D12GraphicsCommandList4* cmd, ID3D12Resource*)
+    {
+        if (!m_rayTracingSceneService) return;
+        m_accelerationStructures.recordBuild(
+            cmd, *m_rayTracingSceneService, m_uploadedModels,
+            static_cast<uint32_t>(ctx.frameIndex %
+                m_frameExecutor.framesInFlight()));
+    }
+
     void DX12Backend::executeGraphicsNode(
         const CompiledGraphPlan& plan,
         const ExecutionNode& node,
@@ -933,7 +1077,7 @@ namespace ic
             cmd->ClearDepthStencilView(
                 dsv,
                 D3D12_CLEAR_FLAG_DEPTH,
-                1.0f,
+                0.0f,
                 0,
                 0,
                 nullptr);
@@ -1007,6 +1151,19 @@ namespace ic
         sceneInputs.prefilteredSrv =
             m_environmentResources.prefilteredSrv.gpuStart;
         sceneInputs.brdfLutSrv = m_environmentResources.brdfLutSrv.gpuStart;
+        sceneInputs.diffuseGiSrv = sceneInputs.brdfLutSrv;
+        if (DX12GraphResourceEntry* gi =
+                m_graphResourceRegistry.entry(m_resolvedDiffuseGi))
+        {
+            if (gi->fullSrv.valid())
+            {
+                sceneInputs.diffuseGiSrv = gi->fullSrv.gpuStart;
+            }
+            else if (!gi->mipSrvs.empty())
+            {
+                sceneInputs.diffuseGiSrv = gi->mipSrvs[0].gpuStart;
+            }
+        }
         sceneInputs.environmentSampler =
             m_environmentResources.sampler.gpuStart;
         sceneInputs.useGpuDriven = useGpuDriven;
@@ -1090,6 +1247,274 @@ namespace ic
             test.groupCountY = pass->groupCountY;
             test.groupCountZ = pass->groupCountZ;
             recordComputeStorageBufferTest(passCtx, test);
+            return;
+        }
+        else if (pipeline->desc.bindingLayout ==
+            PipelineBindingLayoutKind::GlobalIllumination)
+        {
+            // Cache initialization must execute exactly once as soon as graph
+            // resources exist, even if streamed RT scene descriptors are not
+            // ready yet. The shader only references the two root UAVs below.
+            if (pass->name == "GI.CacheInitialization")
+            {
+                m_giCacheInitializationFrame = ctx.frameIndex;
+                m_giDiagnosticFrames = 0;
+                m_loggedGiDiagnostics = false;
+                DX12GraphResourceEntry* hash = m_graphResourceRegistry.entry(
+                    findResourceBySemantic(
+                        plan, GraphResourceSemantic::GiHashBuckets));
+                DX12GraphResourceEntry* residual =
+                    m_graphResourceRegistry.entry(findResourceBySemantic(
+                        plan, GraphResourceSemantic::GiResidualInterface));
+                DX12GraphResourceEntry* probes =
+                    m_graphResourceRegistry.entry(findResourceBySemantic(
+                        plan, GraphResourceSemantic::GiProbes));
+                DX12GraphResourceEntry* probeStaging =
+                    m_graphResourceRegistry.entry(findResourceBySemantic(
+                        plan, GraphResourceSemantic::GiProbeStaging));
+                if (!hash || !hash->buffer || !residual || !residual->buffer ||
+                    !probes || !probes->buffer || !probeStaging ||
+                    !probeStaging->buffer)
+                    return;
+                cmd->SetComputeRootUnorderedAccessView(
+                    3u, hash->buffer.gpuAddress);
+                cmd->SetComputeRootUnorderedAccessView(
+                    10u, residual->buffer.gpuAddress);
+                cmd->SetComputeRootUnorderedAccessView(
+                    4u, probes->buffer.gpuAddress);
+                cmd->SetComputeRootUnorderedAccessView(
+                    12u, probeStaging->buffer.gpuAddress);
+                cmd->Dispatch(pass->groupCountX,
+                    pass->groupCountY, pass->groupCountZ);
+                return;
+            }
+            if (m_gpuScene.frameSlotCount() == 0 ||
+                !m_rayTracingSceneService)
+                return;
+            const uint32_t frameSlot = static_cast<uint32_t>(
+                ctx.frameIndex % m_gpuScene.frameSlotCount());
+            DX12GpuSceneFrameResources& frameResources =
+                m_gpuScene.frameResources(frameSlot);
+            if (!frameResources.giRtGeometries ||
+                !frameResources.giRtInstances ||
+                !frameResources.materials ||
+                !frameResources.giTraceConstants ||
+                !frameResources.frameConstants ||
+                !frameResources.giModelBufferSrvs.valid())
+                return;
+            ID3D12DescriptorHeap* heaps[] = {
+                m_descriptorSystem.shaderResourceHeap(),
+                m_descriptorSystem.samplerHeap() };
+            cmd->SetDescriptorHeaps(2, heaps);
+            for (uint32_t i = 0; i < GiBufferBindingCount; ++i)
+            {
+                const GraphResourceId id =
+                    findResourceBySemantic(plan, GiBufferSemantics[i]);
+                DX12GraphResourceEntry* entry =
+                    m_graphResourceRegistry.entry(id);
+                if (!entry || !entry->buffer)
+                    return;
+                cmd->SetComputeRootUnorderedAccessView(
+                    i, entry->buffer.gpuAddress);
+            }
+
+            const auto srvHandle = [](DX12GraphResourceEntry* entry)
+            {
+                if (!entry)
+                    return D3D12_GPU_DESCRIPTOR_HANDLE{};
+                if (entry->fullSrv.valid())
+                    return entry->fullSrv.gpuStart;
+                return !entry->mipSrvs.empty()
+                    ? entry->mipSrvs[0].gpuStart
+                    : D3D12_GPU_DESCRIPTOR_HANDLE{};
+            };
+            const GraphResourceId primaryId =
+                findNodeResource(plan, node, ResourceUsage::SampledTexture);
+            const D3D12_GPU_DESCRIPTOR_HANDLE primary =
+                srvHandle(m_graphResourceRegistry.entry(primaryId));
+            if (primary.ptr != 0)
+                cmd->SetComputeRootDescriptorTable(
+                    GiBufferBindingCount, primary);
+
+            const GraphResourceId historyId = findPreviousNodeResource(
+                plan, node, ResourceUsage::SampledTexture);
+            const D3D12_GPU_DESCRIPTOR_HANDLE history = srvHandle(
+                m_graphResourceRegistry.previousEntry(historyId));
+            if (history.ptr != 0)
+                cmd->SetComputeRootDescriptorTable(
+                    GiBufferBindingCount + 1u, history);
+
+            const GraphResourceId sceneDepthId = findResourceBySemantic(
+                plan, GraphResourceSemantic::GiSceneDepth);
+            const GraphResourceId surfaceAttributesId = findResourceBySemantic(
+                plan, GraphResourceSemantic::GiSurfaceAttributes);
+            const D3D12_GPU_DESCRIPTOR_HANDLE sceneDepth = srvHandle(
+                m_graphResourceRegistry.entry(sceneDepthId));
+            const D3D12_GPU_DESCRIPTOR_HANDLE surfaceAttributes = srvHandle(
+                m_graphResourceRegistry.entry(surfaceAttributesId));
+            const D3D12_GPU_DESCRIPTOR_HANDLE previousSceneDepth = srvHandle(
+                m_graphResourceRegistry.previousEntry(sceneDepthId));
+            const D3D12_GPU_DESCRIPTOR_HANDLE previousSurfaceAttributes = srvHandle(
+                m_graphResourceRegistry.previousEntry(surfaceAttributesId));
+            if (sceneDepth.ptr != 0)
+                cmd->SetComputeRootDescriptorTable(
+                    GiBufferBindingCount + 2u, sceneDepth);
+            if (surfaceAttributes.ptr != 0)
+                cmd->SetComputeRootDescriptorTable(
+                    GiBufferBindingCount + 3u, surfaceAttributes);
+            if (previousSceneDepth.ptr != 0)
+                cmd->SetComputeRootDescriptorTable(
+                    GiBufferBindingCount + 4u, previousSceneDepth);
+            if (previousSurfaceAttributes.ptr != 0)
+                cmd->SetComputeRootDescriptorTable(
+                    GiBufferBindingCount + 5u, previousSurfaceAttributes);
+
+            const GraphResourceId outputId =
+                findNodeResource(plan, node, ResourceUsage::StorageTexture);
+            DX12GraphResourceEntry* output =
+                m_graphResourceRegistry.entry(outputId);
+            if (output && !output->mipUavs.empty())
+                cmd->SetComputeRootDescriptorTable(
+                    GiBufferBindingCount + 6u,
+                    output->mipUavs[0].gpuStart);
+            const uint64_t tlas =
+                m_accelerationStructures.shaderTlasHandle();
+            if (tlas == 0) return;
+            cmd->SetComputeRootShaderResourceView(
+                GiBufferBindingCount + 7u, tlas);
+            cmd->SetComputeRootShaderResourceView(
+                GiBufferBindingCount + 8u,
+                frameResources.giRtGeometries.gpuAddress);
+            cmd->SetComputeRootShaderResourceView(
+                GiBufferBindingCount + 9u,
+                frameResources.giRtInstances.gpuAddress);
+            cmd->SetComputeRootShaderResourceView(
+                GiBufferBindingCount + 10u,
+                frameResources.materials.gpuAddress);
+            cmd->SetComputeRootDescriptorTable(
+                GiBufferBindingCount + 11u,
+                frameResources.giModelBufferSrvs.gpuStart);
+            D3D12_GPU_DESCRIPTOR_HANDLE indexBuffers =
+                frameResources.giModelBufferSrvs.gpuStart;
+            indexBuffers.ptr += static_cast<UINT64>(GiMaxGeometryBufferCount) *
+                frameResources.giModelBufferSrvs.descriptorSize;
+            cmd->SetComputeRootDescriptorTable(
+                GiBufferBindingCount + 12u, indexBuffers);
+            cmd->SetComputeRootDescriptorTable(
+                GiBufferBindingCount + 13u,
+                m_descriptorSystem.shaderResourceGpuStart());
+            cmd->SetComputeRootDescriptorTable(
+                GiBufferBindingCount + 14u,
+                m_descriptorSystem.samplerGpuStart());
+            D3D12_GPU_DESCRIPTOR_HANDLE environment =
+                m_environmentResources.cubemapSrv.gpuStart;
+            const bool environmentValid =
+                m_environmentResources.cubemapSrv.valid();
+            if (!environmentValid)
+            {
+                environment = frameResources.giModelBufferSrvs.gpuStart;
+                environment.ptr += static_cast<UINT64>(
+                    GiMaxGeometryBufferCount * 2u) *
+                    frameResources.giModelBufferSrvs.descriptorSize;
+            }
+            cmd->SetComputeRootDescriptorTable(
+                GiBufferBindingCount + 15u, environment);
+            cmd->SetComputeRootDescriptorTable(
+                GiBufferBindingCount + 16u,
+                m_environmentResources.sampler.valid()
+                    ? m_environmentResources.sampler.gpuStart
+                    : m_descriptorSystem.samplerGpuStart());
+            const auto& rtStats = m_rayTracingSceneService->statistics();
+            float cellSize = 0.25f;
+            std::memcpy(&cellSize, &pass->userData[6], sizeof(float));
+            cellSize = std::max(cellSize, 1.0e-3f);
+            const uint32_t hierarchyBits = pass->userData[7];
+            const uint32_t evaluationDivisor = std::max(
+                hierarchyBits & 0xfu, 1u);
+            const uint32_t clipmapCount = std::clamp(
+                (hierarchyBits >> 4u) & 0xfu, 1u, 8u);
+            const uint32_t probeResolution = std::clamp(
+                (hierarchyBits >> 8u) & 0x7fu, 2u, 64u);
+            GpuGiTraceConstants constants{
+                .frameIndex = static_cast<uint32_t>(ctx.frameIndex),
+                .sceneGeneration = static_cast<uint32_t>(rtStats.generation),
+                .geometryCount = static_cast<uint32_t>(
+                    m_rayTracingSceneService->gpuGeometries().size()),
+                .instanceCount = static_cast<uint32_t>(
+                    m_rayTracingSceneService->gpuInstances().size()),
+                .materialCount = frameResources.materialCapacity,
+                .textureCount = MaxBindlessTextures,
+                .samplerCount = MaxBindlessSamplers,
+                .maxUpdates = m_giMaxSurfelUpdates,
+                .rayBudget = m_giRayBudget,
+                .raysPerSurfel = std::max(pass->userData[2], 1u),
+                .debugView = m_giDebugView,
+                .environmentEnabled = environmentValid ? 1u : 0u,
+                // Drive the probe-transport sky from the scene so it is
+                // controllable and consistent with the forward/PT paths (it was
+                // defaulting to 1.0, ignoring the scene environment intensity).
+                .environmentIntensity =
+                    scene.environment.settings.intensity,
+                .maxSurfels = pass->userData[4],
+                .cellSize = cellSize,
+                .invCellSize = 1.0f / cellSize,
+                .hashBucketCount = pass->userData[5],
+                .candidatesPerCell = 4u,
+                .gatherRadiusScale = 1.5f,
+                .normalThreshold = 0.85f,
+                .planeThreshold = 0.6f * cellSize,
+                .maxSurfelAge = 256u,
+                .reducedWidth = (m_swapchain.width() +
+                    evaluationDivisor - 1u) / evaluationDivisor,
+                .reducedHeight = (m_swapchain.height() +
+                    evaluationDivisor - 1u) / evaluationDivisor,
+                .evaluationDivisor = evaluationDivisor,
+                .feedbackEnabled = (hierarchyBits >> 15u) & 1u,
+                .confidenceBlend = static_cast<float>(m_giMaxProbeUpdates),
+                .emissiveInstanceIndex =
+                    rtStats.firstEmissiveInstanceIndex,
+                .giFlags = (m_giDiagnosticsReadbackActive ? 1u : 0u) |
+                    (clipmapCount << 4u) |
+                    (probeResolution << 8u) |
+                    ((hierarchyBits & (1u << 16u)) != 0u
+                        ? (1u << 20u) : 0u) |
+                    ((hierarchyBits & (1u << 17u)) != 0u
+                        ? (1u << 21u) : 0u),
+                .freezeAfterFrame = m_giFreezeAfterFrames == 0u ? 0u :
+                    static_cast<uint32_t>(m_giCacheInitializationFrame +
+                        m_giFreezeAfterFrames) };
+            if (frameResources.giTraceConstants.mapped)
+                std::memcpy(frameResources.giTraceConstants.mapped,
+                    &constants, sizeof(constants));
+            cmd->SetComputeRootConstantBufferView(
+                GiBufferBindingCount + 17u,
+                frameResources.giTraceConstants.gpuAddress);
+            cmd->SetComputeRootConstantBufferView(
+                GiBufferBindingCount + 18u,
+                frameResources.frameConstants.gpuAddress);
+
+            if (pass->indirectArguments != InvalidGraphResourceId)
+            {
+                DX12GraphResourceEntry* arguments =
+                    m_graphResourceRegistry.entry(pass->indirectArguments);
+                if (!arguments || !arguments->buffer ||
+                    !m_dispatchIndirectSignature)
+                {
+                    return;
+                }
+                cmd->ExecuteIndirect(
+                    m_dispatchIndirectSignature.Get(),
+                    1,
+                    arguments->buffer.resource.Get(),
+                    pass->indirectArgumentOffset,
+                    nullptr,
+                    0);
+            }
+            else
+            {
+                cmd->Dispatch(pass->groupCountX,
+                    pass->groupCountY, pass->groupCountZ);
+            }
             return;
         }
         else if (pipeline->desc.bindingLayout ==
@@ -1496,13 +1921,12 @@ namespace ic
         // (ahead of the CPU-only constants build the recorder now owns) leaves
         // the RECORDED command order identical: accumulation transition, then any
         // environment-convert dispatch, then the path-trace dispatch.
-        const bool environmentResourcesAvailable =
+        const bool environmentRequested =
+            scene.environment.enabled != 0u &&
+            static_cast<bool>(scene.environment.equirectTexture);
+        const bool environmentResourcesAvailable = environmentRequested &&
             ensureEnvironmentResources(ctx, scene, cmd);
-        if (!environmentResourcesAvailable)
-        {
-            return;
-        }
-        if (!m_environmentResources.converted)
+        if (environmentResourcesAvailable && !m_environmentResources.converted)
         {
             if (DX12ComputePipeline* convertPipeline =
                     environmentConvertPipeline())
@@ -1514,7 +1938,8 @@ namespace ic
                     cmd);
             }
         }
-        const bool environmentReady = m_environmentResources.converted;
+        const bool environmentReady = environmentResourcesAvailable &&
+            m_environmentResources.converted;
 
         DX12ComputePipeline* pipeline =
             m_pipelineManager.computePipeline(pathTracePipelineHandle);
@@ -1578,6 +2003,8 @@ namespace ic
         inputs.sceneBvhNodeCount = m_pathTraceResources.sceneBvhNodeCount;
         inputs.firstEmissiveTriangleIndex =
             m_pathTraceResources.firstEmissiveTriangleIndex;
+        inputs.emissiveTriangleCount =
+            m_pathTraceResources.emissiveTriangleCount;
         inputs.environmentReady = environmentReady;
         inputs.environmentIntensity = scene.environment.settings.intensity;
         inputs.environmentExposure =
@@ -1943,10 +2370,7 @@ namespace ic
         }
 
         m_pathTraceResources.lastSceneBuildFrame = ctx.frameIndex;
-        PathTraceSceneData sceneData =
-            buildPathTraceSceneData(
-                scene,
-                assets,
+        const PathTraceMaterialTextureResolver materialResolver =
                 [this, &assets](
                     AssetHandle modelHandle,
                     const MaterialTextureSlot& slot)
@@ -1989,14 +2413,29 @@ namespace ic
                             model->images[static_cast<size_t>(texture.imageIndex)],
                             slot.transfer);
                     return indices;
-                });
-        if (sceneData.triangles.empty() &&
+                };
+        PathTraceSceneData fallbackScene;
+        const PathTraceSceneData* sharedScene = nullptr;
+        if (m_rayTracingSceneService)
+        {
+            if (retryThisFrame)
+                m_rayTracingSceneService->invalidate();
+            (void)m_rayTracingSceneService->update(
+                scene, assets, materialResolver);
+            sharedScene = &m_rayTracingSceneService->sceneData();
+        }
+        else
+        {
+            fallbackScene = buildPathTraceSceneData(
+                scene, assets, materialResolver);
+            sharedScene = &fallbackScene;
+        }
+        if (sharedScene->triangles.empty() &&
             m_pathTraceResources.sceneSrvs.valid())
         {
             return;
         }
-
-        uploadPathTraceScene(sceneData);
+        uploadPathTraceScene(*sharedScene);
 
         m_pathTraceResources.sceneVersion = scene.sceneVersion;
         m_pathTraceResources.sceneHadPendingModels = hasPendingModels;
@@ -2009,16 +2448,23 @@ namespace ic
     {
         retirePathTraceSceneResources();
 
+        std::vector<PathTraceTriangle> uploadTriangles = sceneData.triangles;
+        uploadTriangles.insert(uploadTriangles.end(),
+            sceneData.emissiveTriangles.begin(),
+            sceneData.emissiveTriangles.end());
+
         m_pathTraceResources.sceneVertexCount =
             static_cast<uint32_t>(sceneData.vertices.size());
         m_pathTraceResources.sceneMaterialCount =
             static_cast<uint32_t>(sceneData.materials.size());
         m_pathTraceResources.sceneTriangleCount =
-            static_cast<uint32_t>(sceneData.triangles.size());
+            static_cast<uint32_t>(uploadTriangles.size());
         m_pathTraceResources.sceneBvhNodeCount =
             static_cast<uint32_t>(sceneData.bvhNodes.size());
         m_pathTraceResources.firstEmissiveTriangleIndex =
             sceneData.firstEmissiveTriangleIndex;
+        m_pathTraceResources.emissiveTriangleCount =
+            static_cast<uint32_t>(sceneData.emissiveTriangles.size());
 
         spdlog::info(
             "[DX12] Path trace scene upload: vertices={} materials={} triangles={} bvhNodes={} firstEmissiveTriangle={}",
@@ -2098,7 +2544,7 @@ namespace ic
             createBuffer(
                 sizeof(PathTraceTriangle),
                 m_pathTraceResources.sceneTriangleCount,
-                sceneData.triangles.data(),
+                uploadTriangles.data(),
                 "DX12 path trace scene triangles");
         m_pathTraceResources.sceneBvhNodes =
             createBuffer(
@@ -3226,30 +3672,32 @@ namespace ic
         {
             uploadImage.srgb = transfer == TextureTransferFunction::SRGB;
         }
+        const ImageMipChain mipChain = buildImageMipChain(uploadImage);
+        const uint32_t mipCount =
+            static_cast<uint32_t>(mipChain.levels.size());
 
         UploadedTexture uploaded{};
         uploaded.texture =
             m_resourceAllocator.createTexture(
                 uploadImage,
                 TextureUsageFlags::Sampled | TextureUsageFlags::TransferDst,
-                "DX12 bindless model texture");
+                "DX12 bindless model texture",
+                mipCount);
         uploaded.srv =
             m_descriptorSystem.allocateResourceDescriptors(1);
 
-        const uint64_t sourceBytes = imageByteSize(uploadImage);
-
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-        UINT rowCount = 0;
-        UINT64 rowSize = 0;
+        std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(mipCount);
+        std::vector<UINT> rowCounts(mipCount);
+        std::vector<UINT64> rowSizes(mipCount);
         UINT64 uploadBytes = 0;
         m_device.device()->GetCopyableFootprints(
             &uploaded.texture.desc,
             0,
-            1,
+            mipCount,
             0,
-            &footprint,
-            &rowCount,
-            &rowSize,
+            footprints.data(),
+            rowCounts.data(),
+            rowSizes.data(),
             &uploadBytes);
 
         DX12Buffer staging =
@@ -3261,18 +3709,23 @@ namespace ic
                 .debugName = "DX12 texture upload staging"
             });
 
-        const uint8_t* src =
-            reinterpret_cast<const uint8_t*>(uploadImage.pixels.data());
-        uint8_t* dst =
-            reinterpret_cast<uint8_t*>(staging.mapped) + footprint.Offset;
-        const uint64_t tightRowBytes =
-            uploadImage.height != 0 ? sourceBytes / uploadImage.height : 0;
-        for (uint32_t row = 0; row < uploadImage.height; ++row)
+        const uint8_t* src = reinterpret_cast<const uint8_t*>(
+            mipChain.pixels.data());
+        uint8_t* uploadBase = reinterpret_cast<uint8_t*>(staging.mapped);
+        for (uint32_t mip = 0; mip < mipCount; ++mip)
         {
-            std::memcpy(
-                dst + static_cast<uint64_t>(row) * footprint.Footprint.RowPitch,
-                src + static_cast<uint64_t>(row) * tightRowBytes,
-                static_cast<size_t>(tightRowBytes));
+            const ImageMipLevel& level = mipChain.levels[mip];
+            const uint64_t tightRowBytes = level.size / level.height;
+            uint8_t* dst = uploadBase + footprints[mip].Offset;
+            for (uint32_t row = 0; row < level.height; ++row)
+            {
+                std::memcpy(
+                    dst + static_cast<uint64_t>(row) *
+                        footprints[mip].Footprint.RowPitch,
+                    src + level.offset + static_cast<uint64_t>(row) *
+                        tightRowBytes,
+                    static_cast<size_t>(tightRowBytes));
+            }
         }
 
         auto recordUpload =
@@ -3287,17 +3740,21 @@ namespace ic
                         D3D12_RESOURCE_STATE_COPY_DEST);
                 }
 
-                D3D12_TEXTURE_COPY_LOCATION dstLocation{};
-                dstLocation.pResource = uploaded.texture.resource.Get();
-                dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                for (uint32_t mip = 0; mip < mipCount; ++mip)
+                {
+                    D3D12_TEXTURE_COPY_LOCATION dstLocation{};
+                    dstLocation.pResource = uploaded.texture.resource.Get();
+                    dstLocation.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    dstLocation.SubresourceIndex = mip;
 
-                D3D12_TEXTURE_COPY_LOCATION srcLocation{};
-                srcLocation.pResource = staging.resource.Get();
-                srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                srcLocation.PlacedFootprint = footprint;
+                    D3D12_TEXTURE_COPY_LOCATION srcLocation{};
+                    srcLocation.pResource = staging.resource.Get();
+                    srcLocation.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    srcLocation.PlacedFootprint = footprints[mip];
 
-                cmd->CopyTextureRegion(
-                    &dstLocation, 0, 0, 0, &srcLocation, nullptr);
+                    cmd->CopyTextureRegion(
+                        &dstLocation, 0, 0, 0, &srcLocation, nullptr);
+                }
                 if (!forCopyQueue)
                 {
                     transitionResource(
@@ -3334,7 +3791,7 @@ namespace ic
             D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         srv.Format = uploaded.texture.desc.Format;
         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-        srv.Texture2D.MipLevels = 1;
+        srv.Texture2D.MipLevels = mipCount;
 
         m_device.device()->CreateShaderResourceView(
             uploaded.texture.resource.Get(),
@@ -3391,12 +3848,19 @@ namespace ic
         uploaded.descriptor = m_descriptorSystem.allocateSamplers(1);
 
         D3D12_SAMPLER_DESC desc{};
-        desc.Filter = sampler
+        const D3D12_FILTER baseFilter = sampler
             ? toFilter(sampler->minFilter, sampler->magFilter)
             : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        const bool linearSampling = !sampler ||
+            (sampler->minFilter != TextureFilterMode::Nearest &&
+             sampler->minFilter != TextureFilterMode::NearestMipmapNearest &&
+             sampler->minFilter != TextureFilterMode::NearestMipmapLinear &&
+             sampler->magFilter != TextureFilterMode::Nearest);
+        desc.Filter = linearSampling ? D3D12_FILTER_ANISOTROPIC : baseFilter;
         desc.AddressU = sampler ? toAddress(sampler->wrapU) : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         desc.AddressV = sampler ? toAddress(sampler->wrapV) : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
         desc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+        desc.MaxAnisotropy = linearSampling ? 8u : 1u;
         desc.MaxLOD = D3D12_FLOAT32_MAX;
 
         m_device.device()->CreateSampler(&desc, uploaded.descriptor.cpuStart);
@@ -3470,6 +3934,8 @@ namespace ic
                 .size = vertexBytes,
                 .usage =
                     BufferUsageFlags::Vertex |
+                    BufferUsageFlags::Storage |
+                    BufferUsageFlags::AccelerationStructureBuildInput |
                     BufferUsageFlags::TransferDst,
                 .memoryUsage = ResourceMemoryUsage::GpuOnly,
                 .mappedAtCreation = false,
@@ -3481,6 +3947,8 @@ namespace ic
                 .size = indexBytes,
                 .usage =
                     BufferUsageFlags::Index |
+                    BufferUsageFlags::Storage |
+                    BufferUsageFlags::AccelerationStructureBuildInput |
                     BufferUsageFlags::TransferDst,
                 .memoryUsage = ResourceMemoryUsage::GpuOnly,
                 .mappedAtCreation = false,
@@ -3655,6 +4123,127 @@ namespace ic
         return &uploaded;
     }
 
+    bool DX12Backend::prepareGiRayQueryResources(const FrameContext& ctx)
+    {
+        if (!m_rayTracingSceneService ||
+            !m_rayTracingSceneService->statistics().valid ||
+            m_gpuScene.frameSlotCount() == 0)
+            return false;
+
+        const auto geometries = m_rayTracingSceneService->gpuGeometries();
+        const auto instances = m_rayTracingSceneService->gpuInstances();
+        if (geometries.empty() || instances.empty())
+            return false;
+        for (const auto& geometry : geometries)
+            if (geometry.mapping.x >= GiMaxGeometryBufferCount)
+                return false;
+
+        const uint32_t frameSlot = static_cast<uint32_t>(
+            ctx.frameIndex % m_gpuScene.frameSlotCount());
+        DX12GpuSceneFrameResources& frame =
+            m_gpuScene.frameResources(frameSlot);
+        const auto ensureBuffer = [&](DX12Buffer& buffer, uint32_t& capacity,
+            uint32_t required, uint32_t stride, const char* name)
+        {
+            if (required <= capacity && buffer)
+                return;
+            m_resourceAllocator.destroyBuffer(buffer);
+            buffer = m_resourceAllocator.createBuffer({
+                .size = static_cast<uint64_t>(required) * stride,
+                .usage = BufferUsageFlags::None,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = name });
+            capacity = required;
+            frame.giRayQueryGeneration = UINT64_MAX;
+        };
+        ensureBuffer(frame.giRtGeometries, frame.giGeometryCapacity,
+            static_cast<uint32_t>(geometries.size()),
+            sizeof(GpuRayTracingGeometryRecord), "DX12 GI RT geometry table");
+        ensureBuffer(frame.giRtInstances, frame.giInstanceCapacity,
+            static_cast<uint32_t>(instances.size()),
+            sizeof(GpuRayTracingInstanceRecord), "DX12 GI RT instance table");
+        if (!frame.giTraceConstants)
+        {
+            // Constant buffers must be 256-byte aligned; the 128-byte payload is
+            // written per frame in recordCompute (all GI passes write identical
+            // bytes into this per-frame-slot buffer).
+            frame.giTraceConstants = m_resourceAllocator.createBuffer({
+                .size = 256u,
+                .usage = BufferUsageFlags::Constant,
+                .memoryUsage = ResourceMemoryUsage::CpuToGpu,
+                .mappedAtCreation = true,
+                .debugName = "DX12 GI trace constants" });
+        }
+        if (!frame.giModelBufferSrvs.valid())
+        {
+            frame.giModelBufferSrvs =
+                m_descriptorSystem.allocateResourceDescriptors(
+                    GiMaxGeometryBufferCount * 2u + 1u);
+            frame.giRayQueryGeneration = UINT64_MAX;
+        }
+
+        const uint64_t generation =
+            m_rayTracingSceneService->statistics().generation;
+        if (frame.giRayQueryGeneration == generation)
+            return true;
+        std::memcpy(frame.giRtGeometries.mapped, geometries.data(),
+            geometries.size_bytes());
+        std::memcpy(frame.giRtInstances.mapped, instances.data(),
+            instances.size_bytes());
+
+        std::array<const DX12UploadedModel*, GiMaxGeometryBufferCount> models{};
+        const DX12UploadedModel* fallback = nullptr;
+        for (const RayTracingGeometryRecord& geometry :
+            m_rayTracingSceneService->geometries())
+        {
+            const auto found = m_uploadedModels.find(geometry.model);
+            if (found == m_uploadedModels.end() || !found->second.uploaded)
+                return false;
+            models[geometry.modelBufferIndex] = &found->second;
+            if (!fallback) fallback = &found->second;
+        }
+        if (!fallback) return false;
+
+        const auto writeRawSrv = [&](uint32_t descriptorIndex,
+            const DX12Buffer& buffer)
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+            srv.Format = DXGI_FORMAT_R32_TYPELESS;
+            srv.Buffer.NumElements = static_cast<UINT>(buffer.size / 4u);
+            srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+            D3D12_CPU_DESCRIPTOR_HANDLE handle =
+                frame.giModelBufferSrvs.cpuStart;
+            handle.ptr += static_cast<SIZE_T>(descriptorIndex) *
+                frame.giModelBufferSrvs.descriptorSize;
+            m_device.device()->CreateShaderResourceView(
+                buffer.resource.Get(), &srv, handle);
+        };
+        for (uint32_t slot = 0; slot < GiMaxGeometryBufferCount; ++slot)
+        {
+            const DX12UploadedModel* model = models[slot]
+                ? models[slot] : fallback;
+            writeRawSrv(slot, model->vertexBuffer);
+            writeRawSrv(GiMaxGeometryBufferCount + slot, model->indexBuffer);
+        }
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullCube{};
+        nullCube.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nullCube.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        nullCube.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nullCube.TextureCube.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE nullCubeHandle =
+            frame.giModelBufferSrvs.cpuStart;
+        nullCubeHandle.ptr += static_cast<SIZE_T>(
+            GiMaxGeometryBufferCount * 2u) *
+            frame.giModelBufferSrvs.descriptorSize;
+        m_device.device()->CreateShaderResourceView(
+            nullptr, &nullCube, nullCubeHandle);
+        frame.giRayQueryGeneration = generation;
+        return true;
+    }
+
     bool DX12Backend::prepareSceneResources(
         const FrameContext& ctx,
         const SceneRenderView& scene)
@@ -3672,7 +4261,7 @@ namespace ic
             static_cast<uint32_t>(
                 ctx.frameIndex % std::max<uint32_t>(1, m_gpuScene.frameSlotCount()));
 
-        return m_gpuScene.prepare(
+        const bool prepared = m_gpuScene.prepare(
             ctx.frameIndex,
             scene,
             frameSlot,
@@ -3698,11 +4287,14 @@ namespace ic
 
                 GpuFrameData frameData{};
                 frameData.view = scene.camera.view;
+                // Swap finite near/far inputs to map near->1 and far->0. D32
+                // floating-point precision then follows view-space distance
+                // instead of collapsing at the far end of the scene.
                 frameData.projection = glm::perspectiveRH_ZO(
                     scene.camera.verticalFovRadians,
                     scene.camera.aspectRatio,
-                    scene.camera.nearPlane,
-                    scene.camera.farPlane);
+                    scene.camera.farPlane,
+                    scene.camera.nearPlane);
                 frameData.viewProjection = frameData.projection * frameData.view;
                 const bool occlusionHistoryReliable =
                     updateGpuOcclusionHistory(
@@ -3722,7 +4314,11 @@ namespace ic
                 frameData.environmentIntensity =
                     scene.environment.settings.intensity;
                 frameData.environmentExposure =
-                    scene.environment.settings.skyboxExposure;
+                    m_resolvedDiffuseGi != InvalidGraphResourceId
+                        ? scene.environment.settings.pathTraceExposure
+                        : scene.environment.settings.skyboxExposure;
+                frameData.environmentTransportExposure =
+                    scene.environment.settings.pathTraceExposure;
 
                 for (const SceneLightRenderItem& light : scene.lights)
                 {
@@ -3765,7 +4361,7 @@ namespace ic
                     m_clusteredForwardResources.width,
                     m_clusteredForwardResources.height,
                     m_clusteredForwardResources.hiZMipCount,
-                    0u);
+                    1u);
                 frameData.cullingConfig = glm::uvec4(
                     std::min<uint32_t>(
                         instanceBoundsCount, ClusteredForwardMaxGpuCullInstances),
@@ -3781,8 +4377,22 @@ namespace ic
                     m_gpuCullDebugMode != GpuCullDebugMode::Off ? 1u : 0u,
                     m_gpuOcclusionEnabled ? 1u : 0u,
                     0u);
+                frameData.globalIlluminationConfig.x =
+                    m_resolvedDiffuseGi != InvalidGraphResourceId ? 1u : 0u;
+                frameData.globalIlluminationConfig.y = m_giDebugView;
+                frameData.globalIlluminationConfig.z =
+                    m_giDiagnosticIntensityBits;
+                frameData.globalIlluminationConfig.w =
+                    m_giDebugExposureBits;
                 return frameData;
             });
+        if (prepared && m_rayTracingSceneService)
+        {
+            m_rayTracingSceneService->updateGeometry(scene, assets);
+            m_accelerationStructures.prepare(
+                *m_rayTracingSceneService, m_uploadedModels);
+        }
+        return prepared;
     }
 
     void DX12Backend::initImGui(Window& window)
@@ -4250,6 +4860,33 @@ namespace ic
             m_gpuCullTimestampValid.begin(),
             m_gpuCullTimestampValid.end(),
             uint8_t{0});
+    }
+
+    bool DX12Backend::globalIlluminationDiagnostics(
+        GpuGiDiagnostics& result) const
+    {
+        std::memcpy(&result, m_giDiagnosticWords.data(), sizeof(result));
+        return m_giDiagnosticFrames != 0;
+    }
+
+    void DX12Backend::setGlobalIlluminationDisplay(
+        uint32_t debugView, float diagnosticIntensity, float debugExposure)
+    {
+        m_giDebugView = debugView;
+        std::memcpy(&m_giDiagnosticIntensityBits, &diagnosticIntensity,
+            sizeof(m_giDiagnosticIntensityBits));
+        std::memcpy(&m_giDebugExposureBits, &debugExposure,
+            sizeof(m_giDebugExposureBits));
+    }
+
+    void DX12Backend::setGlobalIlluminationRuntimeSettings(
+        uint32_t maxSurfelUpdates, uint32_t maxProbeUpdates,
+        uint32_t rayBudget, uint32_t freezeAfterFrames)
+    {
+        m_giMaxSurfelUpdates = std::max(maxSurfelUpdates, 1u);
+        m_giMaxProbeUpdates = std::max(maxProbeUpdates, 64u);
+        m_giRayBudget = std::max(rayBudget, 1u);
+        m_giFreezeAfterFrames = freezeAfterFrames;
     }
 
     TextureFormat DX12Backend::swapchainTextureFormat() const

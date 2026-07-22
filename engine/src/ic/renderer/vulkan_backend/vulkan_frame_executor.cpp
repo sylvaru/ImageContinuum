@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <stdexcept>
+#include <string>
 
 namespace ic
 {
@@ -12,7 +13,9 @@ namespace ic
         {
             if (result != VK_SUCCESS)
             {
-                throw std::runtime_error(message);
+                throw std::runtime_error(
+                    std::string(message) + " VkResult=" +
+                    std::to_string(static_cast<int32_t>(result)));
             }
         }
     }
@@ -452,9 +455,17 @@ namespace ic
             submit.signalSemaphoreCount = 1;
             submit.pSignalSemaphores = &signalSemaphore;
 
-            throwIfFailed(
-                vkQueueSubmit(
-                    queueFor(batch.queue), 1, &submit, VK_NULL_HANDLE),
+            const VkResult submitResult = vkQueueSubmit(
+                queueFor(batch.queue), 1, &submit, VK_NULL_HANDLE);
+            if (submitResult != VK_SUCCESS)
+            {
+                spdlog::error(
+                    "[VulkanFrameExecutor] submit failed index={} level={} queue={} nodes={} VkResult={}",
+                    submissionIndex, batch.levelIndex,
+                    static_cast<uint32_t>(batch.queue), batch.nodeCount,
+                    static_cast<int32_t>(submitResult));
+            }
+            throwIfFailed(submitResult,
                 "Failed to submit Vulkan frame-graph queue batch.");
 
             m_submissionSignals[submissionIndex] = {

@@ -58,6 +58,7 @@ namespace ic
         uint32_t sceneTriangleCount = 0;
         uint32_t sceneBvhNodeCount = 0;
         uint32_t firstEmissiveTriangleIndex = 0;
+        uint32_t emissiveTriangleCount = 0;
         bool environmentReady = false;
         float environmentIntensity = 0.0f;
         float environmentExposure = 0.0f;

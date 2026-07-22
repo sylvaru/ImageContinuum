@@ -26,7 +26,8 @@ struct FrameConstants
     float environmentExposure;
 
     uint pointLightCount;
-    float3 padding1;
+    float environmentTransportExposure;
+    float2 padding1;
 
     float4 pointLightPositionRange[IC_MAX_POINT_LIGHTS];
     float4 pointLightColorIntensity[IC_MAX_POINT_LIGHTS];
@@ -38,6 +39,7 @@ struct FrameConstants
     float4 cameraNearFar;     // x near, y far, z/w reserved.
     float4 occlusionConfig;   // x previous near, y radius scale, z pixel expansion, w depth bias.
     uint4 occlusionDebugConfig; // x mode, y stats enabled, z occlusion enabled, w reserved.
+    uint4 globalIlluminationConfig; // x valid; y view; z intensity bits; w fixed debug exposure bits.
 };
 
 ConstantBuffer<FrameConstants> gFrame : register(b0, space0);

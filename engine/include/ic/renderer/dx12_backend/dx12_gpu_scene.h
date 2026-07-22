@@ -44,12 +44,19 @@ namespace ic
         DX12Buffer frameConstants;
         DX12Buffer objects;
         DX12Buffer materials;
+        DX12Buffer giRtGeometries;
+        DX12Buffer giRtInstances;
+        DX12Buffer giTraceConstants;
 
         DX12DescriptorAllocation objectSrv;
         DX12DescriptorAllocation materialSrv;
+        DX12DescriptorAllocation giModelBufferSrvs;
 
         uint32_t objectCapacity = 0;
         uint32_t materialCapacity = 0;
+        uint32_t giGeometryCapacity = 0;
+        uint32_t giInstanceCapacity = 0;
+        uint64_t giRayQueryGeneration = UINT64_MAX;
     };
 
     // Owns the persistent GPU-driven scene: CPU-side draw extraction/sorting/

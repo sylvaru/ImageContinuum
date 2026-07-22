@@ -158,14 +158,6 @@ namespace ic
                 dst.baseColor = src.baseColorFactor;
                 dst.emissive =
                     glm::vec4(src.emissiveFactor * src.emissiveStrength, 0.0f);
-                if (src.name.find("Light") != std::string::npos ||
-                    src.name.find("light") != std::string::npos)
-                {
-                    const glm::vec3 color =
-                        glm::vec3(src.baseColorFactor);
-                    dst.emissive =
-                        glm::vec4(glm::max(color, glm::vec3(1.0f)) * 18.0f, 0.0f);
-                }
                 dst.roughnessFactor = src.roughnessFactor;
                 dst.metallicFactor = src.metallicFactor;
                 dst.occlusionStrength = src.occlusionTexture.strength;
@@ -349,14 +341,14 @@ namespace ic
         data.triangles.reserve(buildTriangles.size());
         for (const BuildTriangle& tri : buildTriangles)
         {
-            if (tri.emissive &&
-                data.firstEmissiveTriangleIndex == UINT32_MAX)
-            {
-                data.firstEmissiveTriangleIndex =
-                    static_cast<uint32_t>(data.triangles.size());
-            }
             data.triangles.push_back(tri.triangle);
+            if (tri.emissive)
+                data.emissiveTriangles.push_back(tri.triangle);
         }
+
+        if (!data.emissiveTriangles.empty())
+            data.firstEmissiveTriangleIndex =
+                static_cast<uint32_t>(data.triangles.size());
 
         return data;
     }

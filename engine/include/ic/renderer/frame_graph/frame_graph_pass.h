@@ -1,5 +1,6 @@
 // ic/renderer/frame_graph/graph_pass.h
 #pragma once
+#include <array>
 #include <concepts>
 #include <cstdint>
 #include <string>
@@ -38,7 +39,8 @@ namespace ic
         Configuration = 1u << 4,
         Scene         = 1u << 5,
         Environment   = 1u << 6,
-        Manual        = 1u << 7
+        Manual        = 1u << 7,
+        Camera        = 1u << 8
     };
 
     constexpr PassInvalidation operator|(
@@ -104,6 +106,11 @@ namespace ic
         uint32_t groupCountX = 1;
         uint32_t groupCountY = 1;
         uint32_t groupCountZ = 1;
+        GraphResourceId indirectArguments = InvalidGraphResourceId;
+        uint64_t indirectArgumentOffset = 0;
+        // Small API-neutral specialization payload. Backends translate it to
+        // root/push constants; no backend resource is owned by the pass.
+        std::array<uint32_t, 8> userData = {};
         PassExecutionPolicy execution = {};
     };
 
@@ -171,6 +178,9 @@ namespace ic
     struct PresentPassData {};
     struct ShadowPassData {};
     struct PostProcessPassData {};
+    // Native BLAS/TLAS construction is a renderer service workload. It has no
+    // shader pipeline; backends translate only this payload into KHR/DXR calls.
+    struct AccelerationStructureBuildPassData {};
 
     using PassPayload =
         std::variant<
@@ -185,7 +195,8 @@ namespace ic
         TonemapPassData,
         PresentPassData,
         ShadowPassData,
-        PostProcessPassData>;
+        PostProcessPassData,
+        AccelerationStructureBuildPassData>;
 
     template<typename T>
     concept GraphPass = requires(

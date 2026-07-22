@@ -67,6 +67,7 @@ namespace ic
         HiZDepthPyramid,
         GpuFrustumCull,
         GpuOcclusionValidation,
+        GlobalIllumination,
         PathTrace,
         PathTraceTonemap
     };
@@ -90,6 +91,7 @@ namespace ic
         Equal,
         LessEqual,
         Greater,
+        GreaterEqual,
         Always
     };
 

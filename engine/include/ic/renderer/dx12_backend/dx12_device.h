@@ -19,6 +19,8 @@ namespace ic
         bool descriptorIndexing = false;
         bool bindlessResources = false;
         bool directHeapIndexing = false;
+        D3D12_RAYTRACING_TIER rayTracingTier =
+            D3D12_RAYTRACING_TIER_NOT_SUPPORTED;
     };
 
     class DX12Device
